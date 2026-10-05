@@ -20,13 +20,13 @@
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 
-static SttLog stt_log_sink = NULL;
+static DictateLog dictate_log_sink = NULL;
 
-static void stt_log_callback(void *context, int level, const char *format, va_list args) {
+static void dictate_log_callback(void *context, int level, const char *format, va_list args) {
     /* The Rust bridge serializes conversions because libav's log level is global.
      * Disabled FFmpeg debug still preserves native errors on stderr. */
     int limit = av_log_get_level();
-    if (stt_log_sink != NULL && limit >= AV_LOG_INFO && level <= limit) {
+    if (dictate_log_sink != NULL && limit >= AV_LOG_INFO && level <= limit) {
         char line[8192];
         int prefix = 1;
         va_list copy;
@@ -34,17 +34,17 @@ static void stt_log_callback(void *context, int level, const char *format, va_li
         av_log_format_line2(context, level, format, copy, line, sizeof(line), &prefix);
         va_end(copy);
         line[sizeof(line) - 1] = '\0';
-        if (stt_log_sink(line)) return;
+        if (dictate_log_sink(line)) return;
     }
     av_log_default_callback(context, level, format, args);
 }
 
-void stt_ffmpeg_set_log_callback(SttLog callback) {
-    stt_log_sink = callback;
-    av_log_set_callback(stt_log_callback);
+void dictate_ffmpeg_set_log_callback(DictateLog callback) {
+    dictate_log_sink = callback;
+    av_log_set_callback(dictate_log_callback);
 }
 
-static void stt_set_error(char *errbuf, int errbuf_size, const char *fmt, ...) {
+static void dictate_set_error(char *errbuf, int errbuf_size, const char *fmt, ...) {
     if (errbuf == NULL || errbuf_size <= 0) {
         return;
     }
@@ -54,13 +54,13 @@ static void stt_set_error(char *errbuf, int errbuf_size, const char *fmt, ...) {
     va_end(args);
 }
 
-static void stt_set_av_error(char *errbuf, int errbuf_size, const char *prefix, int err) {
+static void dictate_set_av_error(char *errbuf, int errbuf_size, const char *prefix, int err) {
     char av_error[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(err, av_error, sizeof(av_error));
-    stt_set_error(errbuf, errbuf_size, "%s: %s", prefix, av_error);
+    dictate_set_error(errbuf, errbuf_size, "%s: %s", prefix, av_error);
 }
 
-static int stt_pick_sample_fmt(const AVCodec *codec, const char *requested) {
+static int dictate_pick_sample_fmt(const AVCodec *codec, const char *requested) {
     enum AVSampleFormat fmt = AV_SAMPLE_FMT_NONE;
     if (requested != NULL && requested[0] != '\0') {
         fmt = av_get_sample_fmt(requested);
@@ -83,7 +83,7 @@ static int stt_pick_sample_fmt(const AVCodec *codec, const char *requested) {
     return AV_SAMPLE_FMT_S16;
 }
 
-static int stt_alloc_audio_frame(
+static int dictate_alloc_audio_frame(
     AVFrame **frame,
     enum AVSampleFormat sample_fmt,
     const AVChannelLayout *ch_layout,
@@ -95,7 +95,7 @@ static int stt_alloc_audio_frame(
     int ret;
     AVFrame *f = av_frame_alloc();
     if (f == NULL) {
-        stt_set_error(errbuf, errbuf_size, "could not allocate audio frame");
+        dictate_set_error(errbuf, errbuf_size, "could not allocate audio frame");
         return AVERROR(ENOMEM);
     }
     f->format = sample_fmt;
@@ -104,14 +104,14 @@ static int stt_alloc_audio_frame(
     ret = av_channel_layout_copy(&f->ch_layout, ch_layout);
     if (ret < 0) {
         av_frame_free(&f);
-        stt_set_av_error(errbuf, errbuf_size, "could not copy channel layout", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not copy channel layout", ret);
         return ret;
     }
     if (nb_samples > 0) {
         ret = av_frame_get_buffer(f, 0);
         if (ret < 0) {
             av_frame_free(&f);
-            stt_set_av_error(errbuf, errbuf_size, "could not allocate audio frame buffer", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not allocate audio frame buffer", ret);
             return ret;
         }
     }
@@ -119,7 +119,7 @@ static int stt_alloc_audio_frame(
     return 0;
 }
 
-static int stt_encode_write(
+static int dictate_encode_write(
     AVCodecContext *enc_ctx,
     AVFormatContext *ofmt_ctx,
     AVStream *out_stream,
@@ -129,14 +129,14 @@ static int stt_encode_write(
 ) {
     int ret = avcodec_send_frame(enc_ctx, frame);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not send frame to encoder", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not send frame to encoder", ret);
         return ret;
     }
 
     while (1) {
         AVPacket *pkt = av_packet_alloc();
         if (pkt == NULL) {
-            stt_set_error(errbuf, errbuf_size, "could not allocate encoded packet");
+            dictate_set_error(errbuf, errbuf_size, "could not allocate encoded packet");
             return AVERROR(ENOMEM);
         }
         ret = avcodec_receive_packet(enc_ctx, pkt);
@@ -146,7 +146,7 @@ static int stt_encode_write(
         }
         if (ret < 0) {
             av_packet_free(&pkt);
-            stt_set_av_error(errbuf, errbuf_size, "could not receive encoded packet", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not receive encoded packet", ret);
             return ret;
         }
         av_packet_rescale_ts(pkt, enc_ctx->time_base, out_stream->time_base);
@@ -154,13 +154,13 @@ static int stt_encode_write(
         ret = av_interleaved_write_frame(ofmt_ctx, pkt);
         av_packet_free(&pkt);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not write encoded packet", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not write encoded packet", ret);
             return ret;
         }
     }
 }
 
-static int stt_write_fifo_to_encoder(
+static int dictate_write_fifo_to_encoder(
     AVAudioFifo *fifo,
     AVCodecContext *enc_ctx,
     AVFormatContext *ofmt_ctx,
@@ -182,7 +182,7 @@ static int stt_write_fifo_to_encoder(
         }
 
         AVFrame *frame = NULL;
-        ret = stt_alloc_audio_frame(
+        ret = dictate_alloc_audio_frame(
             &frame,
             enc_ctx->sample_fmt,
             &enc_ctx->ch_layout,
@@ -197,12 +197,12 @@ static int stt_write_fifo_to_encoder(
         ret = av_audio_fifo_read(fifo, (void **)frame->extended_data, nb_samples);
         if (ret < nb_samples) {
             av_frame_free(&frame);
-            stt_set_error(errbuf, errbuf_size, "could not read converted samples from fifo");
+            dictate_set_error(errbuf, errbuf_size, "could not read converted samples from fifo");
             return AVERROR(EIO);
         }
         frame->pts = *next_pts;
         *next_pts += frame->nb_samples;
-        ret = stt_encode_write(enc_ctx, ofmt_ctx, out_stream, frame, errbuf, errbuf_size);
+        ret = dictate_encode_write(enc_ctx, ofmt_ctx, out_stream, frame, errbuf, errbuf_size);
         av_frame_free(&frame);
         if (ret < 0) {
             return ret;
@@ -211,7 +211,7 @@ static int stt_write_fifo_to_encoder(
     return 0;
 }
 
-static int stt_convert_and_queue_frame(
+static int dictate_convert_and_queue_frame(
     SwrContext *swr,
     const AVFrame *input_format,
     AVCodecContext *enc_ctx,
@@ -232,7 +232,7 @@ static int stt_convert_and_queue_frame(
     }
 
     AVFrame *converted = NULL;
-    int ret = stt_alloc_audio_frame(
+    int ret = dictate_alloc_audio_frame(
         &converted,
         enc_ctx->sample_fmt,
         &enc_ctx->ch_layout,
@@ -253,7 +253,7 @@ static int stt_convert_and_queue_frame(
     );
     if (ret < 0) {
         av_frame_free(&converted);
-        stt_set_av_error(errbuf, errbuf_size, "could not resample audio frame", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not resample audio frame", ret);
         return ret;
     }
     converted->nb_samples = ret;
@@ -261,13 +261,13 @@ static int stt_convert_and_queue_frame(
         ret = av_audio_fifo_realloc(fifo, av_audio_fifo_size(fifo) + converted->nb_samples);
         if (ret < 0) {
             av_frame_free(&converted);
-            stt_set_av_error(errbuf, errbuf_size, "could not grow audio fifo", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not grow audio fifo", ret);
             return ret;
         }
         ret = av_audio_fifo_write(fifo, (void **)converted->extended_data, converted->nb_samples);
         if (ret < converted->nb_samples) {
             av_frame_free(&converted);
-            stt_set_error(errbuf, errbuf_size, "could not write converted samples to fifo");
+            dictate_set_error(errbuf, errbuf_size, "could not write converted samples to fifo");
             return AVERROR(EIO);
         }
     }
@@ -275,7 +275,7 @@ static int stt_convert_and_queue_frame(
     return 0;
 }
 
-static int stt_flush_resampler(
+static int dictate_flush_resampler(
     SwrContext *swr,
     const AVFrame *input_format,
     AVCodecContext *enc_ctx,
@@ -295,7 +295,7 @@ static int stt_flush_resampler(
             return 0;
         }
         AVFrame *converted = NULL;
-        int ret = stt_alloc_audio_frame(
+        int ret = dictate_alloc_audio_frame(
             &converted,
             enc_ctx->sample_fmt,
             &enc_ctx->ch_layout,
@@ -310,7 +310,7 @@ static int stt_flush_resampler(
         ret = swr_convert(swr, converted->extended_data, out_samples, NULL, 0);
         if (ret < 0) {
             av_frame_free(&converted);
-            stt_set_av_error(errbuf, errbuf_size, "could not flush resampler", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not flush resampler", ret);
             return ret;
         }
         converted->nb_samples = ret;
@@ -321,13 +321,13 @@ static int stt_flush_resampler(
         ret = av_audio_fifo_realloc(fifo, av_audio_fifo_size(fifo) + converted->nb_samples);
         if (ret < 0) {
             av_frame_free(&converted);
-            stt_set_av_error(errbuf, errbuf_size, "could not grow audio fifo", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not grow audio fifo", ret);
             return ret;
         }
         ret = av_audio_fifo_write(fifo, (void **)converted->extended_data, converted->nb_samples);
         if (ret < converted->nb_samples) {
             av_frame_free(&converted);
-            stt_set_error(errbuf, errbuf_size, "could not write flushed samples to fifo");
+            dictate_set_error(errbuf, errbuf_size, "could not write flushed samples to fifo");
             return AVERROR(EIO);
         }
         av_frame_free(&converted);
@@ -335,48 +335,48 @@ static int stt_flush_resampler(
 }
 
 
-typedef struct SttGate {
-    const SttAudioInterval *intervals;
+typedef struct DictateGate {
+    const DictateAudioInterval *intervals;
     size_t count, index;
     int enabled;
     int64_t position;
-    SttCancel cancel;
+    DictateCancel cancel;
     void *context;
-} SttGate;
+} DictateGate;
 
-static int stt_interrupt(void *opaque) {
-    SttGate *gate = opaque;
+static int dictate_interrupt(void *opaque) {
+    DictateGate *gate = opaque;
     return gate->cancel && gate->cancel(gate->context);
 }
 
-static int stt_gate_frame(SttGate *gate, SwrContext *swr, const AVFrame *input_format,
+static int dictate_gate_frame(DictateGate *gate, SwrContext *swr, const AVFrame *input_format,
     AVCodecContext *enc, AVAudioFifo *fifo, AVFrame *frame, char *errbuf, int errbuf_size) {
-    if (stt_interrupt(gate)) return AVERROR_EXIT;
+    if (dictate_interrupt(gate)) return AVERROR_EXIT;
     if (frame->sample_rate != input_format->sample_rate ||
         frame->format != input_format->format ||
         av_channel_layout_compare(&frame->ch_layout, &input_format->ch_layout)) {
-        stt_set_error(errbuf, errbuf_size, "input audio format changed during decoding");
+        dictate_set_error(errbuf, errbuf_size, "input audio format changed during decoding");
         return AVERROR_INVALIDDATA;
     }
     if (frame->nb_samples > INT64_MAX - gate->position) return AVERROR(EOVERFLOW);
     int64_t start = gate->position, end = start + frame->nb_samples;
     gate->position = end;
     if (!gate->enabled)
-        return stt_convert_and_queue_frame(swr, input_format, enc, fifo, frame, errbuf, errbuf_size);
+        return dictate_convert_and_queue_frame(swr, input_format, enc, fifo, frame, errbuf, errbuf_size);
     while (gate->index < gate->count) {
-        if (stt_interrupt(gate)) return AVERROR_EXIT;
-        const SttAudioInterval *i = &gate->intervals[gate->index];
+        if (dictate_interrupt(gate)) return AVERROR_EXIT;
+        const DictateAudioInterval *i = &gate->intervals[gate->index];
         if (i->end_frame <= start) { gate->index++; continue; }
         if (i->start_frame >= end) break;
         int64_t left = FFMAX(start, i->start_frame), right = FFMIN(end, i->end_frame);
         AVFrame *selected = NULL;
-        int ret = stt_alloc_audio_frame(&selected, frame->format, &frame->ch_layout,
+        int ret = dictate_alloc_audio_frame(&selected, frame->format, &frame->ch_layout,
             frame->sample_rate, (int)(right-left), errbuf, errbuf_size);
         if (ret < 0) return ret;
         ret = av_samples_copy(selected->extended_data, frame->extended_data, 0,
             (int)(left-start), (int)(right-left), frame->ch_layout.nb_channels, frame->format);
         if (ret >= 0)
-            ret = stt_convert_and_queue_frame(swr, input_format, enc, fifo, selected, errbuf, errbuf_size);
+            ret = dictate_convert_and_queue_frame(swr, input_format, enc, fifo, selected, errbuf, errbuf_size);
         av_frame_free(&selected);
         if (ret < 0) return ret;
         if (i->end_frame <= end) gate->index++;
@@ -385,7 +385,7 @@ static int stt_gate_frame(SttGate *gate, SwrContext *swr, const AVFrame *input_f
     return 0;
 }
 
-static int stt_deliver_samples(AVAudioFifo *fifo, SttSamples callback, void *context) {
+static int dictate_deliver_samples(AVAudioFifo *fifo, DictateSamples callback, void *context) {
     int16_t buffer[4096];
     while (av_audio_fifo_size(fifo) > 0) {
         int n = FFMIN(av_audio_fifo_size(fifo), 4096);
@@ -396,7 +396,7 @@ static int stt_deliver_samples(AVAudioFifo *fifo, SttSamples callback, void *con
     return 0;
 }
 
-int stt_ffmpeg_convert(
+int dictate_ffmpeg_convert(
     const char *in_path,
     const char *out_path,
     const char *codec_name,
@@ -406,9 +406,9 @@ int stt_ffmpeg_convert(
     int codec_has_bitrate,
     const char *sample_fmt_name,
     int debug,
-    const SttAudioInterval *intervals, size_t interval_count, int intervals_enabled,
-    SttCancel cancel, void *cancel_context,
-    SttSamples samples, void *samples_context,
+    const DictateAudioInterval *intervals, size_t interval_count, int intervals_enabled,
+    DictateCancel cancel, void *cancel_context,
+    DictateSamples samples, void *samples_context,
     int *source_rate, int64_t *source_frames,
     char *errbuf,
     int errbuf_size
@@ -427,7 +427,7 @@ int stt_ffmpeg_convert(
     int ret = 0;
     int64_t next_pts = 0;
     int output_opened = 0;
-    SttGate gate = {intervals, interval_count, 0, intervals_enabled, 0, cancel, cancel_context};
+    DictateGate gate = {intervals, interval_count, 0, intervals_enabled, 0, cancel, cancel_context};
     if (intervals_enabled && (!interval_count || !intervals)) return AVERROR(EINVAL);
     for (size_t n = 0; n < interval_count; n++) {
         if (intervals[n].start_frame < 0 || intervals[n].end_frame <= intervals[n].start_frame ||
@@ -435,24 +435,24 @@ int stt_ffmpeg_convert(
     }
     ifmt_ctx = avformat_alloc_context();
     if (!ifmt_ctx) return AVERROR(ENOMEM);
-    ifmt_ctx->interrupt_callback = (AVIOInterruptCB){stt_interrupt, &gate};
+    ifmt_ctx->interrupt_callback = (AVIOInterruptCB){dictate_interrupt, &gate};
 
     av_log_set_level(debug ? AV_LOG_INFO : AV_LOG_ERROR);
 
     ret = avformat_open_input(&ifmt_ctx, in_path, NULL, NULL);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not open input audio", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not open input audio", ret);
         goto cleanup;
     }
     ret = avformat_find_stream_info(ifmt_ctx, NULL);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not read input stream info", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not read input stream info", ret);
         goto cleanup;
     }
     audio_stream = av_find_best_stream(ifmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (audio_stream < 0) {
         ret = audio_stream;
-        stt_set_av_error(errbuf, errbuf_size, "could not find input audio stream", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not find input audio stream", ret);
         goto cleanup;
     }
 
@@ -460,18 +460,18 @@ int stt_ffmpeg_convert(
     const AVCodec *decoder = avcodec_find_decoder(in_stream->codecpar->codec_id);
     if (decoder == NULL) {
         ret = AVERROR_DECODER_NOT_FOUND;
-        stt_set_error(errbuf, errbuf_size, "could not find decoder for input audio");
+        dictate_set_error(errbuf, errbuf_size, "could not find decoder for input audio");
         goto cleanup;
     }
     dec_ctx = avcodec_alloc_context3(decoder);
     if (dec_ctx == NULL) {
         ret = AVERROR(ENOMEM);
-        stt_set_error(errbuf, errbuf_size, "could not allocate decoder context");
+        dictate_set_error(errbuf, errbuf_size, "could not allocate decoder context");
         goto cleanup;
     }
     ret = avcodec_parameters_to_context(dec_ctx, in_stream->codecpar);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not copy decoder parameters", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not copy decoder parameters", ret);
         goto cleanup;
     }
     if (dec_ctx->ch_layout.nb_channels <= 0) {
@@ -483,7 +483,7 @@ int stt_ffmpeg_convert(
     }
     ret = avcodec_open2(dec_ctx, decoder, NULL);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not open decoder", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not open decoder", ret);
         goto cleanup;
     }
 
@@ -516,23 +516,23 @@ int stt_ffmpeg_convert(
         ret = avformat_alloc_output_context2(&ofmt_ctx, NULL, output_format, out_path);
         if (ret < 0 || ofmt_ctx == NULL) {
             if (ret >= 0) ret = AVERROR(ENOMEM);
-            stt_set_av_error(errbuf, errbuf_size, "could not create output container", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not create output container", ret);
             goto cleanup;
         }
         const AVCodec *encoder = avcodec_find_encoder_by_name(codec_name);
         if (encoder == NULL) {
             ret = AVERROR_ENCODER_NOT_FOUND;
-            stt_set_error(errbuf, errbuf_size, "could not find encoder '%s'", codec_name);
+            dictate_set_error(errbuf, errbuf_size, "could not find encoder '%s'", codec_name);
             goto cleanup;
         }
         enc_ctx = avcodec_alloc_context3(encoder);
         if (enc_ctx == NULL) {
             ret = AVERROR(ENOMEM);
-            stt_set_error(errbuf, errbuf_size, "could not allocate encoder context");
+            dictate_set_error(errbuf, errbuf_size, "could not allocate encoder context");
             goto cleanup;
         }
         enc_ctx->sample_rate = sample_rate;
-        enc_ctx->sample_fmt = stt_pick_sample_fmt(encoder, sample_fmt_name);
+        enc_ctx->sample_fmt = dictate_pick_sample_fmt(encoder, sample_fmt_name);
         enc_ctx->time_base = (AVRational){1, sample_rate};
         if (codec_has_bitrate) {
             enc_ctx->bit_rate = (int64_t)bitrate_kbps * 1000;
@@ -543,20 +543,20 @@ int stt_ffmpeg_convert(
         }
         ret = avcodec_open2(enc_ctx, encoder, NULL);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not open encoder", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not open encoder", ret);
             goto cleanup;
         }
 
         out_stream = avformat_new_stream(ofmt_ctx, NULL);
         if (out_stream == NULL) {
             ret = AVERROR(ENOMEM);
-            stt_set_error(errbuf, errbuf_size, "could not allocate output stream");
+            dictate_set_error(errbuf, errbuf_size, "could not allocate output stream");
             goto cleanup;
         }
         out_stream->time_base = enc_ctx->time_base;
         ret = avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not copy encoder parameters", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not copy encoder parameters", ret);
             goto cleanup;
         }
 
@@ -569,7 +569,7 @@ int stt_ffmpeg_convert(
     input_format->format = dec_ctx->sample_fmt;
     ret = av_channel_layout_copy(&input_format->ch_layout, &dec_ctx->ch_layout);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not copy input channel layout", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not copy input channel layout", ret);
         goto cleanup;
     }
     ret = swr_alloc_set_opts2(
@@ -584,12 +584,12 @@ int stt_ffmpeg_convert(
         NULL
     );
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not allocate resampler", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not allocate resampler", ret);
         goto cleanup;
     }
     ret = swr_init(swr);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not initialize resampler", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not initialize resampler", ret);
         goto cleanup;
     }
 
@@ -600,23 +600,23 @@ int stt_ffmpeg_convert(
     );
     if (fifo == NULL) {
         ret = AVERROR(ENOMEM);
-        stt_set_error(errbuf, errbuf_size, "could not allocate audio fifo");
+        dictate_set_error(errbuf, errbuf_size, "could not allocate audio fifo");
         goto cleanup;
     }
 
     if (!samples) {
-        ofmt_ctx->interrupt_callback = (AVIOInterruptCB){stt_interrupt, &gate};
+        ofmt_ctx->interrupt_callback = (AVIOInterruptCB){dictate_interrupt, &gate};
         if (!(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
             ret = avio_open2(&ofmt_ctx->pb, out_path, AVIO_FLAG_WRITE, &ofmt_ctx->interrupt_callback, NULL);
             output_opened = ret >= 0;
             if (ret < 0) {
-                stt_set_av_error(errbuf, errbuf_size, "could not open output audio", ret);
+                dictate_set_av_error(errbuf, errbuf_size, "could not open output audio", ret);
                 goto cleanup;
             }
         }
         ret = avformat_write_header(ofmt_ctx, NULL);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not write output header", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not write output header", ret);
             goto cleanup;
         }
 
@@ -625,12 +625,12 @@ int stt_ffmpeg_convert(
     decoded = av_frame_alloc();
     if (packet == NULL || decoded == NULL) {
         ret = AVERROR(ENOMEM);
-        stt_set_error(errbuf, errbuf_size, "could not allocate decode buffers");
+        dictate_set_error(errbuf, errbuf_size, "could not allocate decode buffers");
         goto cleanup;
     }
 
     while ((ret = av_read_frame(ifmt_ctx, packet)) >= 0) {
-        if (stt_interrupt(&gate)) { ret = AVERROR_EXIT; goto cleanup; }
+        if (dictate_interrupt(&gate)) { ret = AVERROR_EXIT; goto cleanup; }
         if (packet->stream_index != audio_stream) {
             av_packet_unref(packet);
             continue;
@@ -638,11 +638,11 @@ int stt_ffmpeg_convert(
         ret = avcodec_send_packet(dec_ctx, packet);
         av_packet_unref(packet);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not send packet to decoder", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not send packet to decoder", ret);
             goto cleanup;
         }
         while ((ret = avcodec_receive_frame(dec_ctx, decoded)) >= 0) {
-            ret = stt_gate_frame(&gate,
+            ret = dictate_gate_frame(&gate,
                 swr,
                 input_format,
                 enc_ctx,
@@ -655,7 +655,7 @@ int stt_ffmpeg_convert(
             if (ret < 0) {
                 goto cleanup;
             }
-            ret = samples ? stt_deliver_samples(fifo, samples, samples_context) : stt_write_fifo_to_encoder(
+            ret = samples ? dictate_deliver_samples(fifo, samples, samples_context) : dictate_write_fifo_to_encoder(
                 fifo,
                 enc_ctx,
                 ofmt_ctx,
@@ -670,22 +670,22 @@ int stt_ffmpeg_convert(
             }
         }
         if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-            stt_set_av_error(errbuf, errbuf_size, "could not receive decoded frame", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not receive decoded frame", ret);
             goto cleanup;
         }
     }
     if (ret != AVERROR_EOF) {
-        stt_set_av_error(errbuf, errbuf_size, "could not read input packet", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not read input packet", ret);
         goto cleanup;
     }
 
     ret = avcodec_send_packet(dec_ctx, NULL);
     if (ret < 0) {
-        stt_set_av_error(errbuf, errbuf_size, "could not flush decoder", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not flush decoder", ret);
         goto cleanup;
     }
     while ((ret = avcodec_receive_frame(dec_ctx, decoded)) >= 0) {
-        ret = stt_gate_frame(&gate,
+        ret = dictate_gate_frame(&gate,
             swr,
             input_format,
             enc_ctx,
@@ -698,7 +698,7 @@ int stt_ffmpeg_convert(
         if (ret < 0) {
             goto cleanup;
         }
-        ret = samples ? stt_deliver_samples(fifo, samples, samples_context) : stt_write_fifo_to_encoder(
+        ret = samples ? dictate_deliver_samples(fifo, samples, samples_context) : dictate_write_fifo_to_encoder(
             fifo,
             enc_ctx,
             ofmt_ctx,
@@ -713,15 +713,15 @@ int stt_ffmpeg_convert(
         }
     }
     if (ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
-        stt_set_av_error(errbuf, errbuf_size, "could not receive flushed decoded frame", ret);
+        dictate_set_av_error(errbuf, errbuf_size, "could not receive flushed decoded frame", ret);
         goto cleanup;
     }
 
-    ret = stt_flush_resampler(swr, input_format, enc_ctx, fifo, errbuf, errbuf_size);
+    ret = dictate_flush_resampler(swr, input_format, enc_ctx, fifo, errbuf, errbuf_size);
     if (ret < 0) {
         goto cleanup;
     }
-    ret = samples ? stt_deliver_samples(fifo, samples, samples_context) : stt_write_fifo_to_encoder(
+    ret = samples ? dictate_deliver_samples(fifo, samples, samples_context) : dictate_write_fifo_to_encoder(
         fifo,
         enc_ctx,
         ofmt_ctx,
@@ -735,13 +735,13 @@ int stt_ffmpeg_convert(
         goto cleanup;
     }
     if (!samples) {
-        ret = stt_encode_write(enc_ctx, ofmt_ctx, out_stream, NULL, errbuf, errbuf_size);
+        ret = dictate_encode_write(enc_ctx, ofmt_ctx, out_stream, NULL, errbuf, errbuf_size);
         if (ret < 0) {
             goto cleanup;
         }
         ret = av_write_trailer(ofmt_ctx);
         if (ret < 0) {
-            stt_set_av_error(errbuf, errbuf_size, "could not write output trailer", ret);
+            dictate_set_av_error(errbuf, errbuf_size, "could not write output trailer", ret);
             goto cleanup;
         }
         ret = 0;
@@ -749,7 +749,7 @@ int stt_ffmpeg_convert(
     }
     if (intervals_enabled && gate.position < intervals[interval_count-1].end_frame) {
         ret = AVERROR_INVALIDDATA;
-        stt_set_error(errbuf, errbuf_size, "input ended before selected intervals");
+        dictate_set_error(errbuf, errbuf_size, "input ended before selected intervals");
     }
     if (source_rate) *source_rate = input_format->sample_rate;
     if (source_frames) *source_frames = gate.position;
@@ -784,7 +784,7 @@ cleanup:
     if (ifmt_ctx != NULL) {
         avformat_close_input(&ifmt_ctx);
     }
-    if (stt_interrupt(&gate)) ret = AVERROR_EXIT;
+    if (dictate_interrupt(&gate)) ret = AVERROR_EXIT;
     if (ret < 0 && output_opened) remove(out_path);
     return ret;
 }

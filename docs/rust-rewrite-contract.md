@@ -91,7 +91,7 @@ transcription file. See the README for selector examples and result semantics.
 - `model`, `language`, and `prompt` are omitted when empty.
 - `ExtraConfig` recursively merges objects, replaces arrays and scalar values, and deletes null object members at any depth, including inside arrays. Null array elements are retained. The binary `file` field is reserved.
 - Nested extra values are serialized as compact JSON strings.
-- User-Agent remains `stt-go-client/1.0`.
+- User-Agent is `dictate-client/1.0`.
 - Only HTTP 200 succeeds; the original response body is retained.
 - Requests and exponential retry waits are cancellable.
 - System proxies, redirects, and automatic compression are disabled.
@@ -101,11 +101,36 @@ transcription file. See the README for selector examples and result semantics.
 
 The Rewrite API page follows Audio Record and configures a Provider, Base URL,
 API Key, Model and ordered prompts. Each prompt has a persistent ID, title,
-content, optional JSON overrides and exactly one shortcut. Add/edit/delete/reorder
-remain drafts until Settings Save. Editor Cancel discards its changes; Settings
-Cancel discards all drafts. The shared Network and Audio Hotkeys output settings
-apply to Rewrite. Its connectivity probe sends fixed text once, with no prompt
-extras and no text delivery.
+content, optional JSON overrides and exactly one shortcut. Its optional
+`provider` defaults to null (Same as Main Provider), including when missing from
+older configurations. Null selects the entire main Rewrite API and ignores the
+prompt's `base_url`, `api_key` and `model` while retaining those values. Selecting
+a provider uses all four prompt API fields as a unit, even if the provider
+matches the main one; empty fields never inherit from the main configuration.
+This resolution is shared by GUI and CLI hotkey mode.
+
+API fields may remain incomplete when saving. Actual execution validates the
+effective URL and API key and checks the final model after merging the prompt's
+Extra config; Extra config may supply or replace the body model but does not
+configure the provider, URL or authentication key. Request routing, authentication
+and response extraction all use the selected provider.
+
+Add/edit/delete/reorder remain drafts until Settings Save. Editor Cancel
+discards its changes; Settings Cancel discards all drafts. The shared Network
+and Audio Hotkeys output settings apply to Rewrite. Main and per-prompt
+connectivity probes use only the selected API fields and shared network draft,
+send fixed instructions and input once, and never read or deliver selected text.
+They do not validate or use the draft title, prompt, hotkey or Extra config, so
+the API Model field must be set even if a normal prompt supplies it through
+Extra config. Probes share the runtime task lock and public cancel action.
+
+The prompt editor places Provider above Title, with Same as Main Provider first
+and the eight provider choices after it. A separate provider reveals the three
+API fields and a footer Test connectivity button. Same as Main Provider hides
+those fields, the test button and its result. Editing an API field, choosing a
+provider or closing the editor cancels its probe and discards stale results.
+Save and Test are disabled during a probe; Cancel remains available. The editor
+uses the existing dropdown, rounded input, button and scrollbar styles.
 
 Provider wire formats follow Dictate commit
 `7c475574c066f44a8e9d9633849e1265c5ab28eb`: OpenAI-Compatible, OpenAI Completions,
@@ -234,9 +259,9 @@ or uploading or rewriting; when idle with a buffered recording, it retries that 
 
 ## Conversion
 
-Both frontends use `stt-core::embedded_ffmpeg::EmbeddedFfmpegConverter` through
+Both frontends use `dictate_core::embedded_ffmpeg::EmbeddedFfmpegConverter` through
 `prepare_audio_for_upload`. Neither searches PATH nor launches FFmpeg.
-Release builds enable `stt-core/static-libav`; builds without native libraries
+Release builds enable `dictate-core/static-libav`; builds without native libraries
 remain usable for type checks and report LibAvUnavailable on conversion.
 
 The native bridge streams arbitrary supported inputs to 16 kHz mono int16
@@ -319,7 +344,10 @@ WebView or embedded browser runtime.
 
 - Full window: 222×94 logical pixels.
 - Minimal window: 170×46 logical pixels.
-- Settings window: 760×662 logical pixels; prompt editor: 700×610.
+- Settings window: 760×662 logical pixels. The prompt editor is up to 700
+  logical pixels wide; its height adapts to content, and both dimensions are
+  limited to the current monitor work area. Limited height uses a scrolling
+  body with a fixed footer; Tab navigation scrolls the focused field into view.
 - Frameless, per-pixel-alpha layered, always on top, per-monitor DPI aware.
 - Drag threshold is about 4 px; dragging minimal mode from the microphone does
   not activate recording on release.
@@ -338,7 +366,7 @@ WebView or embedded browser runtime.
   languages are English, Simplified Chinese, German, Japanese, and French.
 - The Display page controls the shared opacity and scale of the full and minimal
   floating windows.
-- Saving validates drafts and prepares replacement runtime dependencies/hotkeys under the task lock, atomically replaces `%APPDATA%\stt\config.json`, then commits runtime state. Failure preserves the previous configuration and restores its hotkeys; rollback registration failures are reported. Saving is allowed only in Idle or Error.
+- Saving validates drafts and prepares replacement runtime dependencies/hotkeys under the task lock, atomically replaces `%APPDATA%\dictate\config.json`, then commits runtime state. Failure preserves the previous configuration and restores its hotkeys; rollback registration failures are reported. Saving is allowed only in Idle or Error.
 - Escape closes settings first; busy quit shows a native confirmation dialog.
 
 ## Verification split

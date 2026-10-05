@@ -223,6 +223,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "dictate-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "dictate-core",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "dictate-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "cc",
+ "chrono",
+ "earshot",
+ "futures-util",
+ "hound",
+ "parking_lot",
+ "pkg-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_json_path",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "windows",
+]
+
+[[package]]
+name = "dictate-gui"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "cc",
+ "chrono",
+ "dictate-core",
+ "hound",
+ "parking_lot",
+ "pkg-config",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "windows",
+ "windows-numerics",
+ "winresource",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1275,63 +1332,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "stt-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "clap",
- "stt-core",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "stt-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "cc",
- "chrono",
- "earshot",
- "futures-util",
- "hound",
- "parking_lot",
- "pkg-config",
- "reqwest",
- "serde",
- "serde_json",
- "serde_json_path",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
- "windows",
-]
-
-[[package]]
-name = "stt-gui"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "cc",
- "chrono",
- "hound",
- "parking_lot",
- "pkg-config",
- "serde_json",
- "stt-core",
- "tempfile",
- "tokio",
- "tokio-util",
- "windows",
- "windows-numerics",
- "winresource",
-]
 
 [[package]]
 name = "subtle"

@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/stt-core",
-    "crates/stt-cli",
-    "crates/stt-gui",
+    "crates/dictate-core",
+    "crates/dictate-cli",
+    "crates/dictate-gui",
 ]
 resolver = "2"
 

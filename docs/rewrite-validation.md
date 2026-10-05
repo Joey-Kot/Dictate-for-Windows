@@ -1,15 +1,17 @@
 # Rewrite 验证记录
 
+以下验证结果保留自更名前的记录；命令中的包名已同步为当前的 `dictate-*`，不表示本次重新执行。
+
 ## 本次自动验证
 
 当前工作区在 Linux 上通过 148 项测试：核心单元测试 124 项、核心集成测试 1 项、CLI 9 项、GUI 中可跨平台执行的模型测试 14 项。新增 Debug 输出的验证范围见 [GUI Debug 输出验证记录](debug-output-validation.md)。
 
 ```sh
-cargo test --workspace --features stt-gui/native-gui
+cargo test --workspace --features dictate-gui/native-gui
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --features stt-gui/native-gui -- -D warnings
-cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --features stt-gui/native-gui -- -D warnings
-cargo build --workspace --target x86_64-pc-windows-gnu --features stt-gui/native-gui
+cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --features dictate-gui/native-gui -- -D warnings
+cargo build --workspace --target x86_64-pc-windows-gnu --features dictate-gui/native-gui
 ```
 
 本次 Windows 构建完成 CLI、GUI 的开发版编译与链接，未启用 `static-libav`。未重建静态 FFmpeg 发布包，也未向真实服务商发送付费请求。用户曾反馈此前版本在 Windows 整体测试中未见异常，随后报告 EmEditor 和 VS Code 的 UI Automation 选区读取失败。本次改为剪贴板复制读取，以下自动测试与交叉编译均已通过；新的原生剪贴板读取、备份恢复和退出等待流程尚未进行 Windows 实机验收。
@@ -31,7 +33,7 @@ cargo build --workspace --target x86_64-pc-windows-gnu --features stt-gui/native
 
 ## Windows 人工验收清单
 
-此前整体测试反馈不涵盖本次剪贴板读取变更，以下项目仍需逐项实机验证。
+此前整体测试反馈不涵盖本次剪贴板读取和提示词独立 API 变更，以下项目仍需逐项实机验证。
 
 1. 在 Windows 10/11 的 EmEditor、VS Code、记事本、浏览器文本框和 Word 中选中文本，分别使用剪贴板和 SendInput 写入模式改写；两种模式均应通过 `Ctrl+C` 读取。记录应用版本，分别验证普通权限、双方管理员权限及目标应用权限高于 Dictate 的场景；受权限限制时不得发送旧剪贴板文本。
 2. 验证无选区、只读文本、密码框、禁用复制或自定义 `Ctrl+C` 的控件，以及读取期间切换窗口/控件。读取失败或没有新的非空白文本时不发送请求、不写入；无选区时结果遵循应用 Copy 行为，例如 VS Code 可能复制当前行，不能以“未选中”统一预期失败，也不能假定本程序能识别密码框。
@@ -44,3 +46,17 @@ cargo build --workspace --target x86_64-pc-windows-gnu --features stt-gui/native
 9. RegisterHotKey 模式下占用一个新快捷键，使保存失败：文件和运行时保留旧配置、旧快捷键继续工作；关闭程序不能卡在热键线程退出。另在启动注册失败、回滚注册失败后改用可用组合保存，确认无需重启即可恢复录音与 Rewrite 快捷键。
 10. Provider 下拉的鼠标、方向键、Enter、Esc、Tab；提示词多行输入的 Enter、Tab 和快捷键录入。检查中、英、德、日、法五种语言及跨显示器 DPI 切换后的布局。
 11. 在实际服务商上测试八种 Provider 的 JSON/SSE 响应、认证、Base URL 补全与嵌套额外参数。自动化测试只验证本地协议行为。
+
+### 每个提示词的独立 API（待 Windows 实机验收）
+
+以下为新增手动步骤，尚未标记通过；Core 的本地协议测试不能替代编辑窗口的实机验证。
+
+1. 打开旧配置中的提示词和新建提示词，Provider 默认均为 Same。下拉应包含 Same 和原有八种 Provider；检查鼠标、方向键、Enter、Esc、Tab 操作。刚打开编辑窗、菜单未展开时，按 Esc 应取消编辑；展开菜单后，第一次 Esc 只关闭菜单并保留草稿，第二次 Esc 取消编辑。在 Hotkey 录制字段按 Esc 不得误关闭编辑窗。Same 下隐藏独立 Base URL、API Key、Model、连接测试按钮及结果，执行时整组继承主 Rewrite API。
+2. 选择独立 Provider，填入三个 API 字段；切回 Same，再切回独立 Provider，字段草稿应保留。分别验证编辑窗取消、主设置取消、保存和重启后的配置；Same 下保留的隐藏字段不得参与请求。
+3. 主 Rewrite API 留空或配置错误，完整配置一个独立提示词并触发其热键，确认仍可执行。独立模式缺少必需 API 参数时应报错，不得逐字段回退使用主 API 的 URL、Key 或 Model。
+4. 为不同提示词分别配置 OpenAI、Anthropic、Google 等不同 Provider，通过各自热键执行。核对实际路径、鉴权、模型、JSON/SSE 解析和回填结果；共享网络、Retry 与取消行为，失败不写入，Retry 热键仍仅重新转写音频。
+5. 在独立 API 编辑窗中，Title、Prompt Content、Hotkey 留空，Extra config 填入无效 JSON，点击 Test connectivity：只要 API 配置有效就能发起固定探测，不读取选区、不发送真实提示词或 Extra config、不回填。通过本地服务分别返回成功、401、429、5xx，确认每次点击仅请求一次。
+6. 用延迟响应服务测试：进行中 Save 和 Test 禁用，Cancel 可用；修改 Base URL、API Key、Model，或切换 Provider，应取消当前测试并清除旧结果。让旧响应迟到，再发起新测试，旧结果不得覆盖新状态。修改 Title、Prompt Content、Hotkey、Extra config 不应取消测试。
+7. 测试期间关闭编辑窗、关闭主设置或退出程序，确认取消与清理；再次打开无残留测试状态。录音、转写、Rewrite、其他连接测试期间触发提示词测试，或反向触发这些任务，应保持互斥、不排队；取消后的清理完成前不得启动新任务。
+8. 在 1366×768、1080p 及适用的 100%/150%/200% 缩放下打开编辑窗、切换 Same/独立模式并跨显示器移动。检查窗口高度受工作区限制，正文可用滚轮、自定义滚动条和 Tab 焦点导航访问全部字段，Save/Cancel 页脚保持可见；多行输入框与外层滚动互不干扰。持续滚动正文、拖动滚动条并往返到达边界，确认输入框、文字和圆角边框不闪烁或残影，Provider 选择框不闪白；菜单展开后滚动选项，确认菜单不被正文覆盖。切回 Same 后隐藏的 API 字段不得因重绘重新出现，文字清晰度和快捷键录制保持正常。
+9. 分别保存 Upload Debug 的关闭、开启状态，再用本地服务回显主 API、其他提示词、同一提示词旧密钥和未保存草稿密钥。关闭时不新增 Upload 日志；开启时错误提示、实时输出和复制内容均须脱敏，覆盖含引号、反斜杠和 URL 编码的密钥。草稿测试成功或失败均不得改写已保存配置。

@@ -54,9 +54,9 @@ jobs:
       - name: Test and lint
         run: |
           cargo fmt --all --check
-          cargo test --workspace --features stt-gui/native-gui
-          cargo clippy --workspace --all-targets --features stt-gui/native-gui -- -D warnings
-          cargo check --workspace --target x86_64-pc-windows-gnu --features stt-gui/native-gui
+          cargo test --workspace --features dictate-gui/native-gui
+          cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
+          cargo check --workspace --target x86_64-pc-windows-gnu --features dictate-gui/native-gui
 
       - name: Check third-party notices
         run: |

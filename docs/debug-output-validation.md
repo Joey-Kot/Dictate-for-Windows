@@ -1,5 +1,7 @@
 # GUI Debug 输出验证记录
 
+以下验证结果保留自更名前的记录；命令中的包名已同步为当前的 `dictate-*`，不表示本次重新执行。
+
 ## 自动验证
 
 当前工作区在 Linux 上通过 130 项测试：核心单元测试 106 项、核心集成测试 1 项、CLI 9 项、GUI 可跨平台模型测试 14 项。
@@ -9,10 +11,10 @@
 ```sh
 cargo fmt --all --check
 git diff --check
-cargo test --workspace --features stt-gui/native-gui
-cargo clippy --workspace --all-targets --features stt-gui/native-gui -- -D warnings
-cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --features stt-gui/native-gui -- -D warnings
-cargo build --workspace --target x86_64-pc-windows-gnu --features stt-gui/native-gui
+cargo test --workspace --features dictate-gui/native-gui
+cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --features dictate-gui/native-gui -- -D warnings
+cargo build --workspace --target x86_64-pc-windows-gnu --features dictate-gui/native-gui
 ```
 
 Debug 相关测试覆盖：
@@ -29,9 +31,9 @@ Debug 相关测试覆盖：
 
 ```sh
 PKG_CONFIG_PATH=/tmp/stt-debug-native-tmp/install/lib/pkgconfig \
-  cargo test -p stt-core --features static-libav --test debug_output
+  cargo test -p dictate-core --features static-libav --test debug_output
 PKG_CONFIG_PATH=/tmp/stt-debug-native-tmp/install/lib/pkgconfig \
-  cargo clippy -p stt-core --all-targets --features static-libav -- -D warnings
+  cargo clippy -p dictate-core --all-targets --features static-libav -- -D warnings
 ```
 
 该集成测试实际执行 PCM 转换，并通过原生 `av_log` 产生诊断：FFmpeg Debug 关闭时不进入 GUI 接收器，原生错误仍输出到 stderr；开启时转发为 FFmpeg 分类。此为同一个集成测试在原生功能开启后的额外执行，不计入上面的 130 项总数。

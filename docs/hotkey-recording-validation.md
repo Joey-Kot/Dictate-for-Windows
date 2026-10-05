@@ -1,14 +1,16 @@
 # 快捷键录入验证
 
+以下验证结果保留自更名前的记录；命令中的包名已同步为当前的 `dictate-*`，不表示本次重新执行。
+
 ## 自动验证
 
 核心录入测试覆盖允许按键与全部修饰键组合的配置往返、符号键和小键盘映射、禁止键污染整个组合、纯修饰键、多普通键、长按重复、不同松键顺序、进入焦点时的残留按键及放弃未完成候选。
 
 ```bash
 cargo fmt --all --check
-cargo test --workspace --features stt-gui/native-gui
-cargo clippy --workspace --all-targets --features stt-gui/native-gui -- -D warnings
-cargo clippy --target x86_64-pc-windows-gnu -p stt-gui --features native-gui -- -D warnings
+cargo test --workspace --features dictate-gui/native-gui
+cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
+cargo clippy --target x86_64-pc-windows-gnu -p dictate-gui --features native-gui -- -D warnings
 ```
 
 以上检查在 Linux 环境运行；Windows 目标另完成了启用 `native-gui,static-libav` 的 GUI 编译和链接。自动测试不代表 Windows 键盘钩子、实际焦点或绘制效果已经实测。

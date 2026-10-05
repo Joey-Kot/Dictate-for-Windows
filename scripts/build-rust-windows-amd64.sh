@@ -13,8 +13,8 @@ export PKG_CONFIG_ALLOW_CROSS=1
 export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig"
 
 cd "$ROOT_DIR"
-cargo build --release --target "$TARGET" -p stt-cli --features static-libav
-cargo build --release --target "$TARGET" -p stt-gui \
+cargo build --release --target "$TARGET" -p dictate-cli --features static-libav
+cargo build --release --target "$TARGET" -p dictate-gui \
     --features native-gui,static-libav
 
 mkdir -p "$ROOT_DIR/dist/cli" "$ROOT_DIR/dist/gui"

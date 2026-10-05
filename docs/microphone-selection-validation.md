@@ -2,7 +2,7 @@
 
 ## Implemented behavior
 
-- `stt-core::audio_devices` owns active endpoint enumeration, stable Windows
+- `dictate_core::audio_devices` owns active endpoint enumeration, stable Windows
   endpoint IDs, default-device resolution, format queries and WASAPI shared-mode
   capture. GUI and CLI call the same core implementation.
 - `INPUT_DEVICE=""` (including old configurations with no field) follows the

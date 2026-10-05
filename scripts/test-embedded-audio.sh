@@ -4,8 +4,8 @@
 # for libopus, libmp3lame and libvorbis. Nothing is installed globally.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-task_dir="${STT_NATIVE_TEST_DIR:-$root/native-audio-test-tmp}"
-source_archive="${STT_FFMPEG_ARCHIVE:-$root/build/ffmpeg/ffmpeg-8.1.tar.xz}"
+task_dir="${DICTATE_NATIVE_TEST_DIR:-$root/native-audio-test-tmp}"
+source_archive="${DICTATE_FFMPEG_ARCHIVE:-$root/build/ffmpeg/ffmpeg-8.1.tar.xz}"
 mkdir -p "$task_dir/source" "$task_dir/build"
 tar -xf "$source_archive" --strip-components=1 -C "$task_dir/source"
 cd "$task_dir/build"
@@ -25,7 +25,7 @@ make install
 cd "$root"
 bash scripts/generate-audio-test-fixtures.sh "$task_dir/fixtures"
 export PKG_CONFIG_PATH="$task_dir/install/lib/pkgconfig"
-export STT_AUDIO_FIXTURES="$task_dir/fixtures"
+export DICTATE_AUDIO_FIXTURES="$task_dir/fixtures"
 export CARGO_TARGET_DIR="$task_dir/target"
-cargo test --workspace --features stt-core/static-libav
-cargo clippy --workspace --all-targets --features stt-core/static-libav -- -D warnings
+cargo test --workspace --features dictate-core/static-libav
+cargo clippy --workspace --all-targets --features dictate-core/static-libav -- -D warnings

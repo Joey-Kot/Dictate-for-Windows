@@ -1,5 +1,7 @@
 # Rust technical validation record
 
+The checks below were recorded before the crate rename; command examples use the current `dictate-*` package names and `DICTATE_*` environment variables.
+
 ## Settings control rounded-edge rendering
 
 Settings and Rewrite editor shapes now use a cached Direct2D target and a
@@ -10,17 +12,17 @@ visibility, z-order and DPI. Rendering failures restore the GDI fallback.
 
 Checks completed for this change:
 
-- `cargo test -p stt-gui --features native-gui`: all 14 portable GUI tests pass.
-- `cargo clippy -p stt-gui --all-targets --target x86_64-pc-windows-gnu --features native-gui -- -D warnings`: passes, including the Windows pixel-test code.
-- `cargo build -p stt-gui --target x86_64-pc-windows-gnu --features native-gui`: development executable compiles and links; this is not a production static-libav release build.
-- `cargo test -p stt-gui --target x86_64-pc-windows-gnu --features native-gui --no-run`: Windows test executable compiles and links.
+- `cargo test -p dictate-gui --features native-gui`: all 14 portable GUI tests pass.
+- `cargo clippy -p dictate-gui --all-targets --target x86_64-pc-windows-gnu --features native-gui -- -D warnings`: passes, including the Windows pixel-test code.
+- `cargo build -p dictate-gui --target x86_64-pc-windows-gnu --features native-gui`: development executable compiles and links; this is not a production static-libav release build.
+- `cargo test -p dictate-gui --target x86_64-pc-windows-gnu --features native-gui --no-run`: Windows test executable compiles and links.
 - `cargo fmt --all --check` and `git diff --check`: pass.
 
 Two new Windows-only pixel tests cover transparent and partially covered edges,
 premultiplied color channels, scratch-surface reuse, and GDI composition with a
 negative viewport origin and a clip region. They have **not been executed** in
 this Linux environment. On Windows, run
-`cargo test -p stt-gui --features native-gui rounded_shape_tests`.
+`cargo test -p dictate-gui --features native-gui rounded_shape_tests`.
 
 Windows desktop verification remains pending for all Settings pages and the
 Rewrite editor at 100%, 125%, 150% and 200% DPI. Check dropdown open/close and
@@ -76,8 +78,8 @@ Native tests require an installed FFmpeg 7.1.1 development build and
 `PKG_CONFIG_PATH` pointing to its pkgconfig directory:
 
 ```bash
-STT_AUDIO_FIXTURES=/absolute/fixture/directory cargo test --workspace --features stt-core/static-libav
-cargo clippy --workspace --all-targets --features stt-core/static-libav -- -D warnings
+DICTATE_AUDIO_FIXTURES=/absolute/fixture/directory cargo test --workspace --features dictate-core/static-libav
+cargo clippy --workspace --all-targets --features dictate-core/static-libav -- -D warnings
 ```
 
 This Linux environment cannot establish real Windows 10/11 microphone, UI or
@@ -108,7 +110,7 @@ The following automated validation record describes the earlier rewrite.
 - `cargo fmt --all --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` pass.
 - `cargo check --workspace --target x86_64-pc-windows-gnu --features
-  stt-gui/native-gui`: Win32, Direct2D/DirectWrite, clipboard, hotkey, and
+  dictate-gui/native-gui`: Win32, Direct2D/DirectWrite, clipboard, hotkey, and
   PortAudio FFI signatures type-check with the GNU Windows target.
 - PortAudio v19.7.0 was cross-built using MinGW-w64. Its configuration summary
   reported `WMME=yes` and `WASAPI=no`.
