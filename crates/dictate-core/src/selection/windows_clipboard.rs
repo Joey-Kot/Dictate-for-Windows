@@ -274,13 +274,14 @@ impl Drop for GlobalLockGuard {
 
 pub(super) struct ClipboardSnapshot {
     data: Vec<ClipboardData>,
-    owner: OwnerWindow,
     restored: Cell<bool>,
 }
 
 pub(super) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), String> {
-    let owner = OwnerWindow::new()?;
-    let _clipboard = open(Some(owner.0), Duration::from_millis(300))?;
+    // Clearing needs no owner. Keeping an owner window on this worker without
+    // a message loop would block the target's Copy in WM_DESTROYCLIPBOARD while
+    // we wait for it to release the clipboard.
+    let _clipboard = open(None, Duration::from_millis(300))?;
     let mut formats = Vec::new();
     let mut previous = 0;
     loop {
@@ -323,7 +324,6 @@ pub(super) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), String> {
     Ok((
         ClipboardSnapshot {
             data,
-            owner,
             restored: Cell::new(false),
         },
         sequence,
@@ -370,7 +370,11 @@ impl ClipboardSnapshot {
         if self.restored.get() {
             return Ok(());
         }
-        let _clipboard = open(Some(self.owner.0), Duration::from_secs(1))?;
+        // SetClipboardData needs an owner, but only during this write. All data
+        // is materialized; no window needs to survive for delayed rendering.
+        // Declare the owner first so the clipboard closes before it is destroyed.
+        let owner = OwnerWindow::new()?;
+        let _clipboard = open(Some(owner.0), Duration::from_secs(1))?;
         unsafe { EmptyClipboard() }
             .map_err(|error| format!("Cannot restore clipboard: {error}"))?;
         let mut failures = Vec::new();
@@ -392,3 +396,6 @@ impl ClipboardSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

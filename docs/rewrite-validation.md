@@ -1,8 +1,40 @@
 # Rewrite 验证记录
 
-以下验证结果保留自更名前的记录；命令中的包名已同步为当前的 `dictate-*`，不表示本次重新执行。
+## 剪贴板所有者窗口修复（2026-10-06）
 
-## 本次自动验证
+用户报告 Rewrite 仍有复制超时，并伴随恢复剪贴板时的 `0x80070005` 拒绝访问。对照 STP 后确认：清空剪贴板时保留的隐藏窗口成为所有者，但工作线程没有消息循环；目标应用复制时，`EmptyClipboard` 对旧所有者的 `WM_DESTROYCLIPBOARD` 通知可能阻塞并持续占用剪贴板。
+
+备份并清空阶段现改用空所有者，不再跨复制等待保留窗口；仅恢复数据时临时创建所有者窗口，在关闭剪贴板后销毁。保留完整格式备份、共用延迟和失败不写入行为。
+
+本次实际完成的自动验证：
+
+- Linux 工作区 159 项测试通过：Core 单元测试 134 项、Core 集成测试 1 项、CLI 9 项、GUI 模型测试 15 项。
+- 格式检查及 Windows 全工作区、全部目标的 Clippy 检查通过。
+- Windows Core 测试程序交叉编译并链接成功，包含新增的原生剪贴板回归测试。
+- 含静态 FFmpeg 的 Windows GUI、CLI 发布构建及打包成功；压缩包中的程序和 README 与当前构建、源码一致，压缩包完整性及 SHA-256 校验通过。
+
+```sh
+cargo test --workspace --features dictate-gui/native-gui
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --features dictate-gui/native-gui -- -D warnings
+cargo test -p dictate-core --target x86_64-pc-windows-gnu --lib --no-run
+scripts/build-rust-windows-amd64.sh
+scripts/package-windows-release.sh
+```
+
+新增 `native_copy_without_message_pump_preserves_clipboard_formats` 使用真实 Windows 剪贴板：第二个线程执行清空与写入，等待线程不处理窗口消息；检查复制完成，以及恢复并销毁临时窗口、快照之后，Unicode 文本和注册格式仍完整可读。测试保存并尝试恢复运行前的剪贴板，因会操作桌面剪贴板而默认忽略。请在 Windows 上停止其他剪贴板操作后，单独执行：
+
+```sh
+cargo test -p dictate-core native_copy_without_message_pump_preserves_clipboard_formats -- --ignored --test-threads=1
+```
+
+当前环境为 Linux，未运行此原生测试，也未完成 EmEditor、VS Code 的 Windows 实机回归。仍需按下方清单验证实际 `Ctrl+C` 读取、恢复和两种输出模式；交叉编译通过不等同于实机通过。
+
+## 先前验证记录
+
+以下验证结果保留自更名前的记录；命令中的包名已同步为当前的 `dictate-*`。
+
+### 自动验证
 
 当前工作区在 Linux 上通过 148 项测试：核心单元测试 124 项、核心集成测试 1 项、CLI 9 项、GUI 中可跨平台执行的模型测试 14 项。新增 Debug 输出的验证范围见 [GUI Debug 输出验证记录](debug-output-validation.md)。
 

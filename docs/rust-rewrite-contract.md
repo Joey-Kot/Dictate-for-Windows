@@ -156,6 +156,13 @@ limits. Input is bounded to 1,000,000 UTF-8 bytes. Cancellation or focus changes
 during the pre-copy delay restore without copying; after Copy, the configured
 restore delay completes even when canceled.
 
+The backup/clear phase uses a null clipboard owner. The native worker has no
+window message loop, so retaining an owner window while waiting for Copy would
+block the target application's `EmptyClipboard` in `WM_DESTROYCLIPBOARD` and
+leave the clipboard locked. Restoration alone uses a temporary owner window for
+`SetClipboardData`, closing the clipboard before destroying the window. All
+restored formats are materialized and need no delayed-rendering window.
+
 Snapshots preserve supported materializable text, HTML/RTF, image and file-list
 formats, up to 64 MiB and 256 formats. Unsupported or unmaterializable formats
 fail before the original clipboard is cleared. Cancellation and normal shutdown
