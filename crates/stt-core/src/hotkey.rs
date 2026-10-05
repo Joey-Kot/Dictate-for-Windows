@@ -130,6 +130,51 @@ pub fn parse_hotkey(spec: &str) -> Result<ParsedHotkey, HotkeyError> {
     })
 }
 
+/// Existing audio bindings retain their matching semantics. New rewrite
+/// bindings must not introduce any ambiguous hook match for the same key.
+pub fn validate_config(config: &crate::Config) -> Result<(), HotkeyError> {
+    validate_bindings(
+        &config.start_key,
+        &config.pause_key,
+        &config.cancel_or_retry_key,
+    )?;
+    let mut bindings = vec![
+        ("Start".to_owned(), parse_hotkey(&config.start_key)?),
+        ("Pause".to_owned(), parse_hotkey(&config.pause_key)?),
+        (
+            "Cancel / Retry".to_owned(),
+            parse_hotkey(&config.cancel_or_retry_key)?,
+        ),
+    ];
+    for prompt in &config.rewrite.prompts {
+        let parsed = parse_hotkey(&prompt.hotkey)?;
+        for (name, previous) in &bindings {
+            if *previous == parsed
+                || (config.hotkey_hook && previous.virtual_key == parsed.virtual_key)
+            {
+                return Err(HotkeyError::Registration(format!(
+                    "Hotkey conflict: {} / {name}",
+                    prompt.title
+                )));
+            }
+        }
+        bindings.push((prompt.title.clone(), parsed));
+    }
+    // RegisterHotKey consumes even injected Ctrl+C, which Rewrite uses to copy
+    // the selection. The low-level hook ignores injected input instead.
+    if !config.hotkey_hook
+        && !config.rewrite.prompts.is_empty()
+        && let Some((name, _)) = bindings.iter().find(|(_, binding)| {
+            binding.modifiers == MOD_CTRL && binding.virtual_key == u32::from(b'C')
+        })
+    {
+        return Err(HotkeyError::Registration(format!(
+            "Hotkey {name} uses Ctrl+C, which is reserved for copying Rewrite input in RegisterHotKey mode; choose another hotkey or enable hook mode"
+        )));
+    }
+    Ok(())
+}
+
 fn key_to_virtual_key(key: &str) -> Result<u32, HotkeyError> {
     if let Some(value) = key
         .strip_prefix("vk_")
@@ -244,6 +289,7 @@ pub fn register(
     _start: &str,
     _pause: &str,
     _cancel_or_retry: &str,
+    _prompts: &[crate::rewrite::RewritePrompt],
     _hook: bool,
     _handler: impl Fn(i32) + Send + Sync + 'static,
     _debug: bool,
@@ -286,5 +332,92 @@ mod tests {
         assert_eq!(parse_hotkey("kp1").unwrap().virtual_key, 0x61);
         assert_eq!(parse_hotkey("super+return").unwrap().modifiers, MOD_WIN);
         assert_eq!(parse_hotkey("F24").unwrap().virtual_key, 0x87);
+    }
+
+    #[test]
+    fn rewrite_conflicts_cover_aliases_other_prompts_and_hook_modifier_overlap() {
+        let mut config = crate::Config::default();
+        config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+            title: "One".into(),
+            hotkey: "control+alt+Q".into(),
+            ..Default::default()
+        });
+        for hook in [false, true] {
+            config.hotkey_hook = hook;
+            assert!(validate_config(&config).is_err());
+        }
+        config.rewrite.prompts[0].hotkey = "ctrl+shift+q".into();
+        config.hotkey_hook = false;
+        validate_config(&config).unwrap();
+        config.hotkey_hook = true;
+        assert!(validate_config(&config).is_err());
+        config.rewrite.prompts[0].hotkey = "ctrl+alt+w".into();
+        validate_config(&config).unwrap();
+        config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+            title: "Two".into(),
+            hotkey: "alt+ctrl+w".into(),
+            ..Default::default()
+        });
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("One") && error.contains("Two"));
+    }
+
+    #[test]
+    fn rewrite_reserves_copy_hotkey_only_in_register_hotkey_mode() {
+        for spec in ["ctrl+c", " CONTROL + C ", "ctrl+vk_43", "Control + VK_0043"] {
+            for binding in ["Start", "Pause", "Cancel / Retry", "Rewrite prompt"] {
+                let mut config = crate::Config {
+                    hotkey_hook: false,
+                    ..Default::default()
+                };
+                config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+                    title: "Rewrite prompt".into(),
+                    hotkey: "ctrl+alt+w".into(),
+                    ..Default::default()
+                });
+                match binding {
+                    "Start" => config.start_key = spec.into(),
+                    "Pause" => config.pause_key = spec.into(),
+                    "Cancel / Retry" => config.cancel_or_retry_key = spec.into(),
+                    _ => config.rewrite.prompts[0].hotkey = spec.into(),
+                }
+
+                let error = validate_config(&config).unwrap_err().to_string();
+                assert!(error.contains(binding), "{error}");
+                assert!(error.contains("Ctrl+C"), "{error}");
+                assert!(
+                    error.contains("reserved for copying Rewrite input"),
+                    "{error}"
+                );
+                assert!(error.contains("RegisterHotKey mode"), "{error}");
+                assert!(
+                    error.contains("choose another hotkey or enable hook mode"),
+                    "{error}"
+                );
+
+                config.hotkey_hook = true;
+                validate_config(&config).unwrap();
+
+                config.hotkey_hook = false;
+                config.rewrite.prompts.clear();
+                validate_config(&config).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_copy_reservation_allows_other_modifier_combinations() {
+        let mut config = crate::Config {
+            hotkey_hook: false,
+            ..Default::default()
+        };
+        config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+            title: "Rewrite prompt".into(),
+            ..Default::default()
+        });
+        for spec in ["c", "alt+c", "ctrl+alt+c", "ctrl+shift+c", "win+ctrl+c"] {
+            config.rewrite.prompts[0].hotkey = spec.into();
+            validate_config(&config).unwrap();
+        }
     }
 }

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
 
@@ -23,7 +24,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
     HGDIOBJ, SelectObject,
 };
@@ -468,10 +469,20 @@ impl LayeredSurface {
     }
 
     unsafe fn present(&self, hwnd: HWND, opacity: u8) -> windows::core::Result<()> {
+        unsafe { self.present_size(hwnd, opacity, self.width, self.height) }
+    }
+
+    unsafe fn present_size(
+        &self,
+        hwnd: HWND,
+        opacity: u8,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<()> {
         let source = POINT { x: 0, y: 0 };
         let size = SIZE {
-            cx: self.width as i32,
-            cy: self.height as i32,
+            cx: width as i32,
+            cy: height as i32,
         };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -503,6 +514,197 @@ impl Drop for LayeredSurface {
             let _ = DeleteDC(self.dc);
         }
     }
+}
+
+thread_local! {
+    static ROUNDED_SHAPES: RefCell<Option<RoundedShapeRenderer>> = const { RefCell::new(None) };
+}
+
+/// Paint only the shape through Direct2D. GDI text and native child controls keep
+/// their own pixel-aligned rendering, viewport origin and clipping region.
+pub fn draw_rounded_box(
+    hdc: HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+    radius: i32,
+) -> windows::core::Result<()> {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return Ok(());
+    }
+    with_rounded_shapes(|renderer| {
+        let surface = renderer.paint(width as u32, height as u32, fill, border, radius)?;
+        unsafe {
+            AlphaBlend(
+                hdc,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                surface.dc,
+                0,
+                0,
+                width,
+                height,
+                BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: u8::MAX,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                },
+            )
+            .ok()
+        }
+    })
+}
+
+/// Present a layered panel with genuine transparent, antialiased outer corners.
+pub fn paint_rounded_panel(hwnd: HWND, fill: COLORREF, radius: i32) -> windows::core::Result<()> {
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client)? };
+    let width = client.right - client.left;
+    let height = client.bottom - client.top;
+    if width <= 0 || height <= 0 {
+        return Ok(());
+    }
+    with_rounded_shapes(|renderer| {
+        let surface = renderer.paint(width as u32, height as u32, fill, fill, radius)?;
+        // The scratch bitmap can be larger after painting another control. Only
+        // the panel's actual dimensions belong in UpdateLayeredWindow's size.
+        unsafe { surface.present_size(hwnd, u8::MAX, width as u32, height as u32) }
+    })
+}
+
+fn with_rounded_shapes(
+    paint: impl FnOnce(&mut RoundedShapeRenderer) -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    ROUNDED_SHAPES.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            // Presenting a layered window can synchronously dispatch messages.
+            // A nested paint uses its own resources instead of borrowing again.
+            return paint(&mut RoundedShapeRenderer::new()?);
+        };
+        if cache.is_none() {
+            *cache = Some(RoundedShapeRenderer::new()?);
+        }
+        let result = paint(cache.as_mut().unwrap());
+        if result.is_err() {
+            // A failed EndDraw must never copy stale pixels. Recreate all
+            // dependent resources on the next paint, including after device loss.
+            *cache = None;
+        }
+        result
+    })
+}
+
+struct RoundedShapeRenderer {
+    target: ID2D1DCRenderTarget,
+    brush: ID2D1SolidColorBrush,
+    surface: Option<LayeredSurface>,
+}
+
+impl RoundedShapeRenderer {
+    fn new() -> windows::core::Result<Self> {
+        unsafe {
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let target = factory.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                // Callers already pass physical pixels scaled for their window.
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            })?;
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            let brush = target.CreateSolidColorBrush(&rgb8(0, 0, 0), None)?;
+            Ok(Self {
+                target,
+                brush,
+                surface: None,
+            })
+        }
+    }
+
+    fn paint(
+        &mut self,
+        width: u32,
+        height: u32,
+        fill: COLORREF,
+        border: COLORREF,
+        radius: i32,
+    ) -> windows::core::Result<&LayeredSurface> {
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|surface| surface.width < width || surface.height < height)
+        {
+            let (capacity_width, capacity_height) = self
+                .surface
+                .as_ref()
+                .map(|surface| (surface.width.max(width), surface.height.max(height)))
+                .unwrap_or((width, height));
+            self.surface = Some(LayeredSurface::new(capacity_width, capacity_height)?);
+        }
+        let surface = self.surface.as_ref().unwrap();
+        let radius = (radius.max(0) as f32).min(width.min(height) as f32 / 2.0);
+        unsafe {
+            self.target.BindDC(
+                surface.dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                },
+            )?;
+            self.target.BeginDraw();
+            self.target.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            self.brush.SetColor(&colorref(border));
+            self.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: width as f32,
+                        bottom: height as f32,
+                    },
+                    radiusX: radius,
+                    radiusY: radius,
+                },
+                &self.brush,
+            );
+            // Keep the existing one-physical-pixel border. A single outer fill
+            // prevents repeatedly blending the same antialiased silhouette.
+            if fill != border && width > 2 && height > 2 {
+                self.brush.SetColor(&colorref(fill));
+                self.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: 1.0,
+                            top: 1.0,
+                            right: width as f32 - 1.0,
+                            bottom: height as f32 - 1.0,
+                        },
+                        radiusX: (radius - 1.0).max(0.0),
+                        radiusY: (radius - 1.0).max(0.0),
+                    },
+                    &self.brush,
+                );
+            }
+            self.target.EndDraw(None, None)?;
+        }
+        Ok(surface)
+    }
+}
+
+fn colorref(value: COLORREF) -> D2D1_COLOR_F {
+    rgb8(value.0 as u8, (value.0 >> 8) as u8, (value.0 >> 16) as u8)
 }
 
 pub struct RoundedOutlineRenderer {
@@ -688,9 +890,12 @@ pub fn button_is_disabled(index: i32, event: &Event) -> bool {
     let state = event.state;
     (index == 1 && !matches!(state, State::Recording | State::Paused))
         || (index == 2
-            && !matches!(state, State::Recording | State::Paused | State::Uploading)
+            && !matches!(
+                state,
+                State::Recording | State::Paused | State::Uploading | State::Rewriting
+            )
             && !button_shows_retry(event))
-        || (index == 0 && state == State::Uploading)
+        || (index == 0 && matches!(state, State::Uploading | State::Rewriting))
 }
 
 fn button_rect_f(index: i32, minimal: bool, lift: f32) -> D2D_RECT_F {
@@ -1277,4 +1482,105 @@ fn mix(from: D2D1_COLOR_F, to: D2D1_COLOR_F, amount: f32) -> D2D1_COLOR_F {
         from.b + (to.b - from.b) * amount,
         from.a + (to.a - from.a) * amount,
     )
+}
+
+#[cfg(test)]
+mod rounded_shape_tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        DC_BRUSH, DIBSECTION, FillRect, GdiFlush, GetObjectW, GetStockObject, GetViewportOrgEx,
+        HBRUSH, IntersectClipRect, SetDCBrushColor, SetViewportOrgEx,
+    };
+
+    fn pixels(surface: &LayeredSurface) -> Vec<[u8; 4]> {
+        unsafe {
+            assert!(GdiFlush().as_bool());
+            let mut section = DIBSECTION::default();
+            assert_eq!(
+                GetObjectW(
+                    HGDIOBJ(surface.bitmap.0),
+                    size_of::<DIBSECTION>() as i32,
+                    Some((&mut section as *mut DIBSECTION).cast()),
+                ),
+                size_of::<DIBSECTION>() as i32,
+            );
+            let bytes = std::slice::from_raw_parts(
+                section.dsBm.bmBits.cast::<u8>(),
+                (surface.width * surface.height * 4) as usize,
+            );
+            bytes.as_chunks::<4>().0.to_vec()
+        }
+    }
+
+    #[test]
+    fn rounded_shape_clears_reused_surface_and_keeps_premultiplied_edges() {
+        let mut renderer = RoundedShapeRenderer::new().unwrap();
+        renderer
+            .paint(48, 32, COLORREF(0x0000ff), COLORREF(0x0000ff), 0)
+            .unwrap();
+        let surface = renderer
+            .paint(32, 24, COLORREF(0xa05018), COLORREF(0xa05018), 7)
+            .unwrap();
+        let pixels = pixels(surface);
+        let at = |x: usize, y: usize| pixels[y * surface.width as usize + x];
+        assert_eq!(at(0, 0), [0, 0, 0, 0]);
+        assert_eq!(at(16, 12), [160, 80, 24, 255]);
+        let edge = (0..7)
+            .flat_map(|y| (0..7).map(move |x| at(x, y)))
+            .filter(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            .collect::<Vec<_>>();
+        assert!(
+            !edge.is_empty(),
+            "rounded edge must contain partial coverage"
+        );
+        for [b, g, r, a] in edge {
+            assert!(b <= a && g <= a && r <= a);
+        }
+    }
+
+    #[test]
+    fn rounded_shape_blend_preserves_viewport_clip_and_background() {
+        let destination = LayeredSurface::new(24, 20).unwrap();
+        unsafe {
+            SetDCBrushColor(destination.dc, COLORREF(0x1e140a));
+            FillRect(
+                destination.dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 24,
+                    bottom: 20,
+                },
+                HBRUSH(GetStockObject(DC_BRUSH).0),
+            );
+            assert!(SetViewportOrgEx(destination.dc, -10, -20, None).as_bool());
+            IntersectClipRect(destination.dc, 14, 20, 28, 40);
+        }
+        draw_rounded_box(
+            destination.dc,
+            RECT {
+                left: 12,
+                top: 22,
+                right: 30,
+                bottom: 38,
+            },
+            COLORREF(0xa05018),
+            COLORREF(0xa05018),
+            4,
+        )
+        .unwrap();
+        let pixels = pixels(&destination);
+        let at = |x: usize, y: usize| {
+            let pixel = pixels[y * destination.width as usize + x];
+            [pixel[0], pixel[1], pixel[2]]
+        };
+        assert_eq!(at(3, 10), [30, 20, 10], "left of clip must be preserved");
+        assert_eq!(at(5, 10), [160, 80, 24]);
+        assert_eq!(at(14, 10), [160, 80, 24]);
+        assert_eq!(at(18, 10), [30, 20, 10], "right of clip must be preserved");
+        assert_eq!(at(10, 19), [30, 20, 10], "outside shape must be preserved");
+        let mut origin = POINT::default();
+        unsafe { assert!(GetViewportOrgEx(destination.dc, &mut origin).as_bool()) };
+        assert_eq!((origin.x, origin.y), (-10, -20));
+    }
 }

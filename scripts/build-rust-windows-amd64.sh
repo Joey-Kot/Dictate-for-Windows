@@ -18,7 +18,7 @@ cargo build --release --target "$TARGET" -p stt-gui \
     --features native-gui,static-libav
 
 mkdir -p "$ROOT_DIR/dist/cli" "$ROOT_DIR/dist/gui"
-cp "$ROOT_DIR/target/$TARGET/release/stt.exe" \
-    "$ROOT_DIR/dist/cli/stt.exe"
-cp "$ROOT_DIR/target/$TARGET/release/STT.exe" \
-    "$ROOT_DIR/dist/gui/STT.exe"
+cp "$ROOT_DIR/target/$TARGET/release/dictate-cli.exe" \
+    "$ROOT_DIR/dist/cli/dictate-cli.exe"
+cp "$ROOT_DIR/target/$TARGET/release/Dictate.exe" \
+    "$ROOT_DIR/dist/gui/Dictate.exe"

@@ -35,7 +35,7 @@ impl TrayIcon {
             hIcon: icon,
             ..Default::default()
         };
-        write_wide(&mut data.szTip, "STT");
+        write_wide(&mut data.szTip, "Dictate");
         unsafe {
             if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
                 return Err(windows::core::Error::from_win32());

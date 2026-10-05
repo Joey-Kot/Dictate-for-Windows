@@ -13,8 +13,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
-    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 use super::{HotkeyError, HotkeyRegistration, ParsedHotkey, parse_hotkey, validate_bindings};
@@ -23,12 +24,13 @@ pub fn register(
     start: &str,
     pause: &str,
     cancel_or_retry: &str,
+    prompts: &[crate::rewrite::RewritePrompt],
     hook: bool,
     handler: impl Fn(i32) + Send + Sync + 'static,
     debug: bool,
 ) -> Result<HotkeyRegistration, HotkeyError> {
     validate_bindings(start, pause, cancel_or_retry)?;
-    let definitions = [
+    let mut definitions = vec![
         (1, start.to_string(), parse_hotkey(start)?),
         (2, pause.to_string(), parse_hotkey(pause)?),
         (
@@ -37,6 +39,13 @@ pub fn register(
             parse_hotkey(cancel_or_retry)?,
         ),
     ];
+    for (index, prompt) in prompts.iter().enumerate() {
+        definitions.push((
+            1000 + index as i32,
+            prompt.hotkey.clone(),
+            parse_hotkey(&prompt.hotkey)?,
+        ));
+    }
     if hook {
         start_low_level_hook(definitions, Arc::new(handler), debug)
     } else {
@@ -45,7 +54,7 @@ pub fn register(
 }
 
 fn start_registered_hotkeys(
-    definitions: [(i32, String, ParsedHotkey); 3],
+    definitions: Vec<(i32, String, ParsedHotkey)>,
     handler: Arc<dyn Fn(i32) + Send + Sync>,
     debug: bool,
 ) -> Result<HotkeyRegistration, HotkeyError> {
@@ -70,8 +79,15 @@ fn start_registered_hotkeys(
                 }
                 registered.push(*id);
             }
-            let _ = result_tx.send(Ok(thread_id));
             let mut message = MSG::default();
+            // Publish readiness only after the thread can receive WM_QUIT.
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            if result_tx.send(Ok(thread_id)).is_err() {
+                for id in registered {
+                    let _ = UnregisterHotKey(None, id);
+                }
+                return;
+            }
             loop {
                 let result = GetMessageW(&mut message, None, 0, 0);
                 if result.0 <= 0 {
@@ -79,7 +95,13 @@ fn start_registered_hotkeys(
                 }
                 if message.message == WM_HOTKEY && !super::capture_active() {
                     if debug {
-                        eprintln!("[hotkey-debug] WM_HOTKEY received id={}", message.wParam.0);
+                        crate::debug_log::write(
+                            crate::debug_log::Category::Hotkey,
+                            format_args!(
+                                "[hotkey-debug] WM_HOTKEY received id={}",
+                                message.wParam.0
+                            ),
+                        );
                     }
                     handler(message.wParam.0 as i32);
                 }
@@ -142,7 +164,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 if modifiers_satisfied(modifiers) {
                     state.swallowed.insert(virtual_key, true);
                     if state.debug {
-                        eprintln!("[hotkey-debug] swallowed keydown vk=0x{virtual_key:X} id={id}");
+                        crate::debug_log::write(
+                            crate::debug_log::Category::Hotkey,
+                            format_args!(
+                                "[hotkey-debug] swallowed keydown vk=0x{virtual_key:X} id={id}"
+                            ),
+                        );
                     }
                     (state.handler)(id);
                     return LRESULT(1);
@@ -180,7 +207,7 @@ fn modifiers_satisfied(required: u32) -> bool {
 }
 
 fn start_low_level_hook(
-    definitions: [(i32, String, ParsedHotkey); 3],
+    definitions: Vec<(i32, String, ParsedHotkey)>,
     handler: Arc<dyn Fn(i32) + Send + Sync>,
     debug: bool,
 ) -> Result<HotkeyRegistration, HotkeyError> {
@@ -220,9 +247,10 @@ fn start_low_level_hook(
                 }
             };
             let thread_id = GetCurrentThreadId();
-            let _ = result_tx.send(Ok(thread_id));
             let mut message = MSG::default();
-            while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            let ready = result_tx.send(Ok(thread_id)).is_ok();
+            while ready && GetMessageW(&mut message, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }

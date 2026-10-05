@@ -1,13 +1,18 @@
+pub mod additional_parameters;
 pub mod asr;
 pub mod cache;
 pub mod clipboard;
 pub mod config;
 pub mod converter;
+pub mod debug_log;
 pub mod hotkey;
 pub mod jsonpath;
 pub mod keyboard;
+mod network;
 pub mod recorder;
+pub mod rewrite;
 pub mod runtime;
+pub mod selection;
 pub mod text_input;
 
 pub use config::Config;

@@ -24,6 +24,8 @@ struct Field {
     generation: usize,
     language: Language,
     status: HWND,
+    context: Vec<(String, String)>,
+    hook: bool,
 }
 
 struct Hook {
@@ -53,6 +55,8 @@ pub fn attach(hwnd: HWND, value: String, language: Language, status: HWND) -> Re
         generation: 0,
         language,
         status,
+        context: Vec::new(),
+        hook: true,
     });
     let pointer = Box::into_raw(field);
     if !unsafe { SetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, pointer as usize) }.as_bool() {
@@ -74,6 +78,15 @@ pub fn value(hwnd: HWND) -> Option<String> {
         Some(unsafe { &*(data as *const Field) }.value.clone())
     } else {
         None
+    }
+}
+
+pub fn set_context(hwnd: HWND, context: Vec<(String, String)>, hook: bool) {
+    let mut data = 0;
+    if unsafe { GetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, Some(&mut data)) }.as_bool() {
+        let field = unsafe { &mut *(data as *mut Field) };
+        field.context = context;
+        field.hook = hook;
     }
 }
 
@@ -254,6 +267,19 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 }
 
 fn check_duplicates(hwnd: HWND, field: &Field) {
+    if let Ok(current) = parse_hotkey(&field.value) {
+        for (name, spec) in &field.context {
+            if let Ok(other) = parse_hotkey(spec)
+                && (current == other || (field.hook && current.virtual_key == other.virtual_key))
+            {
+                set_text(
+                    field.status,
+                    &format!("{}: {name}", field.language.text("hotkey_duplicate")),
+                );
+                return;
+            }
+        }
+    }
     let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
     let mut bindings: Vec<(&str, stt_core::hotkey::ParsedHotkey)> = Vec::new();
     for spec in FIELDS.iter().filter(|spec| KEYS.contains(&spec.key)) {

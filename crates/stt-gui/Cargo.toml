@@ -9,7 +9,7 @@ rust-version.workspace = true
 build = "build.rs"
 
 [[bin]]
-name = "STT"
+name = "Dictate"
 path = "src/main.rs"
 required-features = ["native-gui"]
 
@@ -21,6 +21,7 @@ static-libav = ["stt-core/static-libav"]
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+chrono.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
 stt-core = { path = "../stt-core" }

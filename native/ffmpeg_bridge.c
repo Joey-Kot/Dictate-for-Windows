@@ -14,10 +14,35 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/log.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
+
+static SttLog stt_log_sink = NULL;
+
+static void stt_log_callback(void *context, int level, const char *format, va_list args) {
+    /* The Rust bridge serializes conversions because libav's log level is global.
+     * Disabled FFmpeg debug still preserves native errors on stderr. */
+    int limit = av_log_get_level();
+    if (stt_log_sink != NULL && limit >= AV_LOG_INFO && level <= limit) {
+        char line[8192];
+        int prefix = 1;
+        va_list copy;
+        va_copy(copy, args);
+        av_log_format_line2(context, level, format, copy, line, sizeof(line), &prefix);
+        va_end(copy);
+        line[sizeof(line) - 1] = '\0';
+        if (stt_log_sink(line)) return;
+    }
+    av_log_default_callback(context, level, format, args);
+}
+
+void stt_ffmpeg_set_log_callback(SttLog callback) {
+    stt_log_sink = callback;
+    av_log_set_callback(stt_log_callback);
+}
 
 static void stt_set_error(char *errbuf, int errbuf_size, const char *fmt, ...) {
     if (errbuf == NULL || errbuf_size <= 0) {

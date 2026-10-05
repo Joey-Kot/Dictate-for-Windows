@@ -1,19 +1,147 @@
-//! Shared rounded menu surface for the language and microphone selectors.
+//! Shared antialiased menu surface for the settings dropdown selectors.
 use super::*;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, DeleteDC, SRCCOPY,
-    SetViewportOrgEx,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRectRgn, CreateRoundRectRgn,
+    DeleteDC, SRCCOPY, SetViewportOrgEx,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
-use windows::Win32::UI::Shell::{DefSubclassProc, GetWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETTOPINDEX, WM_CHAR,
-    WM_KEYDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_VSCROLL,
+    GWL_STYLE, GetCursorPos, GetParent, IsWindow, LB_GETITEMRECT, LB_ITEMFROMPOINT,
+    LB_RESETCONTENT, LB_SETTOPINDEX, WM_CHAR, WM_KEYDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_VSCROLL,
 };
 
 pub(super) const PADDING: i32 = 8;
 pub(super) const ROW_HEIGHT: i32 = 36;
+
+struct PanelSurface {
+    hwnd: HWND,
+    dpi: u32,
+    painted_size: Option<(i32, i32, u32)>,
+}
+
+impl PanelSurface {
+    unsafe fn sync(&mut self, panel: HWND) {
+        unsafe {
+            // Test the child's own visible bit: a temporarily hidden ancestor
+            // must not leave the surface hidden when that ancestor reappears.
+            if GetWindowLongPtrW(panel, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                return;
+            }
+            let mut bounds = RECT::default();
+            let Ok(parent) = GetParent(panel) else {
+                self.fallback(panel);
+                return;
+            };
+            if GetWindowRect(panel, &mut bounds).is_err() {
+                self.fallback(panel);
+                return;
+            }
+            let mut origin = POINT {
+                x: bounds.left,
+                y: bounds.top,
+            };
+            if !ScreenToClient(parent, &mut origin).as_bool() {
+                self.fallback(panel);
+                return;
+            }
+            let width = bounds.right - bounds.left;
+            let height = bounds.bottom - bounds.top;
+            let padding = platform::scale(PADDING, self.dpi);
+            if width <= padding * 2 || height <= padding * 2 {
+                self.fallback(panel);
+                return;
+            }
+            // The alpha surface sits immediately behind the native content, but
+            // above the settings fields that the expanded menu overlaps.
+            if SetWindowPos(
+                self.hwnd,
+                Some(panel),
+                origin.x,
+                origin.y,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            )
+            .is_err()
+            {
+                self.fallback(panel);
+                return;
+            }
+            let size = (width, height, self.dpi);
+            if self.painted_size != Some(size) {
+                let radius = platform::scale(12, self.dpi);
+                if crate::render::paint_rounded_panel(self.hwnd, background(), radius).is_err() {
+                    self.fallback(panel);
+                    return;
+                }
+                // Every list/button/scrollbar is inside this padding. Keep its
+                // normal GDI drawing in an opaque rectangle; the alpha surface
+                // supplies the entire curved edge without a hard window region.
+                let region = CreateRectRgn(padding, padding, width - padding, height - padding);
+                if region.is_invalid() {
+                    self.fallback(panel);
+                    return;
+                }
+                if SetWindowRgn(panel, Some(region), true) == 0 {
+                    let _ = DeleteObject(HGDIOBJ(region.0));
+                    self.fallback(panel);
+                    return;
+                }
+                self.painted_size = Some(size);
+            }
+            // SetWindowPos preserves the z-order while showing the surface.
+            if SetWindowPos(
+                self.hwnd,
+                Some(panel),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOACTIVATE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+            )
+            .is_err()
+            {
+                self.fallback(panel);
+            }
+        }
+    }
+
+    unsafe fn fallback(&mut self, panel: HWND) {
+        unsafe {
+            self.painted_size = None;
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let mut client = RECT::default();
+            if GetClientRect(panel, &mut client).is_ok() {
+                let radius = platform::scale(12, self.dpi);
+                let region = CreateRoundRectRgn(
+                    0,
+                    0,
+                    client.right + 1,
+                    client.bottom + 1,
+                    radius * 2,
+                    radius * 2,
+                );
+                if !region.is_invalid() {
+                    if SetWindowRgn(panel, Some(region), true) != 0 {
+                        return;
+                    }
+                    let _ = DeleteObject(HGDIOBJ(region.0));
+                }
+            }
+            // Never leave an old inset region with no alpha surface behind it.
+            let _ = SetWindowRgn(panel, None, true);
+        }
+    }
+}
 
 pub(super) fn background() -> COLORREF {
     rgb(23, 31, 35)
@@ -193,8 +321,45 @@ pub(super) fn create_panel(
         0,
         instance,
     )?;
-    if !unsafe { SetWindowSubclass(panel, Some(panel_proc), 1, 0) }.as_bool() {
-        return Err("Unable to initialize dropdown panel".into());
+    let surface = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            w!("STATIC"),
+            w!(""),
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1,
+            1,
+            Some(state.hwnd),
+            None,
+            Some(instance.into()),
+            None,
+        )
+    };
+    let surface = match surface {
+        Ok(surface) => surface,
+        Err(error) => {
+            unsafe {
+                let _ = DestroyWindow(panel);
+            }
+            return Err(error.to_string());
+        }
+    };
+    let data = Box::into_raw(Box::new(RefCell::new(PanelSurface {
+        hwnd: surface,
+        dpi: state.dpi,
+        painted_size: None,
+    })));
+    unsafe {
+        if !SetWindowSubclass(surface, Some(surface_proc), 1, 0).as_bool()
+            || !SetWindowSubclass(panel, Some(panel_proc), 1, data as usize).as_bool()
+        {
+            drop(Box::from_raw(data));
+            let _ = DestroyWindow(surface);
+            let _ = DestroyWindow(panel);
+            return Err("Unable to initialize dropdown panel".into());
+        }
     }
     Ok(panel)
 }
@@ -206,6 +371,11 @@ pub(super) fn position(panel: HWND, button: HWND, height: i32, dpi: u32) -> i32 
 
 pub(super) fn position_pixels(panel: HWND, button: HWND, height: i32, dpi: u32) -> i32 {
     unsafe {
+        let mut data = 0;
+        if GetWindowSubclass(panel, Some(panel_proc), 1, Some(&mut data)).as_bool() {
+            let state = &*(data as *const RefCell<PanelSurface>);
+            state.borrow_mut().dpi = dpi;
+        }
         let mut bounds = RECT::default();
         let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(panel) else {
             return 0;
@@ -243,11 +413,6 @@ pub(super) fn position_pixels(panel: HWND, button: HWND, height: i32, dpi: u32) 
             height,
             SWP_NOACTIVATE,
         );
-        let radius = platform::scale(12, dpi);
-        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2);
-        if SetWindowRgn(panel, Some(region), true) == 0 {
-            let _ = DeleteObject(HGDIOBJ(region.0));
-        }
         let _ = InvalidateRect(Some(panel), None, true);
         (width - platform::scale(PADDING * 2, dpi)).max(1)
     }
@@ -277,11 +442,28 @@ unsafe extern "system" fn panel_proc(
     wparam: WPARAM,
     lparam: LPARAM,
     _: usize,
-    _: usize,
+    data: usize,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{GetParent, WM_MEASUREITEM};
+    use windows::Win32::UI::WindowsAndMessaging::WM_MEASUREITEM;
     unsafe {
         match message {
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(hwnd, Some(panel_proc), 1);
+                let state = Box::from_raw(data as *mut RefCell<PanelSurface>).into_inner();
+                if IsWindow(Some(state.hwnd)).as_bool() {
+                    let _ = DestroyWindow(state.hwnd);
+                }
+                return DefSubclassProc(hwnd, message, wparam, lparam);
+            }
+            WM_WINDOWPOSCHANGED => {
+                let result = DefSubclassProc(hwnd, message, wparam, lparam);
+                let state = &*(data as *const RefCell<PanelSurface>);
+                // SetWindowRgn may reenter this message while syncing.
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.sync(hwnd);
+                }
+                return result;
+            }
             WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
             WM_DRAWITEM => {
                 if let Ok(parent) = GetParent(hwnd) {
@@ -311,5 +493,30 @@ unsafe extern "system" fn panel_proc(
             _ => {}
         }
         DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+}
+
+unsafe extern "system" fn surface_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        match message {
+            // Menu padding consumes clicks just as the original panel did.
+            // Pixels with zero alpha fall through via layered hit testing.
+            WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut paint);
+                let _ = EndPaint(hwnd, &paint);
+                LRESULT(0)
+            }
+            _ => DefSubclassProc(hwnd, message, wparam, lparam),
+        }
     }
 }

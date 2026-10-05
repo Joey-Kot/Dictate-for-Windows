@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
@@ -76,27 +76,22 @@ pub struct AsrClient {
 impl AsrClient {
     pub fn new(config: Config) -> Result<Self, AsrError> {
         let text_path = jsonpath::parse_text_path(&config.text_path)?;
-        let extra_config = if config.extra_config.is_empty() {
+        let extra_config = if config.extra_config.trim().is_empty() {
             None
         } else {
             Some(serde_json::from_str::<BTreeMap<String, Value>>(
                 &config.extra_config,
             )?)
         };
-        let mut builder = Client::builder()
-            .danger_accept_invalid_certs(!config.verify_ssl)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate();
-        if config.request_timeout > 0 {
-            builder = builder.timeout(Duration::from_secs(config.request_timeout as u64));
+        if extra_config
+            .as_ref()
+            .is_some_and(|fields| fields.contains_key("file"))
+        {
+            return Err(AsrError::Attempt(
+                "Extra config file conflicts with the audio upload".into(),
+            ));
         }
-        if !config.enable_http2 {
-            builder = builder.http1_only();
-        }
-        let client = builder.build().map_err(AsrError::Client)?;
+        let client = crate::network::client(&config).map_err(AsrError::Client)?;
         Ok(Self {
             config,
             client,
@@ -136,6 +131,10 @@ impl AsrClient {
         let mut delay = self.config.retry_base_delay;
         loop {
             attempt += 1;
+            self.debug(format_args!(
+                "[upload] Audio attempt {attempt}/{}",
+                self.config.max_retry
+            ));
             if attempt > 1 {
                 prepare().await?;
             }
@@ -152,10 +151,14 @@ impl AsrClient {
                 });
             }
             if self.config.upload_debug {
-                eprintln!(
-                    "[upload] attempt {attempt} failed: {}",
-                    format_response(&response)
+                let clean = crate::debug_log::request_message(
+                    &String::from_utf8_lossy(&response),
+                    &self.config,
                 );
+                self.debug(format_args!(
+                    "[upload] attempt {attempt} failed: {}",
+                    format_response(clean.as_bytes())
+                ));
             }
             if attempt >= self.config.max_retry {
                 return Err(AsrError::RetryExhausted {
@@ -165,8 +168,15 @@ impl AsrClient {
                 });
             }
             let duration = Duration::from_secs_f64(delay.max(0.0));
+            self.debug(format_args!(
+                "[upload] Audio retry in {:.3}s",
+                duration.as_secs_f64()
+            ));
             tokio::select! {
-                _ = cancellation.cancelled() => return Err(AsrError::Canceled),
+                _ = cancellation.cancelled() => {
+                    self.debug(format_args!("[upload] Audio canceled during retry wait"));
+                    return Err(AsrError::Canceled);
+                },
                 _ = tokio::time::sleep(duration) => {}
             }
             delay *= 2.0;
@@ -180,16 +190,54 @@ impl AsrClient {
         if self.config.api_endpoint.is_empty() {
             return Err(AsrError::EmptyEndpoint);
         }
-        let cancellation = CancellationToken::new();
-        let response = self.send_request(&cancellation, file_path).await?;
+        self.test_connection_cancellable(&CancellationToken::new(), file_path)
+            .await
+    }
+
+    pub async fn test_connection_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+        file_path: &Path,
+    ) -> Result<(), AsrError> {
+        self.debug(format_args!("[upload] Audio connectivity test"));
+        let started = Instant::now();
+        let result = self.test_connection_once(cancellation, file_path).await;
+        match &result {
+            Ok(()) => self.debug(format_args!(
+                "[upload] Audio connectivity succeeded, elapsed={}ms",
+                started.elapsed().as_millis()
+            )),
+            Err(error) => self.debug(format_args!(
+                "[upload] Audio connectivity failed, elapsed={}ms: {error}",
+                started.elapsed().as_millis()
+            )),
+        }
+        result
+    }
+
+    async fn test_connection_once(
+        &self,
+        cancellation: &CancellationToken,
+        file_path: &Path,
+    ) -> Result<(), AsrError> {
+        let response = self.send_request(cancellation, file_path).await?;
         let status = response.status();
         if status == StatusCode::OK {
             return Ok(());
         }
-        let response = response.bytes().await.map_err(AsrError::Client)?;
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AsrError::Canceled),
+            result = response.bytes() => result.map_err(AsrError::Client)?,
+        };
         Err(AsrError::Attempt(format!(
             "HTTP {status}: {}",
-            format_response(&response)
+            format_response(
+                crate::debug_log::request_message(
+                    &String::from_utf8_lossy(&response),
+                    &self.config
+                )
+                .as_bytes()
+            )
         )))
     }
 
@@ -198,13 +246,7 @@ impl AsrClient {
         cancellation: &CancellationToken,
         file_path: &Path,
     ) -> Result<(bool, Vec<u8>), AsrError> {
-        if self.config.upload_debug {
-            eprintln!(
-                "[upload] uploading {} -> {}",
-                file_path.display(),
-                self.config.api_endpoint
-            );
-        }
+        let started = Instant::now();
         let response = match self.send_request(cancellation, file_path).await {
             Ok(response) => response,
             Err(AsrError::Canceled) => return Err(AsrError::Canceled),
@@ -213,12 +255,20 @@ impl AsrClient {
         };
         let status = response.status();
         let bytes = tokio::select! {
-            _ = cancellation.cancelled() => return Err(AsrError::Canceled),
+            _ = cancellation.cancelled() => {
+                self.debug(format_args!("[upload] Audio canceled while reading response"));
+                return Err(AsrError::Canceled);
+            },
             result = response.bytes() => match result {
                 Ok(bytes) => bytes.to_vec(),
                 Err(error) => format!("read response error: {error}").into_bytes(),
             }
         };
+        self.debug(format_args!(
+            "[upload] Audio response complete: HTTP {status}, bytes={}, elapsed={}ms",
+            bytes.len(),
+            started.elapsed().as_millis()
+        ));
         Ok((status == StatusCode::OK, bytes))
     }
 
@@ -227,6 +277,11 @@ impl AsrClient {
         cancellation: &CancellationToken,
         file_path: &Path,
     ) -> Result<reqwest::Response, AsrError> {
+        self.debug(format_args!(
+            "[upload] Audio POST {}",
+            crate::debug_log::safe_url(&self.config.api_endpoint)
+        ));
+        let started = Instant::now();
         // The file and multipart body are reconstructed for every retry.
         let file = File::open(file_path)
             .await
@@ -250,9 +305,31 @@ impl AsrClient {
         if !self.config.token.is_empty() {
             request = request.bearer_auth(&self.config.token);
         }
-        tokio::select! {
+        let result = tokio::select! {
             _ = cancellation.cancelled() => Err(AsrError::Canceled),
             result = request.send() => result.map_err(AsrError::Client),
+        };
+        match &result {
+            Ok(response) => self.debug(format_args!(
+                "[upload] Audio HTTP {}, headers after {}ms",
+                response.status(),
+                started.elapsed().as_millis()
+            )),
+            Err(error) => self.debug(format_args!(
+                "[upload] Audio request failed after {}ms: {error}",
+                started.elapsed().as_millis()
+            )),
+        }
+        result
+    }
+
+    fn debug(&self, message: std::fmt::Arguments<'_>) {
+        if self.config.upload_debug {
+            let message = crate::debug_log::request_message(&message.to_string(), &self.config);
+            crate::debug_log::write(
+                crate::debug_log::Category::Upload,
+                format_args!("{message}"),
+            );
         }
     }
 
@@ -268,13 +345,18 @@ impl AsrClient {
             fields.insert("prompt".into(), self.config.prompt.clone());
         }
         if let Some(extra) = &self.extra_config {
-            for (key, value) in extra {
-                if value.is_null() {
-                    fields.remove(key);
-                } else {
-                    fields.insert(key.clone(), value_to_form_field(value));
-                }
-            }
+            let base = fields
+                .into_iter()
+                .map(|(key, value)| (key, Value::String(value)))
+                .collect();
+            let extra = extra
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            fields = crate::additional_parameters::merge(&base, &extra)
+                .iter()
+                .map(|(key, value)| (key.clone(), value_to_form_field(value)))
+                .collect();
         }
         fields
     }
@@ -483,13 +565,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extra_config_shallowly_overrides_and_null_deletes() {
+    fn extra_config_recursively_normalizes_before_multipart_serialization() {
         let cfg = Config {
             model: "base".into(),
             language: "zh".into(),
             prompt: "hello".into(),
             extra_config:
-                r#"{"language":null,"temperature":0.25,"stream":false,"metadata":{"tier":"test"}}"#
+                r#"{"language":null,"temperature":0.25,"stream":false,"metadata":{"tier":"test","drop":null,"nested":{"drop":null,"keep":true}},"items":[null,{"drop":null,"keep":2}]}"#
                     .into(),
             ..Config::default()
         };
@@ -498,7 +580,11 @@ mod tests {
         assert_eq!(fields["model"], "base");
         assert_eq!(fields["temperature"], "0.25");
         assert_eq!(fields["stream"], "false");
-        assert_eq!(fields["metadata"], r#"{"tier":"test"}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fields["metadata"]).unwrap(),
+            serde_json::json!({"tier":"test","nested":{"keep":true}})
+        );
+        assert_eq!(fields["items"], r#"[null,{"keep":2}]"#);
     }
 
     #[test]

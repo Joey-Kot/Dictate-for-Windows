@@ -86,9 +86,9 @@ jobs:
       - name: Verify binary contracts
         run: |
           # Subclass helpers must resolve against Common Controls v6 at startup.
-          x86_64-w64-mingw32-objdump -p dist/gui/STT.exe | grep 'Entry: ID: 0x000018,'
-          strings dist/gui/STT.exe | grep -F 'name="Microsoft.Windows.Common-Controls"'
-          strings dist/gui/STT.exe | grep -F 'version="6.0.0.0"'
+          x86_64-w64-mingw32-objdump -p dist/gui/Dictate.exe | grep 'Entry: ID: 0x000018,'
+          strings dist/gui/Dictate.exe | grep -F 'name="Microsoft.Windows.Common-Controls"'
+          strings dist/gui/Dictate.exe | grep -F 'version="6.0.0.0"'
           if grep -R -n -E '\bbeeep\b|Toast' crates native; then
             echo "A forbidden input or notification implementation is present." >&2
             exit 1
@@ -97,26 +97,26 @@ jobs:
             echo "The removed NOTIFICATION field is serialized." >&2
             exit 1
           fi
-          x86_64-w64-mingw32-objdump -x dist/gui/STT.exe | grep 'keybd_event'
-          x86_64-w64-mingw32-objdump -x dist/gui/STT.exe | grep 'SendInput'
-          x86_64-w64-mingw32-objdump -x dist/cli/stt.exe | grep 'SendInput'
-          x86_64-w64-mingw32-objdump -x dist/cli/stt.exe | grep 'keybd_event'
-          if strings dist/gui/STT.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
+          x86_64-w64-mingw32-objdump -x dist/gui/Dictate.exe | grep 'keybd_event'
+          x86_64-w64-mingw32-objdump -x dist/gui/Dictate.exe | grep 'SendInput'
+          x86_64-w64-mingw32-objdump -x dist/cli/dictate-cli.exe | grep 'SendInput'
+          x86_64-w64-mingw32-objdump -x dist/cli/dictate-cli.exe | grep 'keybd_event'
+          if strings dist/gui/Dictate.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
             echo "GUI contains the external FFmpeg backend." >&2
             exit 1
           fi
-          strings dist/gui/STT.exe | grep '\[ffmpeg\] crop/transcode'
-          strings dist/cli/stt.exe | grep '\[ffmpeg\] crop/transcode'
-          if strings dist/cli/stt.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
+          strings dist/gui/Dictate.exe | grep '\[ffmpeg\] crop/transcode'
+          strings dist/cli/dictate-cli.exe | grep '\[ffmpeg\] crop/transcode'
+          if strings dist/cli/dictate-cli.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
             echo "CLI contains the external FFmpeg backend." >&2
             exit 1
           fi
-          cli_imports="$(x86_64-w64-mingw32-objdump -p dist/cli/stt.exe | grep 'DLL Name')"
+          cli_imports="$(x86_64-w64-mingw32-objdump -p dist/cli/dictate-cli.exe | grep 'DLL Name')"
           if echo "$cli_imports" | grep -E -i 'avcodec|avformat|avutil|swresample|portaudio'; then
             echo "CLI has a dynamic PortAudio or libav dependency." >&2
             exit 1
           fi
-          imports="$(x86_64-w64-mingw32-objdump -p dist/gui/STT.exe | grep 'DLL Name')"
+          imports="$(x86_64-w64-mingw32-objdump -p dist/gui/Dictate.exe | grep 'DLL Name')"
           echo "$imports"
           if echo "$imports" | grep -E -i 'avcodec|avformat|avutil|swresample|portaudio'; then
             echo "GUI has a dynamic PortAudio or libav dependency." >&2
@@ -144,8 +144,19 @@ jobs:
             gh release create Latest --title "Latest" --notes "$notes"
           fi
           gh release upload Latest \
-            dist/stt-cli-windows-amd64.zip \
-            dist/stt-cli-windows-amd64.zip.sha256 \
-            dist/stt-gui-windows-amd64.zip \
-            dist/stt-gui-windows-amd64.zip.sha256 \
+            dist/dictate-cli-windows-amd64.zip \
+            dist/dictate-cli-windows-amd64.zip.sha256 \
+            dist/dictate-gui-windows-amd64.zip \
+            dist/dictate-gui-windows-amd64.zip.sha256 \
             --clobber
+          # Remove only the four assets published under the former project name.
+          published_assets="$(gh release view Latest --json assets --jq '.assets[].name')"
+          for legacy_asset in \
+            stt-cli-windows-amd64.zip \
+            stt-cli-windows-amd64.zip.sha256 \
+            stt-gui-windows-amd64.zip \
+            stt-gui-windows-amd64.zip.sha256; do
+            if grep -Fxq "$legacy_asset" <<< "$published_assets"; then
+              gh release delete-asset Latest "$legacy_asset" --yes
+            fi
+          done

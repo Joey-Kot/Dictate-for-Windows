@@ -168,7 +168,7 @@ fn run_inner() -> Result<(), String> {
             // window from the app receiving dictated text.
             WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0),
             w!("STTRustNativeWindow"),
-            w!("STT"),
+            w!("Dictate"),
             WS_POPUP,
             windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
             windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
@@ -616,7 +616,7 @@ fn close_settings(state: &mut WindowState) -> bool {
 fn request_quit(state: &mut WindowState) {
     let busy = matches!(
         state.runtime.snapshot().state,
-        State::Recording | State::Paused | State::Uploading
+        State::Recording | State::Paused | State::Uploading | State::Rewriting
     );
     if busy {
         let message = wide(state.language.text("quit_busy"));
@@ -645,7 +645,7 @@ fn show_message(owner: HWND, text: &str, warning: bool) {
         let _ = MessageBoxW(
             Some(owner),
             PCWSTR(text.as_ptr()),
-            w!("STT"),
+            w!("Dictate"),
             if warning {
                 MB_ICONWARNING
             } else {

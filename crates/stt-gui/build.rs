@@ -11,6 +11,11 @@ fn main() {
     // Subclass helpers require Common Controls v6 at process startup.
     // Embed the manifest even when the optional icon is absent.
     let mut resource = winresource::WindowsResource::new();
+    resource
+        .set("ProductName", "Dictate for Windows")
+        .set("FileDescription", "Dictate for Windows")
+        .set("InternalName", "Dictate")
+        .set("OriginalFilename", "Dictate.exe");
     resource.set_manifest_file("app.manifest");
     if std::path::Path::new("../../assets/icon.ico").exists() {
         resource.set_icon("../../assets/icon.ico");

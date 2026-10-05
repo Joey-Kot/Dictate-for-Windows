@@ -44,7 +44,7 @@ are retained for reference to earlier releases.
 
 The application uses permissively licensed crates including `clap`, `serde`,
 `serde_json`, `serde_json_path`, `reqwest`, `tokio`, `tokio-util`, `windows`, `thiserror`, `uuid`,
-`hound`, `chrono`, `parking_lot`, `async-trait`, and their transitive
+`hound`, `chrono`, `parking_lot`, `async-trait`, `tempfile`, and their transitive
 dependencies. Exact versions are locked in `Cargo.lock`. Release source
 archives retain crate license metadata; generated binary packages continue to
 include this notice and the project license.

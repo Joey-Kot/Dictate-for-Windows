@@ -1,7 +1,7 @@
-# STT compatibility contract
+# Dictate for Windows compatibility contract
 
 This document records the behavior preserved by the Rust implementation. The
-release binaries are `stt.exe` and `STT.exe`.
+release binaries are `dictate-cli.exe` and `Dictate.exe`.
 
 ## Deliberately removed behavior
 
@@ -16,7 +16,7 @@ been replaced by standard JSONPath with exactly-one-result validation.
 
 Old JSON files containing `NOTIFICATION` remain readable because unknown
 fields are ignored. `REQUEST_FAILED_NOTIFICATION` remains supported and means
-“paste `[request failed]` after retries are exhausted”; it is not a system
+“write `[request failed]` after audio retries are exhausted”; it is not a system
 notification setting.
 
 ## Configuration
@@ -32,7 +32,8 @@ defaults. Missing fields receive defaults and unknown fields are ignored.
 | `LANGUAGE` | `""` | Multipart field only when non-empty |
 | `PROMPT` | `""` | Multipart field only when non-empty |
 | `TEXT_PATH` | `"$.text"` | Standard JSONPath selecting exactly one scalar; no fallback |
-| `ExtraConfig` | `""` | Must be a JSON object when non-empty |
+| `ExtraConfig` | `""` | Blank or a JSON object; recursive merge before multipart serialization |
+| `REWRITE` | Empty API fields and prompt list, `openai_compatible` provider | Shared by GUI and CLI hotkey mode; independent text API and per-prompt hotkeys |
 | `OPACITY` | `1.0` | GUI floating-window opacity; `0.10`–`1.00` in `0.01` steps, where `1.0` is fully opaque |
 | `WINDOW_SCALE` | `1.0` | GUI floating-window scale; `0.3`–`2.0` in `0.1` steps, shared by full and minimal modes |
 | `INPUT_DEVICE` | `""` | Stable Windows capture endpoint ID; empty follows the system default |
@@ -55,8 +56,8 @@ defaults. Missing fields receive defaults and unknown fields are ignored.
 | `START_KEY` | `"ctrl+alt+q"` | Start/stop recording |
 | `PAUSE_KEY` | `"ctrl+alt+s"` | Pause/resume |
 | `CANCEL_OR_RETRY_KEY` | `"alt+esc"` | Cancel recording/request, or retry the buffered recording while idle |
-| `CLIPBOARD_WRITE_DELAY` | `80` | Milliseconds between writing text and sending Ctrl+V |
-| `CLIPBOARD_RESTORE_DELAY` | `120` | Milliseconds between Ctrl+V and clipboard restoration |
+| `CLIPBOARD_WRITE_DELAY` | `80` | Milliseconds before Ctrl+V after writing output, or before Ctrl+C after clearing the clipboard for Rewrite input |
+| `CLIPBOARD_RESTORE_DELAY` | `120` | Milliseconds before restoring the clipboard after Ctrl+V output or reading Rewrite input |
 | `CACHE_DIR` | `""` | Empty falls back to current directory |
 | `KEEP_CACHE` | `false` | Effective only with a non-empty usable cache dir |
 | `REQUEST_FAILED_NOTIFICATION` | `false` | Paste failure placeholder after retry exhaustion |
@@ -65,7 +66,7 @@ defaults. Missing fields receive defaults and unknown fields are ignored.
 The Rust CLI uses only standard long options. Boolean options require an
 explicit `true` or `false`. `--rate` is a hidden-compatible alias for
 `--sampling-rate`; old single-dash long forms are not accepted. Long help is
-organized into General, API, Audio, Network, Hotkeys, Cache, and Debug groups.
+organized into General, Audio API, Audio Record, Network, Audio Hotkeys, Cache, and Debug groups. Rewrite configuration is read from JSON; there are no Rewrite CLI flags.
 
 ## TEXT_PATH
 
@@ -88,13 +89,74 @@ transcription file. See the README for selector examples and result semantics.
 - Each retry reopens the file and reconstructs the multipart body.
 - The file field is `file`; its uploaded filename is the local basename.
 - `model`, `language`, and `prompt` are omitted when empty.
-- `ExtraConfig` shallowly overrides base fields; `null` removes a base field.
+- `ExtraConfig` recursively merges objects, replaces arrays and scalar values, and deletes null object members at any depth, including inside arrays. Null array elements are retained. The binary `file` field is reserved.
 - Nested extra values are serialized as compact JSON strings.
 - User-Agent remains `stt-go-client/1.0`.
 - Only HTTP 200 succeeds; the original response body is retained.
 - Requests and exponential retry waits are cancellable.
 - System proxies, redirects, and automatic compression are disabled.
 - HTTP/2 and TLS verification follow their explicit settings.
+
+## Selected-text Rewrite
+
+The Rewrite API page follows Audio Record and configures a Provider, Base URL,
+API Key, Model and ordered prompts. Each prompt has a persistent ID, title,
+content, optional JSON overrides and exactly one shortcut. Add/edit/delete/reorder
+remain drafts until Settings Save. Editor Cancel discards its changes; Settings
+Cancel discards all drafts. The shared Network and Audio Hotkeys output settings
+apply to Rewrite. Its connectivity probe sends fixed text once, with no prompt
+extras and no text delivery.
+
+Provider wire formats follow Dictate commit
+`7c475574c066f44a8e9d9633849e1265c5ab28eb`: OpenAI-Compatible, OpenAI Completions,
+DeepSeek, Qwen and GLM use chat completions; OpenAI Responses, Google and
+Anthropic use their respective request/response formats. API endpoints are
+completed from the Base URL. Per-prompt extras merge into the JSON request before
+validating the final model. Google puts this model in the URL. Responses may be
+JSON or SSE; only a complete, nonblank final text result reaches shared output.
+No reasoning blocks or partial SSE output are delivered. Responses are bounded
+to 2 MiB. Network errors, HTTP 408/429/5xx and corresponding service errors retry
+up to the shared total attempt count; configuration, malformed/empty responses
+and other HTTP errors fail immediately.
+
+Shared core input acquisition always uses the target application's Copy command:
+materialize a clipboard backup, clear the clipboard, wait `CLIPBOARD_WRITE_DELAY`,
+inject `Ctrl+C`, read fresh nonblank Unicode text, wait `CLIPBOARD_RESTORE_DELAY`,
+then restore the backup before requesting Rewrite. The two delays share the
+Audio Hotkeys settings and defaults of 80 ms and 120 ms, regardless of
+`USE_SENDINPUT`, which controls output only. No UI Automation selection interface
+is used. Shortcut modifiers and `C` must be released within two seconds; copy
+polling allows three seconds. Native clipboard calls may exceed these polling
+limits. Input is bounded to 1,000,000 UTF-8 bytes. Cancellation or focus changes
+during the pre-copy delay restore without copying; after Copy, the configured
+restore delay completes even when canceled.
+
+Snapshots preserve supported materializable text, HTML/RTF, image and file-list
+formats, up to 64 MiB and 256 formats. Unsupported or unmaterializable formats
+fail before the original clipboard is cleared. Cancellation and normal shutdown
+wait for the single native worker to attempt restoration; the shared task stays
+busy during cleanup. Restore failures remain visible even after cancellation
+and prevent a request or output. Missing fresh nonblank text, read errors and
+foreground/focused-window changes also prevent a request.
+
+Input follows the target's Copy behavior: editors may copy a current line without
+a selection, and this path cannot independently exclude password controls or
+prove that copied text was selected. Application compatibility requires Windows
+desktop validation. Successful output calls the same `text_input::send_text` as
+ASR; there is no additional focus restoration or delivery mode. Failed/canceled
+Rewrite never calls output, even with `REQUEST_FAILED_NOTIFICATION=true`, and
+never replaces the audio retry buffer. Once delivery begins, the existing output
+channel's partial-delivery limitations still apply.
+
+Rewrite shortcuts are normalized and checked against every audio action and
+other prompt. Hook mode permits extra modifiers, so bindings sharing the same
+ordinary key with any Rewrite action are rejected; RegisterHotKey mode rejects
+identical normalized combinations. With any Rewrite prompt configured,
+RegisterHotKey mode also rejects an exact `Ctrl+C` binding on any audio action or
+prompt, preventing interception of the injected copy command. Hook mode ignores
+injected events and permits `Ctrl+C` subject to normal conflicts. Other existing
+audio-to-audio matching remains unchanged. Reload registers shortcuts against
+stable prompt IDs.
 
 ## Cache and filenames
 
@@ -129,10 +191,12 @@ The current optional `USE_SENDINPUT` setting supersedes the original prohibition
 on SendInput. It defaults to false, including in older configuration files.
 When true, shared core output uses SendInput with KEYEVENTF_UNICODE, without
 clipboard access, clipboard delays, fallback, or automatic delivery retries.
-This applies to transcriptions and `[request failed]` text in GUI and CLI hotkey
-mode. CLI `--use-sendinput <BOOL>` overrides the setting. GUI Hotkeys exposes a
-checkbox below Restore delay and disables both clipboard delay controls while
-selected, retaining their values. Unicode scalars stay intact across batches;
+This applies to transcriptions, successful Rewrite results, and audio `[request failed]` text in GUI and CLI hotkey
+mode. Rewrite input acquisition still uses clipboard Copy regardless of this
+setting. CLI `--use-sendinput <BOOL>` overrides the setting. GUI Audio Hotkeys
+exposes a checkbox below Restore delay. Both delay controls remain editable with
+SendInput selected because Rewrite input still uses them; saving temporarily
+disables the controls. Unicode scalars stay intact across batches;
 line endings normalize to CR, and tabs remain Unicode characters. Partial
 delivery and cancellation after delivery report that text may already exist.
 
@@ -142,7 +206,7 @@ message thread, `WM_QUIT`, and unregisters all bindings. Hook mode uses
 `WH_KEYBOARD_LL`, ignores `LLKHF_INJECTED`, checks only required modifiers with
 `GetAsyncKeyState`, swallows held-repeat keydown and its matching keyup, and
 does not forbid extra modifiers. `CANCEL_OR_RETRY_KEY` cancels while recording
-or uploading; when idle with a buffered recording, it retries that recording.
+or uploading or rewriting; when idle with a buffered recording, it retries that recording.
 
 ## Shared WASAPI recorder
 
@@ -218,21 +282,22 @@ disabled VAD preserves existing HTTP retry behavior.
 
 ## Runtime state machine
 
-Visible states are Idle, Recording, Paused, Uploading, and Error. Normal actions
+Visible states are Idle, Recording, Paused, Uploading, Rewriting, and Error. Normal actions
 use one action lock. GUI and hotkey events use a non-blocking try-lock and are
-dropped when busy; they never queue for a later state. Upload
+dropped when busy; they never queue for a later state. Upload/Rewrite
 cancellation bypasses that lock and cancels the active request token directly.
 
 - Idle/Error: start is allowed.
 - Idle with a retry buffer: `CANCEL_OR_RETRY_KEY` retries the buffered WAV.
 - Recording/Paused: stop and cancel are allowed.
 - Pause outside recording is silent except debug output.
-- Uploading: cancel is allowed; other inputs are dropped.
+- Uploading/Rewriting: cancel is allowed; other inputs are dropped.
+- Rewrite holds the action lock from selected-text acquisition through requests, retry waits and shared output. API probes use the same lock and cancellation token; they never select or output text and never update the audio retry buffer.
 
 Stop flow is WAV finalize, Uploading, conversion, ASR, extraction, clipboard
 paste, cache handling, then Idle or Error. Empty ASR text goes to Idle without
 an `[empty result]` paste. Only exhausted retries plus
-`REQUEST_FAILED_NOTIFICATION=true` paste `[request failed]`. Manual request
+`REQUEST_FAILED_NOTIFICATION=true` write `[request failed]` for audio tasks. Rewrite failures never write a placeholder. Manual request
 cancellation signals the active conversion/upload pipeline, immediately aborts
 ASR upload, response, and retry waits, performs cache cleanup, and returns to
 Idle without reporting an upload failure.
@@ -254,7 +319,7 @@ WebView or embedded browser runtime.
 
 - Full window: 222×94 logical pixels.
 - Minimal window: 170×46 logical pixels.
-- Settings window: 760×620 logical pixels.
+- Settings window: 760×662 logical pixels; prompt editor: 700×610.
 - Frameless, per-pixel-alpha layered, always on top, per-monitor DPI aware.
 - Drag threshold is about 4 px; dragging minimal mode from the microphone does
   not activate recording on release.
@@ -265,7 +330,7 @@ WebView or embedded browser runtime.
   11, preserving antialiased edges; native DWM rounding and the Windows 11 border
   are disabled so no second outer shape is added.
 - Tray menu remains Minimal, Settings, Quit and emits no balloon.
-- Audio settings expose ENABLE_VAD, VAD_PADDING_MS and VAD_START_THRESHOLD in all five languages.
+- Audio Record settings expose ENABLE_VAD, VAD_PADDING_MS and VAD_START_THRESHOLD in all five languages.
   Padding and start threshold are disabled while VAD is off, retain their values and are validated on save.
 - Settings use native tab/edit/button/checkbox/combobox controls. Token is a
   password edit. Its outer frame uses the same 10 logical pixel continuous-corner
@@ -273,8 +338,7 @@ WebView or embedded browser runtime.
   languages are English, Simplified Chinese, German, Japanese, and French.
 - The Display page controls the shared opacity and scale of the full and minimal
   floating windows.
-- Config writes `%APPDATA%\stt\config.json`, then validates and reloads runtime
-  dependencies/hotkeys. Saving is allowed only in Idle or Error.
+- Saving validates drafts and prepares replacement runtime dependencies/hotkeys under the task lock, atomically replaces `%APPDATA%\stt\config.json`, then commits runtime state. Failure preserves the previous configuration and restores its hotkeys; rollback registration failures are reported. Saving is allowed only in Idle or Error.
 - Escape closes settings first; busy quit shows a native confirmation dialog.
 
 ## Verification split

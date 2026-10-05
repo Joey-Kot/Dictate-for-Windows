@@ -302,7 +302,10 @@ fn record_loop(
     }
     let format = stream.format().clone();
     if config.record_debug {
-        eprintln!("[record] device={} format={format:?}", stream.description());
+        crate::debug_log::write(
+            crate::debug_log::Category::Record,
+            format_args!("[record] device={} format={format:?}", stream.description()),
+        );
     }
     let mut writer = match CaptureWav::create(&wav_path, &format) {
         Ok(writer) => writer,
@@ -382,8 +385,11 @@ fn record_loop(
             Err(error) => {
                 consecutive_errors += 1;
                 if config.record_debug {
-                    eprintln!(
-                        "[record] stream read error ({consecutive_errors}/{MAX_CONSECUTIVE_READ_ERRORS}): {error}"
+                    crate::debug_log::write(
+                        crate::debug_log::Category::Record,
+                        format_args!(
+                            "[record] stream read error ({consecutive_errors}/{MAX_CONSECUTIVE_READ_ERRORS}): {error}"
+                        ),
                     );
                 }
                 if consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS {

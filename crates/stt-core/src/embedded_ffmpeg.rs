@@ -71,7 +71,10 @@ mod native {
     }
     type Cancel = extern "C" fn(*mut c_void) -> i32;
     type Samples = extern "C" fn(*mut c_void, *const i16, i32) -> i32;
+    static CONVERT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static LOG_INIT: std::sync::Once = std::sync::Once::new();
     unsafe extern "C" {
+        fn stt_ffmpeg_set_log_callback(callback: extern "C" fn(*const c_char) -> i32);
         fn stt_ffmpeg_convert(
             input: *const c_char,
             output: *const c_char,
@@ -94,6 +97,19 @@ mod native {
             error: *mut c_char,
             error_size: i32,
         ) -> i32;
+    }
+    extern "C" fn log_line(message: *const c_char) -> i32 {
+        if message.is_null() {
+            return 0;
+        }
+        std::panic::catch_unwind(|| {
+            let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+            i32::from(crate::debug_log::forward(
+                crate::debug_log::Category::Ffmpeg,
+                &message,
+            ))
+        })
+        .unwrap_or(0)
     }
     extern "C" fn canceled(context: *mut c_void) -> i32 {
         i32::from(unsafe { &*context.cast::<CancellationToken>() }.is_cancelled())
@@ -136,6 +152,12 @@ mod native {
         output: &Path,
         source_rate: i32,
     ) -> Result<(), ConvertError> {
+        // libav logging is global, including calls from codec worker threads.
+        let _conversion = CONVERT_LOCK.lock();
+        if token.is_cancelled() {
+            return Err(ConvertError::Canceled);
+        }
+        LOG_INIT.call_once(|| unsafe { stt_ffmpeg_set_log_callback(log_line) });
         let settings = settings_for(config, source_rate)?;
         let input = string(input.to_string_lossy().as_bytes())?;
         let output = string(output.to_string_lossy().as_bytes())?;
@@ -212,13 +234,16 @@ mod native {
             }
             if config.ffmpeg_debug {
                 let kept: i64 = intervals.iter().map(|i| i.end_frame - i.start_frame).sum();
-                eprintln!(
-                    "[vad] rate={rate} duration={:.3}s raw_intervals={raw_count} intervals={} padding={}ms frames={frames} kept={kept} ratio={:.3} elapsed={:?}",
-                    frames as f64 / f64::from(rate),
-                    intervals.len(),
-                    config.vad_padding_ms,
-                    kept as f64 / (frames.max(1) as f64),
-                    start.elapsed()
+                crate::debug_log::write(
+                    crate::debug_log::Category::Ffmpeg,
+                    format_args!(
+                        "[vad] rate={rate} duration={:.3}s raw_intervals={raw_count} intervals={} padding={}ms frames={frames} kept={kept} ratio={:.3} elapsed={:?}",
+                        frames as f64 / f64::from(rate),
+                        intervals.len(),
+                        config.vad_padding_ms,
+                        kept as f64 / (frames.max(1) as f64),
+                        start.elapsed()
+                    ),
                 );
             }
             if intervals.is_empty() {
@@ -256,7 +281,10 @@ mod native {
             let _ = std::fs::remove_file(Path::new(output.to_str().map_err(failed)?));
         }
         if config.ffmpeg_debug {
-            eprintln!("[ffmpeg] crop/transcode elapsed={:?}", start.elapsed());
+            crate::debug_log::write(
+                crate::debug_log::Category::Ffmpeg,
+                format_args!("[ffmpeg] crop/transcode elapsed={:?}", start.elapsed()),
+            );
         }
         result
     }

@@ -7,10 +7,15 @@
 typedef struct SttAudioInterval { int64_t start_frame; int64_t end_frame; } SttAudioInterval;
 typedef int (*SttCancel)(void *);
 typedef int (*SttSamples)(void *, const int16_t *, int);
+/* Return nonzero if the host consumed the line; otherwise keep stderr output. */
+typedef int (*SttLog)(const char *);
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Install once, before starting conversions. The callback has process lifetime. */
+void stt_ffmpeg_set_log_callback(SttLog callback);
 
 /* With samples != NULL, stream mono 16 kHz PCM to the callback and do not open
  * an output. source_rate/source_frames report the actual decoded source domain.

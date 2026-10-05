@@ -29,6 +29,7 @@ pub enum State {
     Recording,
     Paused,
     Uploading,
+    Rewriting,
     Error,
 }
 
@@ -99,6 +100,8 @@ struct RuntimeInner {
     recorder: Arc<Recorder>,
     asr_client: Arc<AsrClient>,
     hotkeys: Option<HotkeyRegistration>,
+    // A failed registration must not disable the user's intent to use hotkeys.
+    hotkeys_requested: bool,
     event: Event,
     event_handler: Option<Arc<dyn Fn(Event) + Send + Sync>>,
     next_session: u64,
@@ -114,7 +117,13 @@ pub struct Runtime {
     lifecycle: CancellationToken,
     converter: Arc<dyn AudioConverter>,
     executor: Handle,
+    #[cfg(test)]
+    hotkey_registrar: Mutex<Option<TestHotkeyRegistrar>>,
 }
+
+#[cfg(test)]
+type TestHotkeyRegistrar =
+    Arc<dyn Fn(&Config) -> Result<HotkeyRegistration, hotkey::HotkeyError> + Send + Sync>;
 
 impl std::fmt::Debug for Runtime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,6 +151,7 @@ impl Runtime {
                 recorder,
                 asr_client,
                 hotkeys: None,
+                hotkeys_requested: false,
                 event: Event::default(),
                 event_handler: None,
                 next_session: 0,
@@ -154,6 +164,8 @@ impl Runtime {
             lifecycle: CancellationToken::new(),
             converter,
             executor: Handle::current(),
+            #[cfg(test)]
+            hotkey_registrar: Mutex::new(None),
         });
         Ok(runtime)
     }
@@ -243,35 +255,189 @@ impl Runtime {
         }
     }
 
+    pub fn try_rewrite(self: &Arc<Self>, prompt_id: &str) -> bool {
+        if self.is_stopped() {
+            return false;
+        }
+        let Ok(guard) = self.action_lock.clone().try_lock_owned() else {
+            return false;
+        };
+        if !self.can_reload() {
+            return false;
+        }
+        let config = self.config();
+        let Some(prompt) = config
+            .rewrite
+            .prompts
+            .iter()
+            .find(|p| p.id == prompt_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let cancellation = self.begin_active_request();
+        self.set_state(
+            State::Rewriting,
+            "Rewriting selected text",
+            None::<&RuntimeError>,
+        );
+        let runtime = self.clone();
+        self.executor.spawn(async move {
+            let _guard = guard;
+            let input = match crate::selection::read(
+                &cancellation,
+                Duration::from_millis(config.clipboard_write_delay),
+                Duration::from_millis(config.clipboard_restore_delay),
+            )
+            .await
+            {
+                Ok(input) => Ok(input),
+                Err(crate::selection::SelectionError::Restore(error)) => {
+                    // A cancellation must not hide loss of clipboard contents.
+                    if !runtime.is_stopped() {
+                        runtime.set_state(State::Idle, "Clipboard restore failed", Some(&error));
+                    }
+                    runtime.clear_active_request();
+                    return;
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let result = async {
+                let input = input?;
+                let client = crate::rewrite::RewriteClient::new(config.clone())
+                    .map_err(|e| e.to_string())?;
+                client
+                    .execute(&prompt, &input, &cancellation, true)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            runtime.finish_rewrite(result, &cancellation, &config).await;
+            runtime.clear_active_request();
+        });
+        true
+    }
+
+    async fn finish_rewrite(
+        &self,
+        result: Result<String, String>,
+        cancellation: &CancellationToken,
+        config: &Config,
+    ) {
+        self.finish_rewrite_with(result, cancellation, |text| async move {
+            text_input::send_text(&text, cancellation, config).await
+        })
+        .await;
+    }
+
+    async fn finish_rewrite_with<F, Fut>(
+        &self,
+        result: Result<String, String>,
+        cancellation: &CancellationToken,
+        output: F,
+    ) where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), text_input::TextInputError>>,
+    {
+        if self.is_stopped() {
+            return;
+        }
+        if cancellation.is_cancelled() {
+            self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+            return;
+        }
+        match result {
+            Ok(text) if !text.trim().is_empty() => match output(text).await {
+                Ok(()) => self.set_state(State::Idle, "Rewrite completed", None::<&RuntimeError>),
+                Err(error) if error.canceled_before_output() => {
+                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
+                }
+                Err(error) => self.set_state(State::Idle, error.status(), Some(&error)),
+            },
+            Ok(_) => self.set_state(
+                State::Idle,
+                "Rewrite failed",
+                Some("Rewrite response contains no text"),
+            ),
+            Err(error) => self.set_state(State::Idle, "Rewrite failed", Some(&error)),
+        }
+    }
+
+    /// Connectivity probes share the same admission, cancellation and task lifetime.
+    /// The supplied operation never delivers text or changes the recording buffer.
+    pub async fn test_connection<F, Fut>(
+        self: &Arc<Self>,
+        rewrite: bool,
+        external: CancellationToken,
+        operation: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let _guard = self
+            .action_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| "A task is already running".to_owned())?;
+        if self.is_stopped() || !self.can_reload() {
+            return Err("A task is already running".into());
+        }
+        let cancellation = self.begin_active_request();
+        self.set_state(
+            if rewrite {
+                State::Rewriting
+            } else {
+                State::Uploading
+            },
+            "Testing API connection",
+            None::<&RuntimeError>,
+        );
+        let result = {
+            let operation = operation(cancellation.clone());
+            tokio::pin!(operation);
+            tokio::select! { biased;
+                _ = external.cancelled() => {
+                    cancellation.cancel();
+                    let _ = operation.await;
+                    Err("Request canceled".into())
+                }
+                result = &mut operation => result,
+            }
+        };
+        let result = if cancellation.is_cancelled() {
+            Err("Request canceled".into())
+        } else {
+            result
+        };
+        self.clear_active_request();
+        self.set_state(
+            State::Idle,
+            if cancellation.is_cancelled() {
+                "Request canceled"
+            } else if result.is_ok() {
+                "Connection test completed"
+            } else {
+                "Connection test failed"
+            },
+            result.as_ref().err(),
+        );
+        result
+    }
+
     pub fn start_hotkeys(self: &Arc<Self>) -> Result<(), RuntimeError> {
         if self.is_stopped() {
             return Err(RuntimeError::Stopped);
         }
         let config = {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
+            inner.hotkeys_requested = true;
             if inner.hotkeys.is_some() {
                 return Ok(());
             }
             inner.config.clone()
         };
-        let weak = Arc::downgrade(self);
-        let registration = hotkey::register(
-            &config.start_key,
-            &config.pause_key,
-            &config.cancel_or_retry_key,
-            config.hotkey_hook,
-            move |id| {
-                if let Some(runtime) = weak.upgrade()
-                    && !runtime.try_action(id)
-                    && runtime.config().hotkey_debug
-                {
-                    eprintln!(
-                        "[hotkey-debug] dropped action id={id} while another action is in progress"
-                    );
-                }
-            },
-            config.hotkey_debug,
-        );
+        let registration = self.register_hotkeys(&config);
         match registration {
             Ok(registration) => {
                 if self.is_stopped() {
@@ -288,7 +454,70 @@ impl Runtime {
         }
     }
 
-    pub async fn reload(self: &Arc<Self>, mut config: Config) -> Result<(), RuntimeError> {
+    fn register_hotkeys(
+        self: &Arc<Self>,
+        config: &Config,
+    ) -> Result<HotkeyRegistration, hotkey::HotkeyError> {
+        #[cfg(test)]
+        {
+            let register = self.hotkey_registrar.lock().clone();
+            if let Some(register) = register {
+                return register(config);
+            }
+        }
+        let weak = Arc::downgrade(self);
+        let prompt_ids: Vec<_> = config
+            .rewrite
+            .prompts
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        hotkey::register(
+            &config.start_key,
+            &config.pause_key,
+            &config.cancel_or_retry_key,
+            &config.rewrite.prompts,
+            config.hotkey_hook,
+            move |id| {
+                if let Some(runtime) = weak.upgrade() {
+                    let accepted = if id >= 1000 {
+                        prompt_ids
+                            .get((id - 1000) as usize)
+                            .is_some_and(|prompt| runtime.try_rewrite(prompt))
+                    } else {
+                        runtime.try_action(id)
+                    };
+                    if !accepted && runtime.config().hotkey_debug {
+                        crate::debug_log::write(
+                            crate::debug_log::Category::Hotkey,
+                            format_args!(
+                                "[hotkey-debug] dropped action id={id} while another action is in progress"
+                            ),
+                        );
+                    }
+                }
+            },
+            config.hotkey_debug,
+        )
+    }
+
+    pub async fn reload(self: &Arc<Self>, config: Config) -> Result<(), RuntimeError> {
+        self.apply_config(config, None).await
+    }
+
+    pub async fn save_and_reload(
+        self: &Arc<Self>,
+        config: Config,
+        path: &Path,
+    ) -> Result<(), RuntimeError> {
+        self.apply_config(config, Some(path)).await
+    }
+
+    async fn apply_config(
+        self: &Arc<Self>,
+        mut config: Config,
+        path: Option<&Path>,
+    ) -> Result<(), RuntimeError> {
         if self.is_stopped() {
             return Err(RuntimeError::Stopped);
         }
@@ -305,20 +534,63 @@ impl Runtime {
         let temp_dir = cache::initialize_cache_dir(&mut config);
         let asr_client = Arc::new(AsrClient::new(config.clone())?);
         let recorder = Arc::new(Recorder::new(config.clone(), temp_dir.clone()));
-        if let Some(previous_hotkeys) = self.inner.lock().hotkeys.take() {
-            previous_hotkeys.stop_and_wait();
-        }
-        {
+        let (previous_config, previous_hotkeys, hotkeys_requested) = {
             let mut inner = self.inner.lock();
+            (
+                inner.config.clone(),
+                inner.hotkeys.take(),
+                inner.hotkeys_requested,
+            )
+        };
+        let had_hotkeys = previous_hotkeys.is_some();
+        if let Some(hotkeys) = previous_hotkeys {
+            hotkeys.stop_and_wait();
+        }
+        let mut replacement = None;
+        let result = (|| -> Result<(), RuntimeError> {
+            if hotkeys_requested {
+                replacement = Some(self.register_hotkeys(&config)?);
+            }
+            let mut inner = self.inner.lock();
+            if self.is_stopped() {
+                return Err(RuntimeError::Stopped);
+            }
+            if let Some(path) = path {
+                config.save(path)?;
+            }
             inner.config = config;
             inner.temp_dir = temp_dir;
             inner.asr_client = asr_client;
             inner.recorder = recorder;
+            inner.hotkeys = replacement.take();
             inner.active_session = 0;
             inner.active_request_cancellation = None;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(hotkeys) = replacement {
+                hotkeys.stop_and_wait();
+            }
+            if had_hotkeys && !self.is_stopped() {
+                match self.register_hotkeys(&previous_config) {
+                    Ok(hotkeys) => {
+                        let mut inner = self.inner.lock();
+                        if self.is_stopped() {
+                            drop(inner);
+                            hotkeys.stop();
+                        } else {
+                            inner.hotkeys = Some(hotkeys);
+                        }
+                    }
+                    Err(rollback) => {
+                        let message = format!("{error}; failed to restore hotkeys: {rollback}");
+                        self.set_state(State::Error, "Hotkey registration failed", Some(&message));
+                        return Err(hotkey::HotkeyError::Registration(message).into());
+                    }
+                }
+            }
+            return Err(error);
         }
-        // start_hotkeys commits a stable Error event before returning an error.
-        self.start_hotkeys()?;
         self.set_state(State::Idle, "Settings saved", None::<&RuntimeError>);
         Ok(())
     }
@@ -344,6 +616,10 @@ impl Runtime {
         if let Some(hotkeys) = hotkeys {
             hotkeys.stop();
         }
+
+        // Copy may already be queued in another application. The native worker
+        // restores the clipboard independently of the async task/executor.
+        crate::selection::wait_for_cleanup();
 
         let deadline = Instant::now() + SHUTDOWN_GRACE_PERIOD;
         while Instant::now() < deadline {
@@ -461,7 +737,7 @@ impl Runtime {
     fn cancel_active_request(&self) -> bool {
         let cancellation = {
             let inner = self.inner.lock();
-            if inner.event.state != State::Uploading {
+            if !matches!(inner.event.state, State::Uploading | State::Rewriting) {
                 return false;
             }
             inner.active_request_cancellation.clone()
@@ -510,7 +786,10 @@ impl Runtime {
                 self.set_state(State::Recording, "Recording resumed", None::<&RuntimeError>)
             }
             Ok(_) => {}
-            Err(_) if debug => eprintln!("[hotkey] not recording; cannot pause/resume"),
+            Err(_) if debug => crate::debug_log::write(
+                crate::debug_log::Category::Hotkey,
+                format_args!("[hotkey] not recording; cannot pause/resume"),
+            ),
             Err(_) => {}
         }
     }
@@ -527,7 +806,10 @@ impl Runtime {
         };
         if !matches!(state, State::Recording | State::Paused) {
             if debug {
-                eprintln!("[hotkey] not recording; nothing to cancel");
+                crate::debug_log::write(
+                    crate::debug_log::Category::Hotkey,
+                    format_args!("[hotkey] not recording; nothing to cancel"),
+                );
             }
             return;
         }
@@ -1414,5 +1696,273 @@ mod tests {
         );
         assert!(matches!(result, Err(RuntimeError::OutputFile { .. })));
         assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_empty_canceled_and_late_rewrites_never_deliver_or_replace_retry_audio() {
+        let config = Config {
+            request_failed_notification: true,
+            ..Default::default()
+        };
+        let runtime = Runtime::new(config, Arc::new(NoopConverter)).unwrap();
+        runtime.enable_retry_buffer();
+        runtime.inner.lock().retry_recording = Some(Arc::new(b"previous audio".to_vec()));
+        for (result, canceled, stopped) in [
+            (Err("network failure".into()), false, false),
+            (Ok(" \n".into()), false, false),
+            (Ok("late result".into()), true, false),
+            (Ok("late result".into()), false, true),
+        ] {
+            let token = CancellationToken::new();
+            if canceled {
+                token.cancel();
+            }
+            if stopped {
+                runtime.lifecycle.cancel();
+            }
+            runtime
+                .finish_rewrite_with(result, &token, |_| async {
+                    panic!("failed or canceled Rewrite must never call output")
+                })
+                .await;
+            assert_eq!(
+                runtime
+                    .inner
+                    .lock()
+                    .retry_recording
+                    .as_deref()
+                    .unwrap()
+                    .as_slice(),
+                b"previous audio"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_rewrite_delivers_exactly_once_and_preserves_retry_audio() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        runtime.enable_retry_buffer();
+        runtime.inner.lock().retry_recording = Some(Arc::new(b"audio".to_vec()));
+        let calls = AtomicUsize::new(0);
+        runtime
+            .finish_rewrite_with(
+                Ok("rewritten text".into()),
+                &CancellationToken::new(),
+                |text| {
+                    assert_eq!(text, "rewritten text");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.snapshot().message, "Rewrite completed");
+        assert!(runtime.snapshot().retry_available);
+    }
+
+    #[tokio::test]
+    async fn active_audio_and_rewrite_states_reject_new_tasks_and_probes() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        for state in [
+            State::Recording,
+            State::Paused,
+            State::Uploading,
+            State::Rewriting,
+        ] {
+            runtime.set_state(state, "active", None::<&RuntimeError>);
+            assert!(!runtime.try_rewrite("any"));
+            assert!(
+                runtime
+                    .test_connection(true, CancellationToken::new(), |_| async {
+                        panic!("probe should not start")
+                    })
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                runtime.reload(Config::default()).await,
+                Err(RuntimeError::CannotReload(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_holds_shared_lock_through_cancel_and_cleanup() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let cleaning = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let task_runtime = runtime.clone();
+        let (a, b, c) = (started.clone(), cleaning.clone(), release.clone());
+        let task = tokio::spawn(async move {
+            task_runtime
+                .test_connection(true, CancellationToken::new(), |cancel| async move {
+                    a.wait().await;
+                    cancel.cancelled().await;
+                    b.wait().await;
+                    c.wait().await;
+                    Ok(())
+                })
+                .await
+        });
+        started.wait().await;
+        assert_eq!(runtime.snapshot().state, State::Rewriting);
+        assert!(!runtime.try_toggle_recording());
+        assert!(!runtime.try_rewrite("any"));
+        assert!(runtime.try_cancel_or_retry());
+        cleaning.wait().await;
+        assert!(!runtime.try_toggle_recording());
+        assert!(!runtime.try_rewrite("any"));
+        release.wait().await;
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(runtime.snapshot().message, "Request canceled");
+        assert!(
+            runtime
+                .test_connection(false, CancellationToken::new(), |_| async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_retries_failed_startup_hotkeys_and_preserves_config_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let attempts = mock_hotkeys(&runtime, &[false, false, true]);
+        let original = runtime.config();
+        original.save(&path).unwrap();
+        assert!(runtime.start_hotkeys().is_err());
+        assert_eq!(runtime.snapshot().state, State::Error);
+
+        let mut next = original.clone();
+        next.start_key = "ctrl+alt+j".into();
+        assert!(matches!(
+            runtime.save_and_reload(next.clone(), &path).await,
+            Err(RuntimeError::Hotkey(_))
+        ));
+        assert_eq!(runtime.config(), original);
+        assert_eq!(Config::load(&path).unwrap(), original);
+        assert_eq!(runtime.snapshot().state, State::Error);
+
+        runtime.save_and_reload(next.clone(), &path).await.unwrap();
+        assert_eq!(runtime.config(), next);
+        assert_eq!(Config::load(&path).unwrap(), next);
+        assert!(runtime.inner.lock().hotkeys.is_some());
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(
+            attempts.lock().keys,
+            [original.start_key, next.start_key.clone(), next.start_key]
+        );
+        runtime.stop();
+        assert_eq!(attempts.lock().stopped, 1);
+    }
+
+    #[tokio::test]
+    async fn saving_recovers_after_both_replacement_and_rollback_hotkeys_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let attempts = mock_hotkeys(&runtime, &[true, false, false, true]);
+        let original = runtime.config();
+        original.save(&path).unwrap();
+        runtime.start_hotkeys().unwrap();
+
+        let mut next = original.clone();
+        next.start_key = "ctrl+alt+j".into();
+        let error = runtime
+            .save_and_reload(next.clone(), &path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to restore hotkeys"));
+        assert_eq!(runtime.config(), original);
+        assert_eq!(Config::load(&path).unwrap(), original);
+        assert_eq!(runtime.snapshot().state, State::Error);
+        assert!(runtime.inner.lock().hotkeys.is_none());
+        assert_eq!(attempts.lock().stopped, 1);
+
+        next.start_key = "ctrl+alt+k".into();
+        runtime.save_and_reload(next.clone(), &path).await.unwrap();
+        assert_eq!(runtime.config(), next);
+        assert_eq!(Config::load(&path).unwrap(), next);
+        assert!(runtime.inner.lock().hotkeys.is_some());
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(
+            attempts.lock().keys,
+            [
+                original.start_key.clone(),
+                "ctrl+alt+j".into(),
+                original.start_key,
+                next.start_key,
+            ]
+        );
+        runtime.stop();
+        assert_eq!(attempts.lock().stopped, 2);
+    }
+
+    struct HotkeyAttempts {
+        keys: Vec<String>,
+        outcomes: std::collections::VecDeque<bool>,
+        stopped: usize,
+    }
+
+    fn mock_hotkeys(runtime: &Runtime, outcomes: &[bool]) -> Arc<Mutex<HotkeyAttempts>> {
+        let attempts = Arc::new(Mutex::new(HotkeyAttempts {
+            keys: Vec::new(),
+            outcomes: outcomes.iter().copied().collect(),
+            stopped: 0,
+        }));
+        let history = attempts.clone();
+        *runtime.hotkey_registrar.lock() = Some(Arc::new(move |config| {
+            let succeeds = {
+                let mut attempts = history.lock();
+                attempts.keys.push(config.start_key.clone());
+                attempts
+                    .outcomes
+                    .pop_front()
+                    .expect("unexpected registration")
+            };
+            if succeeds {
+                let history = history.clone();
+                Ok(HotkeyRegistration::new(move |_| {
+                    history.lock().stopped += 1
+                }))
+            } else {
+                Err(hotkey::HotkeyError::Registration("Hotkey occupied".into()))
+            }
+        }));
+        attempts
+    }
+
+    #[tokio::test]
+    async fn save_failure_and_busy_save_preserve_file_and_runtime_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        *runtime.hotkey_registrar.lock() = Some(Arc::new(|_| {
+            panic!("saving must not enable hotkeys that were never requested")
+        }));
+        let original = runtime.config();
+        original.save(&path).unwrap();
+        let mut next = original.clone();
+        next.model = "changed".into();
+        assert!(
+            runtime
+                .save_and_reload(next.clone(), directory.path())
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.config(), original);
+        let guard = runtime.action_lock.clone().lock_owned().await;
+        assert!(matches!(
+            runtime.save_and_reload(next.clone(), &path).await,
+            Err(RuntimeError::Busy)
+        ));
+        assert_eq!(Config::load(&path).unwrap(), original);
+        drop(guard);
+        runtime.save_and_reload(next, &path).await.unwrap();
+        assert_eq!(Config::load(&path).unwrap(), runtime.config());
+        assert_eq!(runtime.config().model, "changed");
     }
 }

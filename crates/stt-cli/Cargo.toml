@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "stt"
+name = "dictate-cli"
 path = "src/main.rs"
 
 [features]

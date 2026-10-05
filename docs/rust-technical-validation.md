@@ -1,5 +1,38 @@
 # Rust technical validation record
 
+## Settings control rounded-edge rendering
+
+Settings and Rewrite editor shapes now use a cached Direct2D target and a
+premultiplied-alpha DIB, composited at native pixel size into the existing GDI
+DC. Text remains on the original GDI path. Dropdowns use a layered child
+surface behind their opaque native content, with synchronized position,
+visibility, z-order and DPI. Rendering failures restore the GDI fallback.
+
+Checks completed for this change:
+
+- `cargo test -p stt-gui --features native-gui`: all 14 portable GUI tests pass.
+- `cargo clippy -p stt-gui --all-targets --target x86_64-pc-windows-gnu --features native-gui -- -D warnings`: passes, including the Windows pixel-test code.
+- `cargo build -p stt-gui --target x86_64-pc-windows-gnu --features native-gui`: development executable compiles and links; this is not a production static-libav release build.
+- `cargo test -p stt-gui --target x86_64-pc-windows-gnu --features native-gui --no-run`: Windows test executable compiles and links.
+- `cargo fmt --all --check` and `git diff --check`: pass.
+
+Two new Windows-only pixel tests cover transparent and partially covered edges,
+premultiplied color channels, scratch-surface reuse, and GDI composition with a
+negative viewport origin and a clip region. They have **not been executed** in
+this Linux environment. On Windows, run
+`cargo test -p stt-gui --features native-gui rounded_shape_tests`.
+
+Windows desktop verification remains pending for all Settings pages and the
+Rewrite editor at 100%, 125%, 150% and 200% DPI. Check dropdown open/close and
+upward placement, hover/selection and keyboard navigation, scrollbar dragging,
+padding clicks, overlap with native inputs, page switches, disabled controls,
+and settings-window movement/hiding and monitor changes. Compilation and pixel
+tests alone do not establish these visual and interaction results.
+
+## Selected-text Rewrite update
+
+See [Rewrite validation](rewrite-validation.md) for this change's automated checks and pending Windows desktop checks. Historical counts and static audio builds below describe earlier changes.
+
 ## Microphone selection and native-format capture update
 
 The current WASAPI backend supersedes the PortAudio/WMME and capture-rate

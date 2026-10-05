@@ -21,7 +21,6 @@ build/
 dist/
 out/
 target/
-stt.exe
 *.exe
 *.dll
 *.so

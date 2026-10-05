@@ -23,6 +23,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_path.workspace = true
+tempfile = "3.21.0"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -37,4 +38,3 @@ pkg-config = "0.3.32"
 
 [dev-dependencies]
 base64.workspace = true
-tempfile = "3.21.0"

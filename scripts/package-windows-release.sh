@@ -27,9 +27,9 @@ package() {
         THIRD_PARTY_LICENSES
 }
 
-package "$DIST_DIR/cli" stt.exe stt-cli-windows-amd64.zip
-package "$DIST_DIR/gui" STT.exe stt-gui-windows-amd64.zip
+package "$DIST_DIR/cli" dictate-cli.exe dictate-cli-windows-amd64.zip
+package "$DIST_DIR/gui" Dictate.exe dictate-gui-windows-amd64.zip
 
 cd "$DIST_DIR"
-sha256sum stt-cli-windows-amd64.zip > stt-cli-windows-amd64.zip.sha256
-sha256sum stt-gui-windows-amd64.zip > stt-gui-windows-amd64.zip.sha256
+sha256sum dictate-cli-windows-amd64.zip > dictate-cli-windows-amd64.zip.sha256
+sha256sum dictate-gui-windows-amd64.zip > dictate-gui-windows-amd64.zip.sha256

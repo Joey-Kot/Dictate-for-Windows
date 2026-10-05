@@ -1319,6 +1319,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cc",
+ "chrono",
  "hound",
  "parking_lot",
  "pkg-config",

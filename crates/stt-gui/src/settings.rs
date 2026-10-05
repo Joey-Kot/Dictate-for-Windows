@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
@@ -51,11 +52,13 @@ use crate::render::{PANEL_CORNER_RADIUS, RoundedOutlineRenderer, continuous_roun
 use crate::resources;
 
 mod audio;
+mod debug;
 mod dropdown;
 #[path = "dropdown_scrollbar.rs"]
 mod dropdown_scrollbar;
 mod hotkeys;
 mod microphone;
+mod rewrite;
 use microphone::{
     ID_MICROPHONE, ID_MICROPHONE_LIST, MICROPHONE_TIMER, MicrophonePicker, WM_MICROPHONE_ACTION,
 };
@@ -66,7 +69,8 @@ pub fn microphone_handles_escape(hwnd: HWND) -> bool {
     }
     unsafe {
         let id = windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(hwnd) as usize;
-        id == ID_MICROPHONE_LIST
+        rewrite::handles_escape(id)
+            || id == ID_MICROPHONE_LIST
             || (audio::ID_LIST_BASE..audio::ID_LIST_BASE + 6).contains(&id)
             || (0x6410..0x6416).contains(&id)
     }
@@ -80,9 +84,9 @@ const ID_TEST_CONNECTIVITY: usize = 0x6105;
 const ID_PAGE_BASE: usize = 0x6110;
 const ID_LANGUAGE_ITEM_BASE: usize = 0x6180;
 const ID_FIELD_BASE: usize = 0x6200;
-const WM_SAVE_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 21;
+const SAVE_TIMER: usize = 0x6701;
 pub const WM_LANGUAGE_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 22;
-const WM_CONNECTIVITY_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 23;
+const CONNECTIVITY_TIMER: usize = 0x6700;
 pub const WM_OPACITY_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
 pub const WM_WINDOW_SCALE_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
 
@@ -98,15 +102,17 @@ const EDIT_WIDTH: i32 = 378;
 const FIELD_TOP: i32 = 94;
 const FIELD_HEIGHT: i32 = 34;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
+const CLIPBOARD_DELAY_KEYS: [&str; 2] = ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"];
 const CONNECTIVITY_TEST_SAMPLE_RATE: i32 = 16_000;
 const CONNECTIVITY_TEST_PCM: &str = include_str!("../../../scripts/connectivity_test.pcm.b64");
 
 const GROUPS: &[(&str, &str)] = &[
     ("Display", "display"),
-    ("API", "API"),
-    ("Audio", "audio"),
+    ("API", "audio_api"),
+    ("Audio", "audio_record"),
+    ("Rewrite", "rewrite_api"),
     ("Network", "network"),
-    ("Hotkeys", "hotkeys"),
+    ("Hotkeys", "audio_hotkeys"),
     ("Cache", "cache"),
     ("Debug", "debug"),
     ("About", "about"),
@@ -359,9 +365,17 @@ struct SettingsState {
     owner: HWND,
     runtime: Arc<Runtime>,
     controls: HashMap<&'static str, HWND>,
+    layouts: RefCell<Vec<(HWND, RECT)>>,
     config_path: std::path::PathBuf,
     saving: bool,
+    save_receiver: Option<std::sync::mpsc::Receiver<Result<Event, String>>>,
     connectivity_status: ConnectivityStatus,
+    connectivity_cancel: tokio_util::sync::CancellationToken,
+    connectivity_receiver: Option<std::sync::mpsc::Receiver<(Result<(), String>, u128)>>,
+    rewrite_test: bool,
+    connectivity_elapsed: u128,
+    rewrite: rewrite::Page,
+    debug: debug::Page,
     language: Language,
     language_control: HWND,
     language_items: Vec<HWND>,
@@ -414,7 +428,16 @@ impl SettingsFrameOverlay {
         owner: HWND,
         instance: windows::Win32::Foundation::HMODULE,
         dpi: u32,
+        width: i32,
+        height: i32,
     ) -> Result<Self, String> {
+        let renderer = RoundedOutlineRenderer::new(
+            width as f32,
+            height as f32,
+            PANEL_CORNER_RADIUS as f32,
+            dpi,
+        )
+        .map_err(|error| error.to_string())?;
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(
@@ -425,8 +448,8 @@ impl SettingsFrameOverlay {
                 WS_POPUP,
                 0,
                 0,
-                platform::scale(WINDOW_WIDTH, dpi),
-                platform::scale(WINDOW_HEIGHT, dpi),
+                platform::scale(width, dpi),
+                platform::scale(height, dpi),
                 Some(owner),
                 None,
                 Some(instance.into()),
@@ -435,18 +458,33 @@ impl SettingsFrameOverlay {
         }
         .map_err(|error| error.to_string())?;
         platform::disable_native_window_frame(hwnd);
-        let renderer = RoundedOutlineRenderer::new(
-            WINDOW_WIDTH as f32,
-            WINDOW_HEIGHT as f32,
-            PANEL_CORNER_RADIUS as f32,
-            dpi,
-        )
-        .map_err(|error| error.to_string())?;
         Ok(Self { hwnd, renderer })
     }
 
     fn set_dpi(&mut self, dpi: u32) {
         self.renderer.set_dpi(dpi);
+    }
+
+    fn sync(&mut self, owner: HWND, repaint: bool) {
+        let mut window = RECT::default();
+        if unsafe { GetWindowRect(owner, &mut window) }.is_err() {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                window.left,
+                window.top,
+                window.right - window.left,
+                window.bottom - window.top,
+                SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        if repaint {
+            let _ = self.renderer.paint(self.hwnd);
+        }
     }
 }
 
@@ -477,9 +515,17 @@ impl SettingsWindow {
             owner,
             runtime: runtime.clone(),
             controls: HashMap::new(),
+            layouts: RefCell::new(Vec::new()),
             config_path: platform::config_path()?,
             saving: false,
+            save_receiver: None,
             connectivity_status: ConnectivityStatus::Idle,
+            connectivity_cancel: tokio_util::sync::CancellationToken::new(),
+            connectivity_receiver: None,
+            rewrite_test: false,
+            connectivity_elapsed: 0,
+            rewrite: rewrite::Page::new(runtime.config().rewrite),
+            debug: debug::Page::default(),
             language,
             language_control: HWND::default(),
             language_items: Vec::new(),
@@ -508,7 +554,7 @@ impl SettingsWindow {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 w!("STTRustSettingsWindow"),
-                PCWSTR(wide(language.text("settings")).as_ptr()),
+                PCWSTR(wide(&format!("Dictate - {}", language.text("settings"))).as_ptr()),
                 WS_POPUP | WS_CLIPCHILDREN,
                 windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
                 windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
@@ -524,18 +570,19 @@ impl SettingsWindow {
             unsafe { drop(Box::from_raw(pointer)) };
             error.to_string()
         })?;
-        let frame_overlay = match SettingsFrameOverlay::create(hwnd, instance, dpi) {
-            Ok(frame_overlay) => frame_overlay,
-            Err(error) => {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
+        let frame_overlay =
+            match SettingsFrameOverlay::create(hwnd, instance, dpi, WINDOW_WIDTH, WINDOW_HEIGHT) {
+                Ok(frame_overlay) => frame_overlay,
+                Err(error) => {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         unsafe {
             (*pointer).frame_overlay = Some(frame_overlay);
-            apply_settings_region(&*pointer);
+            apply_settings_region(hwnd, dpi);
             platform::apply_dark_mode(hwnd);
             platform::disable_native_window_frame(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -568,6 +615,9 @@ unsafe extern "system" fn settings_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     let state = unsafe { &mut *pointer };
+    if rewrite::handle_message(state, message, wparam, lparam) {
+        return LRESULT(0);
+    }
     match message {
         WM_CREATE => {
             if let Err(error) = create_controls(state) {
@@ -595,6 +645,12 @@ unsafe extern "system" fn settings_proc(
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            if debug::command(state, id, notification) {
+                return LRESULT(0);
+            }
+            if rewrite::command(state, id, notification) {
+                return LRESULT(0);
+            }
             if notification == BN_CLICKED
                 && let Some(field) = state
                     .audio_pickers
@@ -608,6 +664,7 @@ unsafe extern "system" fn settings_proc(
             if id >= ID_PAGE_BASE && id < ID_PAGE_BASE + GROUPS.len() && notification == BN_CLICKED
             {
                 hotkeys::deactivate();
+                rewrite::close_provider(state);
                 set_language_dropdown(state, false);
                 audio::close_all(state);
                 if let Some(picker) = &mut state.microphone {
@@ -642,6 +699,7 @@ unsafe extern "system" fn settings_proc(
                 let value = state.boolean_values.entry(key).or_default();
                 *value = !*value;
                 update_input_controls(state);
+                rewrite::refresh_hotkey_context(state);
                 if let Some(control) = state.controls.get(key) {
                     unsafe {
                         let _ = InvalidateRect(Some(*control), None, true);
@@ -651,6 +709,9 @@ unsafe extern "system" fn settings_proc(
                 && id < ID_FIELD_BASE + FIELDS.len()
                 && (notification == EN_SETFOCUS || notification == EN_KILLFOCUS)
             {
+                if notification == EN_KILLFOCUS && FIELDS[id - ID_FIELD_BASE].key == "ExtraConfig" {
+                    format_json_input(HWND(lparam.0 as *mut c_void));
+                }
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, true);
                 }
@@ -667,6 +728,7 @@ unsafe extern "system" fn settings_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            rewrite::close_provider(state);
             audio::close_all(state);
             if let Some(picker) = &mut state.microphone {
                 picker.set_open(false, state.language, state.dpi);
@@ -683,6 +745,9 @@ unsafe extern "system" fn settings_proc(
         WM_ERASEBKGND => LRESULT(1),
         WM_DRAWITEM => {
             let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            if rewrite::draw(state, item) {
+                return LRESULT(1);
+            }
             if item.CtlID as usize == ID_MICROPHONE_LIST {
                 if let Some(picker) = &state.microphone {
                     picker.draw(state, item);
@@ -700,6 +765,7 @@ unsafe extern "system" fn settings_proc(
             let item =
                 unsafe { &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT) };
             if item.CtlID as usize == ID_MICROPHONE_LIST
+                || item.CtlID as usize == rewrite::ID_PROMPTS
                 || (audio::ID_LIST_BASE..audio::ID_LIST_BASE + 6).contains(&(item.CtlID as usize))
             {
                 item.itemHeight = platform::scale(36, state.dpi) as u32;
@@ -764,8 +830,18 @@ unsafe extern "system" fn settings_proc(
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
                 let control = HWND(lparam.0 as *mut c_void);
+                // Keep these STATIC labels enabled to avoid embossed disabled text.
+                // Their color follows the corresponding input's enabled state.
+                let color_control = state
+                    .localized_controls
+                    .iter()
+                    .find(|(label, key)| *label == control && CLIPBOARD_DELAY_KEYS.contains(key))
+                    .and_then(|(_, key)| state.controls.get(key))
+                    .copied()
+                    .unwrap_or(control);
                 let enabled =
-                    windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(control).as_bool();
+                    windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(color_control)
+                        .as_bool();
                 SetTextColor(
                     hdc,
                     if enabled {
@@ -792,6 +868,8 @@ unsafe extern "system" fn settings_proc(
         }
         WM_CTLCOLORDLG => LRESULT(state.background_brush.0 as isize),
         WM_DPICHANGED => {
+            rewrite::close_provider(state);
+            audio::close_all(state);
             state.dpi = ((wparam.0 >> 16) & 0xffff) as u32;
             if let Some(frame) = &mut state.frame_overlay {
                 frame.set_dpi(state.dpi);
@@ -808,6 +886,7 @@ unsafe extern "system" fn settings_proc(
                     SWP_NOACTIVATE,
                 );
             }
+            resize_controls(state);
             if let Some(picker) = &mut state.microphone {
                 picker.rebuild(state.language, state.dpi);
             }
@@ -820,60 +899,21 @@ unsafe extern "system" fn settings_proc(
             let resized = position.flags.0 & SWP_NOSIZE.0 == 0;
             let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             if resized {
-                apply_settings_region(state);
+                apply_settings_region(hwnd, state.dpi);
             }
             sync_settings_frame(state, resized);
             result
         }
-        WM_SAVE_RESULT => {
-            let result = unsafe { Box::from_raw(lparam.0 as *mut Result<Event, String>) };
-            state.saving = false;
-            enable_controls(state, true);
-            let config = state.runtime.config();
-            unsafe {
-                let alpha = platform::window_opacity_alpha(config.opacity);
-                let _ = PostMessageW(
-                    Some(state.owner),
-                    WM_OPACITY_CHANGED,
-                    WPARAM(alpha as usize),
-                    LPARAM(0),
-                );
-                let _ = PostMessageW(
-                    Some(state.owner),
-                    WM_WINDOW_SCALE_CHANGED,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
-            match *result {
-                Ok(_) => unsafe {
-                    let _ = DestroyWindow(hwnd);
-                },
-                Err(error) => show_error(hwnd, &error),
-            }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == SAVE_TIMER => {
+            poll_save(state);
             LRESULT(0)
         }
-        WM_CONNECTIVITY_RESULT => {
-            let result = unsafe { Box::from_raw(lparam.0 as *mut Result<(), String>) };
-            state.connectivity_status = match *result {
-                Ok(()) => ConnectivityStatus::Succeeded,
-                Err(error) => ConnectivityStatus::Failed(error),
-            };
-            if let Some(button) = state.controls.get("__test_connectivity") {
-                unsafe {
-                    if !state.saving {
-                        let _ = EnableWindow(*button, true);
-                    }
-                    let _ = SetWindowTextW(
-                        *button,
-                        PCWSTR(wide(state.language.text("test_connectivity")).as_ptr()),
-                    );
-                    let _ = InvalidateRect(Some(*button), None, true);
-                }
-            }
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, true);
-            }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == CONNECTIVITY_TIMER => {
+            poll_connectivity(state);
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == debug::TIMER => {
+            debug::refresh(&mut state.debug);
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
@@ -893,8 +933,11 @@ unsafe extern "system" fn settings_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            state.connectivity_cancel.cancel();
             hotkeys::deactivate();
             unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), debug::TIMER);
                 let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
                     Some(hwnd),
                     MICROPHONE_TIMER,
@@ -913,13 +956,13 @@ unsafe extern "system" fn settings_proc(
     }
 }
 
-fn apply_settings_region(state: &SettingsState) {
+fn apply_settings_region(hwnd: HWND, dpi: u32) {
     let mut client = RECT::default();
-    if unsafe { GetClientRect(state.hwnd, &mut client) }.is_err() {
+    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
         return;
     }
-    let width = platform::unscale(client.right - client.left, state.dpi) as f32;
-    let height = platform::unscale(client.bottom - client.top, state.dpi) as f32;
+    let width = platform::unscale(client.right - client.left, dpi) as f32;
+    let height = platform::unscale(client.bottom - client.top, dpi) as f32;
     let inset = 0.75;
     let points = continuous_rounded_rect_polygon(
         inset,
@@ -931,8 +974,8 @@ fn apply_settings_region(state: &SettingsState) {
     )
     .into_iter()
     .map(|(x, y)| POINT {
-        x: (x * state.dpi as f32 / 96.0).round() as i32,
-        y: (y * state.dpi as f32 / 96.0).round() as i32,
+        x: (x * dpi as f32 / 96.0).round() as i32,
+        y: (y * dpi as f32 / 96.0).round() as i32,
     })
     .collect::<Vec<_>>();
     unsafe {
@@ -940,34 +983,15 @@ fn apply_settings_region(state: &SettingsState) {
         if region.is_invalid() {
             return;
         }
-        if SetWindowRgn(state.hwnd, Some(region), true) == 0 {
+        if SetWindowRgn(hwnd, Some(region), true) == 0 {
             let _ = DeleteObject(HGDIOBJ(region.0));
         }
     }
 }
 
 fn sync_settings_frame(state: &mut SettingsState, repaint: bool) {
-    let Some(frame) = &mut state.frame_overlay else {
-        return;
-    };
-    let mut window = RECT::default();
-    if unsafe { GetWindowRect(state.hwnd, &mut window) }.is_err() {
-        return;
-    }
-    unsafe {
-        let _ = SetWindowPos(
-            frame.hwnd,
-            Some(HWND_TOP),
-            window.left,
-            window.top,
-            window.right - window.left,
-            window.bottom - window.top,
-            SWP_NOACTIVATE,
-        );
-        let _ = ShowWindow(frame.hwnd, SW_SHOWNOACTIVATE);
-    }
-    if repaint {
-        let _ = frame.renderer.paint(frame.hwnd);
+    if let Some(frame) = &mut state.frame_overlay {
+        frame.sync(state.hwnd, repaint);
     }
 }
 
@@ -1144,7 +1168,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
                     let frame_height = if multiline { 68 } else { FIELD_HEIGHT };
                     let mut style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
                     style |= WINDOW_STYLE(if multiline {
-                        (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32
+                        (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32 | WS_CLIPCHILDREN.0
                     } else {
                         ES_AUTOHSCROLL as u32
                     });
@@ -1176,6 +1200,9 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
                             Some(LPARAM((margin | (margin << 16)) as isize)),
                         );
                     }
+                    if multiline {
+                        dropdown_scrollbar::attach_edit(hwnd, state.dpi)?;
+                    }
                     state.input_frames.push(InputFrame {
                         rect: RECT {
                             left: EDIT_LEFT,
@@ -1202,6 +1229,8 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
         );
     }
 
+    rewrite::create(state, instance)?;
+    debug::create(state, instance)?;
     audio::refresh(state);
     let vad_hint = create_label(
         state,
@@ -1264,6 +1293,8 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
     )?;
     state.controls.insert("__cancel", cancel);
     state.controls.insert("__save", save);
+    dropdown::track_hover(cancel, false)?;
+    dropdown::track_hover(save, false)?;
     state.localized_controls.push((cancel, "cancel"));
     state.localized_controls.push((save, "save"));
 
@@ -1329,7 +1360,49 @@ fn create_child(
     }
     .map_err(|error| error.to_string())?;
     set_font(hwnd, state.font);
+    state.layouts.borrow_mut().push((
+        hwnd,
+        RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        },
+    ));
     Ok(hwnd)
+}
+
+fn resize_controls(state: &mut SettingsState) {
+    use windows::Win32::UI::WindowsAndMessaging::GetParent;
+    let old = [state.font, state.title_font, state.small_font];
+    state.font = create_font(state.dpi, 14, false);
+    state.title_font = create_font(state.dpi, 20, true);
+    state.small_font = create_font(state.dpi, 11, false);
+    for (hwnd, logical) in state.layouts.borrow().iter() {
+        unsafe {
+            if GetParent(*hwnd).ok() == Some(state.hwnd) {
+                let rect = scaled_rect(*logical, state.dpi);
+                let _ = SetWindowPos(
+                    *hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                );
+            }
+            set_font(*hwnd, state.font);
+        }
+    }
+    rewrite::resize_list(state);
+    debug::resize(&mut state.debug, state.dpi);
+    unsafe {
+        for font in old {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        let _ = InvalidateRect(Some(state.hwnd), None, true);
+    }
 }
 
 fn create_label(
@@ -1473,7 +1546,7 @@ fn paint_window(state: &SettingsState) {
         if active == "About" {
             paint_about(state, hdc);
         }
-        if active == "API" {
+        if active == "API" || active == "Rewrite" {
             paint_connectivity_status(state, hdc);
         }
         SelectObject(hdc, old);
@@ -1483,6 +1556,10 @@ fn paint_window(state: &SettingsState) {
 
 fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
     let id = item.CtlID as usize;
+    if id == ID_SAVE || id == ID_CANCEL {
+        unsafe { draw_dialog_button(item, state.font, state.dpi) };
+        return;
+    }
     if let Some(key) = state.boolean_ids.get(&id).copied() {
         unsafe {
             draw_checkbox(
@@ -1496,7 +1573,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
 
     let selected_page = id >= ID_PAGE_BASE && id == ID_PAGE_BASE + state.active_group;
     let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
-    let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0;
+    let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0 || dropdown::hovered(item.hwndItem);
     let focused = item.itemState.0 & ODS_FOCUS.0 != 0;
     let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
     let scale = |value| platform::scale(value, state.dpi);
@@ -1504,8 +1581,6 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
     unsafe {
         let base = if id >= ID_PAGE_BASE && id < ID_PAGE_BASE + GROUPS.len() {
             rgb(12, 18, 21)
-        } else if id == ID_SAVE || id == ID_CANCEL {
-            rgb(13, 19, 22)
         } else {
             rgb(16, 22, 25)
         };
@@ -1562,6 +1637,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         }
 
         if id == ID_LANGUAGE
+            || id == rewrite::ID_PROVIDER
             || id == ID_MICROPHONE
             || state
                 .audio_pickers
@@ -1570,6 +1646,8 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         {
             let open = if id == ID_LANGUAGE {
                 state.language_open
+            } else if id == rewrite::ID_PROVIDER {
+                state.rewrite.provider_open
             } else if id == ID_MICROPHONE {
                 state.microphone.as_ref().is_some_and(|p| p.open)
             } else {
@@ -1655,47 +1733,10 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
             return;
         }
 
-        let (fill, border, text_color, radius) = if id == ID_SAVE {
-            (
-                if disabled {
-                    rgb(54, 86, 81)
-                } else if pressed {
-                    rgb(80, 187, 169)
-                } else {
-                    rgb(112, 215, 195)
-                },
-                if disabled {
-                    rgb(54, 86, 81)
-                } else {
-                    rgb(112, 215, 195)
-                },
-                if disabled {
-                    rgb(118, 145, 140)
-                } else {
-                    rgb(7, 28, 24)
-                },
-                7,
-            )
-        } else if id == ID_CANCEL {
-            (
-                if pressed {
-                    rgb(36, 47, 52)
-                } else {
-                    rgb(26, 35, 39)
-                },
-                if focused || hot {
-                    rgb(82, 102, 109)
-                } else {
-                    rgb(56, 70, 76)
-                },
-                if disabled {
-                    rgb(92, 105, 109)
-                } else {
-                    rgb(215, 226, 228)
-                },
-                7,
-            )
-        } else if id == ID_TEST_CONNECTIVITY {
+        let (fill, border, text_color, radius) = if id == ID_TEST_CONNECTIVITY
+            || (rewrite::ID_ADD..=rewrite::ID_TEST).contains(&id)
+            || debug::is_button(id)
+        {
             (
                 if disabled {
                     rgb(29, 39, 43)
@@ -1765,6 +1806,64 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
                 0
             },
             0,
+        );
+    }
+}
+
+unsafe fn draw_dialog_button(item: &DRAWITEMSTRUCT, font: HFONT, dpi: u32) {
+    let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+    let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0 || dropdown::hovered(item.hwndItem);
+    let focused = item.itemState.0 & ODS_FOCUS.0 != 0;
+    let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+    let (fill, border, text_color) = if item.CtlID as usize == ID_SAVE {
+        (
+            if disabled {
+                rgb(54, 86, 81)
+            } else if pressed {
+                rgb(80, 187, 169)
+            } else {
+                rgb(112, 215, 195)
+            },
+            if disabled {
+                rgb(54, 86, 81)
+            } else {
+                rgb(112, 215, 195)
+            },
+            if disabled {
+                rgb(118, 145, 140)
+            } else {
+                rgb(7, 28, 24)
+            },
+        )
+    } else {
+        (
+            if pressed {
+                rgb(36, 47, 52)
+            } else {
+                rgb(26, 35, 39)
+            },
+            if focused || hot {
+                rgb(82, 102, 109)
+            } else {
+                rgb(56, 70, 76)
+            },
+            if disabled {
+                rgb(92, 105, 109)
+            } else {
+                rgb(215, 226, 228)
+            },
+        )
+    };
+    unsafe {
+        fill_color(item.hDC, item.rcItem, rgb(13, 19, 22));
+        rounded_box(item.hDC, item.rcItem, fill, border, platform::scale(7, dpi));
+        draw_text_line(
+            item.hDC,
+            font,
+            &read_text(item.hwndItem),
+            text_color,
+            item.rcItem,
+            DT_CENTER,
         );
     }
 }
@@ -1877,7 +1976,7 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
         draw_text_line(
             hdc,
             state.title_font,
-            "STT for Windows",
+            "Dictate for Windows",
             rgb(239, 246, 247),
             RECT {
                 left: s(286),
@@ -1903,7 +2002,7 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
         draw_text_line(
             hdc,
             state.small_font,
-            "Native speech-to-text workflow for Windows",
+            "Speech transcription and text rewriting for Windows",
             rgb(132, 151, 156),
             RECT {
                 left: s(286),
@@ -1925,7 +2024,11 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
             ("Author", "Joey Kot", false),
             ("Email", "joey.kot.x@gmail.com", false),
             ("License", "GPL-3.0-or-later", false),
-            ("Repository", "github.com/Joey-Kot/STT-for-Windows", true),
+            (
+                "Repository",
+                "github.com/Joey-Kot/Dictate-for-Windows",
+                true,
+            ),
         ];
         for (index, (label, value, accent)) in rows.iter().enumerate() {
             let top = 206 + index as i32 * 46;
@@ -1975,13 +2078,36 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
 
 unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
     let s = |value| platform::scale(value, state.dpi);
+    if (state.active_group == 3) != state.rewrite_test {
+        return;
+    }
+    let left = if state.rewrite_test {
+        CONTENT_LEFT
+    } else {
+        EDIT_LEFT
+    };
     match &state.connectivity_status {
-        ConnectivityStatus::Idle | ConnectivityStatus::Testing => {}
+        ConnectivityStatus::Idle => {}
+        ConnectivityStatus::Testing => unsafe {
+            draw_text_line(
+                hdc,
+                state.font,
+                state.language.text("testing_connectivity"),
+                rgb(230, 240, 240),
+                RECT {
+                    left: s(left),
+                    top: s(507),
+                    right: s(EDIT_LEFT + EDIT_WIDTH),
+                    bottom: s(541),
+                },
+                DT_LEFT,
+            );
+        },
         ConnectivityStatus::Succeeded => unsafe {
             let icon = RECT {
-                left: s(EDIT_LEFT),
+                left: s(left),
                 top: s(514),
-                right: s(EDIT_LEFT + 20),
+                right: s(left + 20),
                 bottom: s(534),
             };
             rounded_box(hdc, icon, rgb(104, 201, 88), rgb(104, 201, 88), s(10));
@@ -2009,10 +2135,14 @@ unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
             draw_text_line(
                 hdc,
                 state.font,
-                state.language.text("connectivity_success"),
+                &format!(
+                    "{} ({} ms)",
+                    state.language.text("connectivity_success"),
+                    state.connectivity_elapsed
+                ),
                 rgb(108, 207, 94),
                 RECT {
-                    left: s(EDIT_LEFT + 30),
+                    left: s(left + 30),
                     top: s(507),
                     right: s(EDIT_LEFT + EDIT_WIDTH),
                     bottom: s(541),
@@ -2022,16 +2152,16 @@ unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
         },
         ConnectivityStatus::Failed(error) => unsafe {
             let card = RECT {
-                left: s(EDIT_LEFT),
+                left: s(left),
                 top: s(506),
                 right: s(EDIT_LEFT + EDIT_WIDTH),
                 bottom: s(554),
             };
             rounded_box(hdc, card, rgb(47, 27, 30), rgb(226, 67, 74), s(7));
             let icon = RECT {
-                left: s(EDIT_LEFT + 11),
+                left: s(left + 11),
                 top: s(519),
-                right: s(EDIT_LEFT + 31),
+                right: s(left + 31),
                 bottom: s(539),
             };
             rounded_box(hdc, icon, rgb(239, 86, 91), rgb(239, 86, 91), s(4));
@@ -2043,7 +2173,7 @@ unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
                 &message,
                 rgb(255, 112, 116),
                 RECT {
-                    left: s(EDIT_LEFT + 42),
+                    left: s(left + 42),
                     top: s(512),
                     right: s(EDIT_LEFT + EDIT_WIDTH - 10),
                     bottom: s(548),
@@ -2057,9 +2187,10 @@ fn refresh_language(state: &SettingsState) {
     unsafe {
         let _ = SetWindowTextW(
             state.hwnd,
-            PCWSTR(wide(state.language.text("settings")).as_ptr()),
+            PCWSTR(wide(&format!("Dictate - {}", state.language.text("settings"))).as_ptr()),
         );
     }
+    rewrite::refresh_labels(state);
     for (hwnd, key) in &state.localized_controls {
         let text = if *key == "API" {
             "API"
@@ -2188,10 +2319,16 @@ fn select_language(state: &mut SettingsState, index: usize) {
 }
 
 fn test_connectivity(state: &mut SettingsState) {
+    start_connectivity(state, false);
+}
+
+fn start_connectivity(state: &mut SettingsState, rewrite: bool) {
     if matches!(state.connectivity_status, ConnectivityStatus::Testing) {
         return;
     }
-    let config = match read_config(state).and_then(|config| {
+    state.rewrite_test = rewrite;
+    state.connectivity_elapsed = 0;
+    let mut config = match read_config(state).and_then(|config| {
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
     }) {
@@ -2205,46 +2342,98 @@ fn test_connectivity(state: &mut SettingsState) {
         }
     };
 
+    // API/network fields are tested as drafts; debug switches apply only on Save.
+    let applied = state.runtime.config();
+    config.ffmpeg_debug = applied.ffmpeg_debug;
+    config.record_debug = applied.record_debug;
+    config.hotkey_debug = applied.hotkey_debug;
+    config.upload_debug = applied.upload_debug;
+
     state.connectivity_status = ConnectivityStatus::Testing;
-    if let Some(button) = state.controls.get("__test_connectivity") {
-        unsafe {
-            let _ = EnableWindow(*button, false);
-            let _ = SetWindowTextW(
-                *button,
-                PCWSTR(wide(state.language.text("testing_connectivity")).as_ptr()),
-            );
-            let _ = InvalidateRect(Some(*button), None, true);
-        }
-    }
-    let hwnd = state.hwnd.0 as usize;
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
-            let async_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            async_runtime.block_on(run_connectivity_test(config))
-        })();
-        let pointer = Box::into_raw(Box::new(result));
-        let hwnd = HWND(hwnd as *mut c_void);
-        if unsafe {
-            PostMessageW(
-                Some(hwnd),
-                WM_CONNECTIVITY_RESULT,
-                WPARAM(0),
-                LPARAM(pointer as isize),
-            )
-        }
-        .is_err()
-        {
+    state.rewrite_test = rewrite;
+    state.connectivity_cancel = tokio_util::sync::CancellationToken::new();
+    for key in ["__test_connectivity", "__rewrite_test"] {
+        if let Some(button) = state.controls.get(key) {
             unsafe {
-                drop(Box::from_raw(pointer));
+                let _ = EnableWindow(*button, false);
             }
         }
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(state.hwnd), None, true);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.connectivity_receiver = Some(rx);
+    let runtime = state.runtime.clone();
+    let external = state.connectivity_cancel.clone();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(state.hwnd),
+            CONNECTIVITY_TIMER,
+            50,
+            None,
+        );
+    }
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = (|| -> Result<(), String> {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            executor.block_on(
+                runtime.test_connection(rewrite, external, |cancel| async move {
+                    if rewrite {
+                        let client = stt_core::rewrite::RewriteClient::new(config)
+                            .map_err(|e| e.to_string())?;
+                        client
+                            .test_connection(&cancel)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        run_connectivity_test(config, cancel).await
+                    }
+                }),
+            )
+        })();
+        let _ = tx.send((result, started.elapsed().as_millis()));
     });
 }
 
-async fn run_connectivity_test(config: Config) -> Result<(), String> {
+fn poll_connectivity(state: &mut SettingsState) {
+    let Some(result) = state
+        .connectivity_receiver
+        .as_ref()
+        .and_then(|rx| rx.try_recv().ok())
+    else {
+        return;
+    };
+    state.connectivity_receiver = None;
+    state.connectivity_elapsed = result.1;
+    state.connectivity_status = match result.0 {
+        Ok(()) => ConnectivityStatus::Succeeded,
+        Err(e) => ConnectivityStatus::Failed(e),
+    };
+    for key in ["__test_connectivity", "__rewrite_test"] {
+        if let Some(button) = state.controls.get(key) {
+            unsafe {
+                let _ = EnableWindow(*button, !state.saving);
+            }
+        }
+    }
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+            Some(state.hwnd),
+            CONNECTIVITY_TIMER,
+        );
+        let _ = InvalidateRect(Some(state.hwnd), None, true);
+    }
+}
+
+async fn run_connectivity_test(
+    config: Config,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
     let client = AsrClient::new(config.clone()).map_err(|error| error.to_string())?;
     if config.api_endpoint.is_empty() {
         return Err("API endpoint is empty".into());
@@ -2252,7 +2441,6 @@ async fn run_connectivity_test(config: Config) -> Result<(), String> {
     let (input, output) = connectivity_test_paths(&config.container_extension());
     let result = async {
         write_connectivity_test_wav(&input)?;
-        let cancellation = tokio_util::sync::CancellationToken::new();
         platform::GuiLibAvConverter
             .convert(
                 &cancellation,
@@ -2264,7 +2452,7 @@ async fn run_connectivity_test(config: Config) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
         client
-            .test_connection(&output)
+            .test_connection_cancellable(&cancellation, &output)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2316,6 +2504,44 @@ fn write_connectivity_test_wav(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to create connectivity test audio: {error}"))
 }
 
+fn poll_save(state: &mut SettingsState) {
+    let Some(result) = state
+        .save_receiver
+        .as_ref()
+        .and_then(|rx| rx.try_recv().ok())
+    else {
+        return;
+    };
+    state.save_receiver = None;
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(state.hwnd), SAVE_TIMER);
+    }
+    state.saving = false;
+    enable_controls(state, true);
+    let config = state.runtime.config();
+    unsafe {
+        let alpha = platform::window_opacity_alpha(config.opacity);
+        let _ = PostMessageW(
+            Some(state.owner),
+            WM_OPACITY_CHANGED,
+            WPARAM(alpha as usize),
+            LPARAM(0),
+        );
+        let _ = PostMessageW(
+            Some(state.owner),
+            WM_WINDOW_SCALE_CHANGED,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+    match result {
+        Ok(_) => unsafe {
+            let _ = DestroyWindow(state.hwnd);
+        },
+        Err(error) => show_error(state.hwnd, &error),
+    }
+}
+
 fn save(state: &mut SettingsState) {
     if state.saving {
         return;
@@ -2359,6 +2585,7 @@ fn save(state: &mut SettingsState) {
         return;
     }
     state.saving = true;
+    rewrite::close_provider(state);
     audio::close_all(state);
     if let Some(picker) = &mut state.microphone {
         picker.set_open(false, state.language, state.dpi);
@@ -2366,37 +2593,23 @@ fn save(state: &mut SettingsState) {
     enable_controls(state, false);
     let runtime = state.runtime.clone();
     let config_path = state.config_path.clone();
-    let hwnd = state.hwnd.0 as usize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.save_receiver = Some(rx);
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(state.hwnd), SAVE_TIMER, 50, None);
+    }
     std::thread::spawn(move || {
         let result = (|| -> Result<Event, String> {
-            config
-                .save(&config_path)
-                .map_err(|error| error.to_string())?;
             let async_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
             async_runtime
-                .block_on(runtime.reload(config))
+                .block_on(runtime.save_and_reload(config, &config_path))
                 .map_err(|error| error.to_string())?;
             Ok(runtime.snapshot())
         })();
-        let pointer = Box::into_raw(Box::new(result));
-        let hwnd = HWND(hwnd as *mut c_void);
-        if unsafe {
-            PostMessageW(
-                Some(hwnd),
-                WM_SAVE_RESULT,
-                WPARAM(0),
-                LPARAM(pointer as isize),
-            )
-        }
-        .is_err()
-        {
-            unsafe {
-                drop(Box::from_raw(pointer));
-            }
-        }
+        let _ = tx.send(result);
     });
 }
 
@@ -2467,11 +2680,10 @@ fn read_config(state: &SettingsState) -> Result<Config, String> {
         };
         object.insert(field.key.into(), value);
     }
-    let config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
-    if !config.extra_config.is_empty() {
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&config.extra_config)
-            .map_err(|error| format!("Extra config is invalid JSON: {error}"))?;
-    }
+    let mut config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    config.rewrite = rewrite::read(state);
+    stt_core::additional_parameters::parse(&config.extra_config)
+        .map_err(|e| format!("Extra config: {e}"))?;
     Ok(config)
 }
 
@@ -2482,10 +2694,28 @@ fn read_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..copied])
 }
 
+fn format_json_input(hwnd: HWND) {
+    let input = read_text(hwnd);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return;
+    };
+    let Ok(formatted) = serde_json::to_string_pretty(&value) else {
+        return;
+    };
+    // Native multiline EDIT controls use CRLF line endings.
+    let formatted = formatted.replace('\n', "\r\n");
+    if formatted != input {
+        unsafe {
+            let _ = SetWindowTextW(hwnd, PCWSTR(wide(&formatted).as_ptr()));
+        }
+    }
+}
+
 fn enable_controls(state: &SettingsState, enabled: bool) {
     for control in state
         .controls
         .values()
+        .chain(state.rewrite.provider_items.iter())
         .chain(state.page_buttons.iter())
         .chain(std::iter::once(&state.language_control))
         .chain(state.language_items.iter())
@@ -2499,6 +2729,17 @@ fn enable_controls(state: &SettingsState, enabled: bool) {
 }
 
 fn update_input_controls(state: &SettingsState) {
+    for key in ["__test_connectivity", "__rewrite_test"] {
+        if let Some(button) = state.controls.get(key) {
+            unsafe {
+                let _ = EnableWindow(
+                    *button,
+                    !state.saving
+                        && !matches!(state.connectivity_status, ConnectivityStatus::Testing),
+                );
+            }
+        }
+    }
     for picker in &state.audio_pickers {
         let enabled = !state.saving && state.audio_draft.enabled(picker.field);
         unsafe {
@@ -2521,13 +2762,8 @@ fn update_input_controls(state: &SettingsState) {
             let _ = InvalidateRect(Some(*control), None, true);
         }
     }
-    let enabled = !state.saving
-        && !state
-            .boolean_values
-            .get("USE_SENDINPUT")
-            .copied()
-            .unwrap_or(false);
-    for key in ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"] {
+    let enabled = !state.saving;
+    for key in CLIPBOARD_DELAY_KEYS {
         if let Some(control) = state.controls.get(key) {
             unsafe {
                 let _ = EnableWindow(*control, enabled);
@@ -2537,7 +2773,6 @@ fn update_input_controls(state: &SettingsState) {
         for (label, label_key) in &state.localized_controls {
             if *label_key == key {
                 unsafe {
-                    let _ = EnableWindow(*label, enabled);
                     let _ = InvalidateRect(Some(*label), None, true);
                 }
             }
@@ -2546,6 +2781,10 @@ fn update_input_controls(state: &SettingsState) {
 }
 
 fn create_font(dpi: u32, points: i32, bold: bool) -> HFONT {
+    create_font_face(dpi, points, bold, w!("Segoe UI"))
+}
+
+fn create_font_face(dpi: u32, points: i32, bold: bool, face: PCWSTR) -> HFONT {
     unsafe {
         CreateFontW(
             -platform::scale(points, dpi),
@@ -2565,7 +2804,7 @@ fn create_font(dpi: u32, points: i32, bold: bool) -> HFONT {
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
-            w!("Segoe UI"),
+            face,
         )
     }
 }
@@ -2591,6 +2830,10 @@ fn scaled_rect(rect: RECT, dpi: u32) -> RECT {
 }
 
 unsafe fn rounded_box(hdc: HDC, rect: RECT, fill: COLORREF, border: COLORREF, radius: i32) {
+    if crate::render::draw_rounded_box(hdc, rect, fill, border, radius).is_ok() {
+        return;
+    }
+    // Keep controls usable if the Direct2D target cannot be created or is lost.
     unsafe {
         let old_brush = SelectObject(hdc, GetStockObject(DC_BRUSH));
         let old_pen = SelectObject(hdc, GetStockObject(DC_PEN));
@@ -2714,7 +2957,7 @@ fn show_error(owner: HWND, message: &str) {
         let _ = MessageBoxW(
             Some(owner),
             PCWSTR(message.as_ptr()),
-            w!("STT Settings"),
+            w!("Dictate Settings"),
             MB_OK | MB_ICONERROR,
         );
     }

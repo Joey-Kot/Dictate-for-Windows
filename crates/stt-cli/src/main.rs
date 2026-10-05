@@ -8,9 +8,9 @@ use stt_core::runtime::{Runtime, run_file_mode_with_cancellation};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "stt",
+    name = "dictate-cli",
     version,
-    about = "Record audio, transcribe it through an ASR API, and paste the result.",
+    about = "Dictate for Windows: transcribe audio or rewrite selected text, then insert the result.",
     disable_help_flag = false
 )]
 struct Arguments {
@@ -27,61 +27,61 @@ struct Arguments {
     output: Option<PathBuf>,
 
     /// ASR HTTP endpoint URL.
-    #[arg(long, value_name = "URL", help_heading = "API")]
+    #[arg(long, value_name = "URL", help_heading = "Audio API")]
     api_endpoint: Option<String>,
     /// Bearer token sent with the ASR request.
-    #[arg(long, value_name = "TOKEN", help_heading = "API")]
+    #[arg(long, value_name = "TOKEN", help_heading = "Audio API")]
     token: Option<String>,
     /// Model multipart field.
-    #[arg(long, value_name = "MODEL", help_heading = "API")]
+    #[arg(long, value_name = "MODEL", help_heading = "Audio API")]
     model: Option<String>,
     /// Language multipart field.
-    #[arg(long, value_name = "LANGUAGE", help_heading = "API")]
+    #[arg(long, value_name = "LANGUAGE", help_heading = "Audio API")]
     language: Option<String>,
     /// Prompt multipart field.
-    #[arg(long, value_name = "TEXT", help_heading = "API")]
+    #[arg(long, value_name = "TEXT", help_heading = "Audio API")]
     prompt: Option<String>,
     /// JSONPath selecting exactly one string, number or boolean (default: $.text).
-    #[arg(long, value_name = "PATH", help_heading = "API")]
+    #[arg(long, value_name = "PATH", help_heading = "Audio API")]
     text_path: Option<String>,
     /// Stringified JSON object with extra multipart fields.
-    #[arg(long, value_name = "JSON", help_heading = "API")]
+    #[arg(long, value_name = "JSON", help_heading = "Audio API")]
     extra_config: Option<String>,
 
     /// List active microphones and their stable IDs, then exit without loading config.
-    #[arg(long, help_heading = "Audio")]
+    #[arg(long, help_heading = "Audio Record")]
     list_input_devices: bool,
     /// Microphone endpoint ID, or "default" to follow the system default (this run only).
-    #[arg(long, value_name = "ID|default", help_heading = "Audio")]
+    #[arg(long, value_name = "ID|default", help_heading = "Audio Record")]
     input_device: Option<String>,
 
     /// Detect speech and trim original input (default false); no system FFmpeg required.
-    #[arg(long, action = ArgAction::Set, value_name = "BOOL", help_heading = "Audio")]
+    #[arg(long, action = ArgAction::Set, value_name = "BOOL", help_heading = "Audio Record")]
     enable_vad: Option<bool>,
     /// Shared padding at internal cuts, in milliseconds (0-1000).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1000), help_heading = "Audio")]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1000), help_heading = "Audio Record")]
     vad_padding_ms: Option<u32>,
     /// Speech start score threshold (0.5-1.0, default 0.6).
-    #[arg(long, value_parser = parse_vad_start_threshold, help_heading = "Audio")]
+    #[arg(long, value_parser = parse_vad_start_threshold, help_heading = "Audio Record")]
     vad_start_threshold: Option<f64>,
 
     /// Audio encoder or compatible alias.
-    #[arg(long, value_name = "CODEC", help_heading = "Audio")]
+    #[arg(long, value_name = "CODEC", help_heading = "Audio Record")]
     codecs: Option<String>,
     /// Output audio container.
-    #[arg(long, value_name = "FORMAT", help_heading = "Audio")]
+    #[arg(long, value_name = "FORMAT", help_heading = "Audio Record")]
     container: Option<String>,
     /// Final upload channel count; capture follows the microphone format.
-    #[arg(long, value_name = "N", help_heading = "Audio")]
+    #[arg(long, value_name = "N", help_heading = "Audio Record")]
     channels: Option<i32>,
     /// Final upload sample rate in Hz; capture follows the microphone format.
-    #[arg(long, alias = "rate", value_name = "HZ", help_heading = "Audio")]
+    #[arg(long, alias = "rate", value_name = "HZ", help_heading = "Audio Record")]
     sampling_rate: Option<i32>,
     /// Conversion sample depth in bits.
-    #[arg(long, value_name = "BITS", help_heading = "Audio")]
+    #[arg(long, value_name = "BITS", help_heading = "Audio Record")]
     sampling_rate_depth: Option<i32>,
     /// Audio bitrate in kbps.
-    #[arg(long, value_name = "KBPS", help_heading = "Audio")]
+    #[arg(long, value_name = "KBPS", help_heading = "Audio Record")]
     bit_rate: Option<i32>,
 
     /// Per-request client timeout in seconds.
@@ -111,30 +111,30 @@ struct Arguments {
     verify_ssl: Option<bool>,
 
     /// Start/stop recording hotkey.
-    #[arg(long, value_name = "HOTKEY", help_heading = "Hotkeys")]
+    #[arg(long, value_name = "HOTKEY", help_heading = "Audio Hotkeys")]
     start_key: Option<String>,
     /// Pause/resume recording hotkey.
-    #[arg(long, value_name = "HOTKEY", help_heading = "Hotkeys")]
+    #[arg(long, value_name = "HOTKEY", help_heading = "Audio Hotkeys")]
     pause_key: Option<String>,
     /// Cancels a recording/request or retries the latest completed recording.
-    #[arg(long, value_name = "HOTKEY", help_heading = "Hotkeys")]
+    #[arg(long, value_name = "HOTKEY", help_heading = "Audio Hotkeys")]
     cancel_or_retry_key: Option<String>,
     /// Use the low-level keyboard hook instead of RegisterHotKey.
     #[arg(
         long,
         value_name = "BOOL",
         action = ArgAction::Set,
-        help_heading = "Hotkeys"
+        help_heading = "Audio Hotkeys"
     )]
     hotkey_hook: Option<bool>,
-    /// Input Unicode text without the clipboard or fallback.
-    #[arg(long, value_name = "BOOL", action = ArgAction::Set, help_heading = "Hotkeys")]
+    /// Use Unicode output instead of clipboard paste; Rewrite input still uses Copy.
+    #[arg(long, value_name = "BOOL", action = ArgAction::Set, help_heading = "Audio Hotkeys")]
     use_sendinput: Option<bool>,
-    /// Milliseconds to wait after writing the transcription before sending Ctrl+V.
-    #[arg(long, value_name = "MS", help_heading = "Hotkeys")]
+    /// Milliseconds to wait before Ctrl+V output or Ctrl+C Rewrite input.
+    #[arg(long, value_name = "MS", help_heading = "Audio Hotkeys")]
     clipboard_write_delay: Option<u64>,
-    /// Milliseconds to wait after Ctrl+V before restoring the original clipboard text.
-    #[arg(long, value_name = "MS", help_heading = "Hotkeys")]
+    /// Milliseconds to wait before restoring the clipboard after paste or Rewrite input.
+    #[arg(long, value_name = "MS", help_heading = "Audio Hotkeys")]
     clipboard_restore_delay: Option<u64>,
 
     /// Directory used for temporary and retained cache files.
@@ -148,7 +148,7 @@ struct Arguments {
         help_heading = "Cache"
     )]
     keep_cache: Option<bool>,
-    /// Paste [request failed] after all request attempts fail.
+    /// Write [request failed] after all audio request attempts fail.
     #[arg(
         long,
         value_name = "BOOL",
@@ -402,12 +402,12 @@ mod tests {
     fn microphone_override_and_explicit_default_are_session_only() {
         use clap::Parser;
         for (args, expected) in [
-            (vec!["stt"], "saved-endpoint"),
+            (vec!["dictate-cli"], "saved-endpoint"),
             (
-                vec!["stt", "--input-device", "another-endpoint"],
+                vec!["dictate-cli", "--input-device", "another-endpoint"],
                 "another-endpoint",
             ),
-            (vec!["stt", "--input-device", "default"], ""),
+            (vec!["dictate-cli", "--input-device", "default"], ""),
         ] {
             let mut config = stt_core::Config {
                 input_device: "saved-endpoint".into(),
@@ -426,7 +426,8 @@ mod tests {
                 if overridden { "" } else { "Saved mic" }
             );
         }
-        let listing = super::Arguments::try_parse_from(["stt", "--list-input-devices"]).unwrap();
+        let listing =
+            super::Arguments::try_parse_from(["dictate-cli", "--list-input-devices"]).unwrap();
         assert!(listing.list_input_devices);
         assert!(!listing.has_config_override());
     }
@@ -434,7 +435,7 @@ mod tests {
     fn vad_override_and_range() {
         use clap::Parser;
         let args = super::Arguments::try_parse_from([
-            "stt",
+            "dictate-cli",
             "--enable-vad",
             "false",
             "--vad-padding-ms",
@@ -449,16 +450,20 @@ mod tests {
         assert!(!config.enable_vad);
         assert_eq!(config.vad_padding_ms, 0);
         for value in ["-1", "1001"] {
-            assert!(super::Arguments::try_parse_from(["stt", "--vad-padding-ms", value]).is_err());
+            assert!(
+                super::Arguments::try_parse_from(["dictate-cli", "--vad-padding-ms", value])
+                    .is_err()
+            );
         }
-        assert!(super::Arguments::try_parse_from(["stt", "--enable-vad"]).is_err());
+        assert!(super::Arguments::try_parse_from(["dictate-cli", "--enable-vad"]).is_err());
     }
     #[test]
     fn vad_start_threshold_override_and_range() {
         use clap::Parser;
         for value in ["0.5", "0.6", "1.0"] {
             let args =
-                super::Arguments::try_parse_from(["stt", "--vad-start-threshold", value]).unwrap();
+                super::Arguments::try_parse_from(["dictate-cli", "--vad-start-threshold", value])
+                    .unwrap();
             assert!(args.has_config_override());
             let mut config = stt_core::Config::default();
             args.apply(&mut config);
@@ -467,14 +472,15 @@ mod tests {
         }
         for value in ["0", "0.499", "1.001", "NaN", "inf", "invalid"] {
             assert!(
-                super::Arguments::try_parse_from(["stt", "--vad-start-threshold", value,]).is_err()
+                super::Arguments::try_parse_from(["dictate-cli", "--vad-start-threshold", value,])
+                    .is_err()
             );
         }
         let mut config = stt_core::Config {
             vad_start_threshold: 0.8,
             ..Default::default()
         };
-        super::Arguments::try_parse_from(["stt"])
+        super::Arguments::try_parse_from(["dictate-cli"])
             .unwrap()
             .apply(&mut config);
         assert_eq!(config.vad_start_threshold, 0.8);
@@ -489,12 +495,13 @@ mod tests {
             use_sendinput: true,
             ..Config::default()
         };
-        Arguments::try_parse_from(["stt"])
+        Arguments::try_parse_from(["dictate-cli"])
             .unwrap()
             .apply(&mut config);
         assert!(config.use_sendinput);
         for value in ["false", "true"] {
-            let args = Arguments::try_parse_from(["stt", "--use-sendinput", value]).unwrap();
+            let args =
+                Arguments::try_parse_from(["dictate-cli", "--use-sendinput", value]).unwrap();
             assert!(args.has_config_override());
             args.apply(&mut config);
             assert_eq!(config.use_sendinput, value == "true");
@@ -504,7 +511,7 @@ mod tests {
     #[test]
     fn standard_boolean_values_and_alias_apply() {
         let arguments = Arguments::try_parse_from([
-            "stt",
+            "dictate-cli",
             "--verify-ssl",
             "false",
             "--enable-http2",
@@ -532,11 +539,12 @@ mod tests {
     #[test]
     fn cancel_or_retry_key_option_replaces_cancel_key() {
         let arguments =
-            Arguments::try_parse_from(["stt", "--cancel-or-retry-key", "ctrl+alt+r"]).unwrap();
+            Arguments::try_parse_from(["dictate-cli", "--cancel-or-retry-key", "ctrl+alt+r"])
+                .unwrap();
         let mut config = Config::default();
         arguments.apply(&mut config);
         assert_eq!(config.cancel_or_retry_key, "ctrl+alt+r");
-        assert!(Arguments::try_parse_from(["stt", "--cancel-key", "alt+esc"]).is_err());
+        assert!(Arguments::try_parse_from(["dictate-cli", "--cancel-key", "alt+esc"]).is_err());
     }
 
     #[test]
@@ -545,7 +553,13 @@ mod tests {
         let help = command.render_long_help().to_string();
         let mut previous = 0;
         for heading in [
-            "General:", "API:", "Audio:", "Network:", "Hotkeys:", "Cache:", "Debug:",
+            "General:",
+            "Audio API:",
+            "Audio Record:",
+            "Network:",
+            "Audio Hotkeys:",
+            "Cache:",
+            "Debug:",
         ] {
             let position = help
                 .find(heading)
@@ -560,7 +574,8 @@ mod tests {
 
     #[test]
     fn removed_notification_argument_is_rejected() {
-        let error = Arguments::try_parse_from(["stt", "--notification", "true"]).unwrap_err();
+        let error =
+            Arguments::try_parse_from(["dictate-cli", "--notification", "true"]).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -570,6 +585,6 @@ mod tests {
 
     #[test]
     fn single_dash_legacy_argument_is_rejected() {
-        assert!(Arguments::try_parse_from(["stt", "-token", "secret"]).is_err());
+        assert!(Arguments::try_parse_from(["dictate-cli", "-token", "secret"]).is_err());
     }
 }

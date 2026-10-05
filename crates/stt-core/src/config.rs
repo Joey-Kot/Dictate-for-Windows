@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
 #[serde(default)]
 #[allow(non_snake_case)]
 pub struct Config {
+    #[serde(rename = "REWRITE")]
+    pub rewrite: crate::rewrite::RewriteConfig,
     #[serde(rename = "API_ENDPOINT")]
     pub api_endpoint: String,
     #[serde(rename = "TOKEN")]
@@ -107,6 +110,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            rewrite: crate::rewrite::RewriteConfig::default(),
             api_endpoint: String::new(),
             token: String::new(),
             model: String::new(),
@@ -198,13 +202,29 @@ impl Config {
             })?;
         }
         let bytes = serde_json::to_vec_pretty(self)?;
-        fs::write(path, bytes).map_err(|source| ConfigError::Write {
+        // Persist a complete sibling file atomically so a failed save cannot
+        // truncate the last working configuration.
+        let write = || -> Result<(), std::io::Error> {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary.write_all(&bytes)?;
+            temporary.as_file().sync_all()?;
+            temporary.persist(path).map_err(|error| error.error)?;
+            Ok(())
+        };
+        write().map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
         })
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.rewrite.validate().map_err(ConfigError::Invalid)?;
+        crate::additional_parameters::parse(&self.extra_config)
+            .map_err(|error| ConfigError::Invalid(format!("Extra config: {error}")))?;
         validate_vad_start_threshold(self.vad_start_threshold)?;
         crate::jsonpath::parse_text_path(&self.text_path)
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
@@ -255,8 +275,7 @@ impl Config {
                 self.bit_rate
             )));
         }
-        hotkey::validate_bindings(&self.start_key, &self.pause_key, &self.cancel_or_retry_key)
-            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        hotkey::validate_config(self).map_err(|error| ConfigError::Invalid(error.to_string()))?;
 
         let codecs: HashSet<&str> = [
             "opus",
@@ -539,5 +558,40 @@ mod tests {
         assert!(raw.contains_key("CANCEL_OR_RETRY_KEY"));
         assert_eq!(raw.get("OPACITY"), Some(&serde_json::json!(1.0)));
         assert_eq!(raw.get("WINDOW_SCALE"), Some(&serde_json::json!(1.0)));
+    }
+
+    #[test]
+    fn legacy_config_and_rewrite_roundtrip_preserve_defaults_and_stable_prompt_ids() {
+        let old: Config =
+            serde_json::from_str(r#"{"MODEL":"audio-model","START_KEY":"ctrl+alt+q"}"#).unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.rewrite, crate::rewrite::RewriteConfig::default());
+        let mut config = old;
+        config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+            title: "Polish".into(),
+            prompt: "Polish the text".into(),
+            hotkey: "ctrl+alt+w".into(),
+            extra_config: r#"{"nested":{"array":[null,{"keep":true}]}}"#.into(),
+            ..Default::default()
+        });
+        config.validate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+        config
+            .rewrite
+            .prompts
+            .push(config.rewrite.prompts[0].clone());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate prompt ID")
+        );
+        config.rewrite.prompts.pop();
+        config.rewrite.prompts[0].extra_config = "[]".into();
+        assert!(config.validate().is_err());
     }
 }

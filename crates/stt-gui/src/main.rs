@@ -2,6 +2,8 @@
 
 #[cfg(any(windows, test))]
 mod audio_options;
+#[cfg(any(windows, test))]
+mod debug_log;
 #[cfg(all(test, not(windows)))]
 mod dropdown_scrollbar;
 #[cfg(windows)]
@@ -23,8 +25,9 @@ mod window;
 
 #[cfg(windows)]
 fn main() {
+    let _debug_logs = debug_log::install();
     if let Err(error) = window::run() {
-        let message = format!("STT failed to start:\n{error}");
+        let message = format!("Dictate failed to start:\n{error}");
         let wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
@@ -32,7 +35,7 @@ fn main() {
             let _ = MessageBoxW(
                 None,
                 PCWSTR(wide.as_ptr()),
-                windows::core::w!("STT"),
+                windows::core::w!("Dictate"),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -41,5 +44,5 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("STT is a Windows-only native GUI");
+    eprintln!("Dictate is a Windows-only native GUI");
 }
