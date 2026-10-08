@@ -2297,7 +2297,7 @@ mod tests {
         SignerConfig, StreamAction, StreamRule, WorkflowSchemaVersion,
     };
     use crate::audio_devices::{CaptureFormat, test_capture_format};
-    use crate::converter::{SegmentAnalysis, SourceFrameInterval};
+    use crate::converter::{SegmentAnalysis, SegmentExportRequest, SourceFrameInterval};
     use crate::recorder::{AudioBackend, AudioStream};
 
     fn retry_recording_for_test(bytes: &[u8]) -> Arc<RetryRecording> {
@@ -2545,24 +2545,19 @@ mod tests {
         async fn export_segments(
             &self,
             _: &CancellationToken,
-            config: &Config,
-            _: &Path,
-            outputs: &[PathBuf],
-            intervals: &[SourceFrameInterval],
-            _: u32,
-            _: u64,
+            request: SegmentExportRequest<'_>,
         ) -> Result<(), ConvertError> {
             self.calls.lock().exports.push(SegmentExportCall {
-                segmented_upload_enabled: config.enable_segmented_upload,
-                max_segment_seconds: config.max_upload_segment_seconds,
-                min_pause_ms: config.min_upload_pause_ms,
-                max_concurrency: config.max_upload_concurrency,
-                enable_vad: config.enable_vad,
-                intervals: intervals.to_vec(),
+                segmented_upload_enabled: request.config.enable_segmented_upload,
+                max_segment_seconds: request.config.max_upload_segment_seconds,
+                min_pause_ms: request.config.min_upload_pause_ms,
+                max_concurrency: request.config.max_upload_concurrency,
+                enable_vad: request.config.enable_vad,
+                intervals: request.intervals.to_vec(),
             });
             match self.outcome {
                 SegmentExportOutcome::Succeed => {
-                    for output in outputs {
+                    for output in request.outputs {
                         std::fs::write(output, b"segment").map_err(|error| {
                             ConvertError::Failed {
                                 message: error.to_string(),
@@ -2575,7 +2570,7 @@ mod tests {
                     message: "simulated segment export failure".into(),
                 }),
                 SegmentExportOutcome::Canceled => {
-                    if let Some(output) = outputs.first() {
+                    if let Some(output) = request.outputs.first() {
                         std::fs::write(output, b"partial segment").map_err(|error| {
                             ConvertError::Failed {
                                 message: error.to_string(),

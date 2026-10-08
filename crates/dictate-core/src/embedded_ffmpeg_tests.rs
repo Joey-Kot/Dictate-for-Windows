@@ -646,12 +646,14 @@ async fn native_segmented_encoded_outputs_are_independently_decodable() {
         converter
             .export_segments(
                 &token,
-                &config,
-                &input,
-                &outputs,
-                &intervals,
-                16_000,
-                samples.len() as u64,
+                SegmentExportRequest {
+                    config: &config,
+                    input: &input,
+                    outputs: &outputs,
+                    intervals: &intervals,
+                    expected_source_rate: 16_000,
+                    expected_source_frames: samples.len() as u64,
+                },
             )
             .await
             .unwrap_or_else(|error| panic!("{codec}: {error}"));

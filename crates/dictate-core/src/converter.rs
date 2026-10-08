@@ -36,6 +36,20 @@ pub struct SegmentAnalysis {
     pub silence_intervals: Vec<SourceFrameInterval>,
 }
 
+/// All inputs needed to export a previously frozen segmented upload plan.
+///
+/// The source-frame coordinates deliberately remain separate from encoded
+/// output timing, so a retry can reuse its original boundaries unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentExportRequest<'a> {
+    pub config: &'a Config,
+    pub input: &'a Path,
+    pub outputs: &'a [PathBuf],
+    pub intervals: &'a [SourceFrameInterval],
+    pub expected_source_rate: u32,
+    pub expected_source_frames: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum ConvertError {
     #[error("No speech detected")]
@@ -84,22 +98,9 @@ pub trait AudioConverter: Send + Sync {
     async fn export_segments(
         &self,
         cancellation: &CancellationToken,
-        config: &Config,
-        input: &Path,
-        outputs: &[PathBuf],
-        intervals: &[SourceFrameInterval],
-        expected_source_rate: u32,
-        expected_source_frames: u64,
+        request: SegmentExportRequest<'_>,
     ) -> Result<(), ConvertError> {
-        let _ = (
-            cancellation,
-            config,
-            input,
-            outputs,
-            intervals,
-            expected_source_rate,
-            expected_source_frames,
-        );
+        let _ = (cancellation, request);
         Err(ConvertError::SegmentedUploadUnavailable)
     }
 }

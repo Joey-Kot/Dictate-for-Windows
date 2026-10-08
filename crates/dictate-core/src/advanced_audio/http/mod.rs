@@ -4,7 +4,7 @@ mod body;
 mod request;
 mod response;
 
-pub use body::{BodyError, PreparedAudio, StageContext};
+pub use body::{BodyError, PreparedAudio, StageContext, StageContextInputs};
 pub(crate) use body::{
     TypedTemplateRenderError, render_json_with_context, render_text_with_context,
 };

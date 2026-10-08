@@ -21,7 +21,9 @@ use dictate_core::advanced_audio::{
     HttpMethod, HttpStage, RemoteAudioConfig, WorkflowSchemaVersion,
 };
 use dictate_core::audio_api::AudioApiClient;
-use dictate_core::converter::{AudioConverter, ConvertError, SegmentAnalysis, SourceFrameInterval};
+use dictate_core::converter::{
+    AudioConverter, ConvertError, SegmentAnalysis, SegmentExportRequest, SourceFrameInterval,
+};
 use dictate_core::runtime::test_audio_api_with_source;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -647,18 +649,13 @@ impl AudioConverter for TestSegmentConverter {
     async fn export_segments(
         &self,
         _: &CancellationToken,
-        config: &Config,
-        _: &Path,
-        outputs: &[PathBuf],
-        intervals: &[SourceFrameInterval],
-        expected_source_rate: u32,
-        expected_source_frames: u64,
+        request: SegmentExportRequest<'_>,
     ) -> Result<(), ConvertError> {
-        assert!(!config.enable_vad);
-        assert_eq!(expected_source_rate, 1_000);
-        assert_eq!(expected_source_frames, 2_000);
+        assert!(!request.config.enable_vad);
+        assert_eq!(request.expected_source_rate, 1_000);
+        assert_eq!(request.expected_source_frames, 2_000);
         assert_eq!(
-            intervals,
+            request.intervals,
             [
                 SourceFrameInterval {
                     start_frame: 0,
@@ -670,11 +667,11 @@ impl AudioConverter for TestSegmentConverter {
                 },
             ]
         );
-        assert_eq!(outputs.len(), 2);
-        std::fs::write(&outputs[0], b"first").map_err(|error| ConvertError::Failed {
+        assert_eq!(request.outputs.len(), 2);
+        std::fs::write(&request.outputs[0], b"first").map_err(|error| ConvertError::Failed {
             message: error.to_string(),
         })?;
-        std::fs::write(&outputs[1], b"second").map_err(|error| ConvertError::Failed {
+        std::fs::write(&request.outputs[1], b"second").map_err(|error| ConvertError::Failed {
             message: error.to_string(),
         })?;
         self.exports.fetch_add(1, Ordering::SeqCst);

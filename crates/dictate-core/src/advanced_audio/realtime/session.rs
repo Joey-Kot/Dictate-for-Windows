@@ -28,6 +28,36 @@ use crate::asr::Transcription;
 
 const MAX_RAW_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Immutable inputs shared by all message-template renders in one realtime
+/// session. Keeping them together makes the session flow explicit without
+/// repeatedly threading the same workflow-owned values through every send.
+#[derive(Clone, Copy)]
+pub(crate) struct RealtimeRenderContext<'a> {
+    values: &'a BTreeMap<String, String>,
+    secrets: &'a BTreeMap<String, String>,
+    runtime: &'a RuntimeTemplateValues,
+    parameters: &'a [ParameterDefinition],
+    schema_version: WorkflowSchemaVersion,
+}
+
+impl<'a> RealtimeRenderContext<'a> {
+    pub(crate) fn new(
+        values: &'a BTreeMap<String, String>,
+        secrets: &'a BTreeMap<String, String>,
+        runtime: &'a RuntimeTemplateValues,
+        parameters: &'a [ParameterDefinition],
+        schema_version: WorkflowSchemaVersion,
+    ) -> Self {
+        Self {
+            values,
+            secrets,
+            runtime,
+            parameters,
+            schema_version,
+        }
+    }
+}
+
 /// Runs one realtime session from an already-recorded WAV. This is used for
 /// CLI `--file`, workflow test audio, realtime retry, and live-failure replay.
 pub async fn run_recorded_replay(
@@ -38,17 +68,14 @@ pub async fn run_recorded_replay(
     path: impl AsRef<std::path::Path>,
     cancellation: &CancellationToken,
 ) -> Result<Transcription, RealtimeSessionError> {
-    run_recorded_replay_with_parameters(
-        realtime,
+    let render_context = RealtimeRenderContext::new(
         values,
         secrets,
         runtime,
         &[],
         WorkflowSchemaVersion(LEGACY_SCHEMA_VERSION),
-        path,
-        cancellation,
-    )
-    .await
+    );
+    run_recorded_replay_with_parameters(realtime, &render_context, path, cancellation).await
 }
 
 /// Runs a replay with the owning workflow's parameter declarations.  The
@@ -56,26 +83,12 @@ pub async fn run_recorded_replay(
 /// callers that only have a standalone realtime definition.
 pub(crate) async fn run_recorded_replay_with_parameters(
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     path: impl AsRef<std::path::Path>,
     cancellation: &CancellationToken,
 ) -> Result<Transcription, RealtimeSessionError> {
     let mut source = RecordedReplaySource::from_wav(path, &realtime.audio_stream)?;
-    run_realtime_session_with_parameters(
-        realtime,
-        values,
-        secrets,
-        runtime,
-        parameters,
-        schema_version,
-        &mut source,
-        cancellation,
-    )
-    .await
+    run_realtime_session_with_parameters(realtime, render_context, &mut source, cancellation).await
 }
 
 /// Runs a single WebSocket realtime recognition session.
@@ -91,49 +104,38 @@ pub async fn run_realtime_session<S: RealtimeChunkSource + ?Sized>(
     source: &mut S,
     cancellation: &CancellationToken,
 ) -> Result<Transcription, RealtimeSessionError> {
-    run_realtime_session_with_parameters(
-        realtime,
+    let render_context = RealtimeRenderContext::new(
         values,
         secrets,
         runtime,
         &[],
         WorkflowSchemaVersion(LEGACY_SCHEMA_VERSION),
-        source,
-        cancellation,
-    )
-    .await
+    );
+    run_realtime_session_with_parameters(realtime, &render_context, source, cancellation).await
 }
 
 /// Runs one realtime session with the parameter declarations of its owning
 /// workflow.  Only this path enables v2 JSON-native parameter leaves.
 pub(crate) async fn run_realtime_session_with_parameters<S: RealtimeChunkSource + ?Sized>(
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     source: &mut S,
     cancellation: &CancellationToken,
 ) -> Result<Transcription, RealtimeSessionError> {
     let mut transport = WebSocketTransport::connect(
         &realtime.connect,
-        values,
-        secrets,
-        runtime,
-        parameters,
-        schema_version,
+        render_context.values,
+        render_context.secrets,
+        render_context.runtime,
+        render_context.parameters,
+        render_context.schema_version,
         cancellation,
     )
     .await?;
     let result = run_connected(
         &mut transport,
         realtime,
-        values,
-        secrets,
-        runtime,
-        parameters,
-        schema_version,
+        render_context,
         source,
         cancellation,
     )
@@ -142,44 +144,24 @@ pub(crate) async fn run_realtime_session_with_parameters<S: RealtimeChunkSource 
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_connected<S: RealtimeChunkSource + ?Sized>(
     transport: &mut WebSocketTransport,
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     source: &mut S,
     cancellation: &CancellationToken,
 ) -> Result<Transcription, RealtimeSessionError> {
     let mut accumulator = TranscriptAccumulator::new();
     let mut raw_response = Vec::new();
     for message in &realtime.initial_messages {
-        send_message(
-            transport,
-            message,
-            values,
-            secrets,
-            runtime,
-            parameters,
-            schema_version,
-            None,
-            cancellation,
-        )
-        .await?;
+        send_message(transport, message, render_context, None, cancellation).await?;
     }
 
     while let Some(chunk) = source.next_chunk(cancellation).await? {
         send_audio(
             transport,
             &realtime.audio_message,
-            values,
-            secrets,
-            runtime,
-            parameters,
-            schema_version,
+            render_context,
             &chunk,
             cancellation,
         )
@@ -193,9 +175,6 @@ async fn run_connected<S: RealtimeChunkSource + ?Sized>(
             wait_with_messages(
                 transport,
                 realtime,
-                values,
-                secrets,
-                runtime,
                 &mut accumulator,
                 &mut raw_response,
                 Duration::from_millis(chunk.duration_ms),
@@ -209,9 +188,6 @@ async fn run_connected<S: RealtimeChunkSource + ?Sized>(
             drain_available_messages(
                 transport,
                 realtime,
-                values,
-                secrets,
-                runtime,
                 &mut accumulator,
                 &mut raw_response,
                 cancellation,
@@ -223,25 +199,11 @@ async fn run_connected<S: RealtimeChunkSource + ?Sized>(
     }
 
     for message in &realtime.finish_messages {
-        send_message(
-            transport,
-            message,
-            values,
-            secrets,
-            runtime,
-            parameters,
-            schema_version,
-            None,
-            cancellation,
-        )
-        .await?;
+        send_message(transport, message, render_context, None, cancellation).await?;
     }
     wait_until_complete(
         transport,
         realtime,
-        values,
-        secrets,
-        runtime,
         &mut accumulator,
         &mut raw_response,
         Duration::from_millis(realtime.finalization_timeout_ms),
@@ -251,13 +213,9 @@ async fn run_connected<S: RealtimeChunkSource + ?Sized>(
     completed_transcription(accumulator, raw_response)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn drain_available_messages(
     transport: &mut WebSocketTransport,
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
     accumulator: &mut TranscriptAccumulator,
     raw_response: &mut Vec<u8>,
     cancellation: &CancellationToken,
@@ -270,28 +228,16 @@ fn drain_available_messages(
             return Ok(());
         };
         match received {
-            Ok(Some(message)) => process_incoming(
-                message,
-                realtime,
-                values,
-                secrets,
-                runtime,
-                accumulator,
-                raw_response,
-            )?,
+            Ok(Some(message)) => process_incoming(message, realtime, accumulator, raw_response)?,
             Ok(None) => return Err(RealtimeSessionError::ClosedBeforeComplete),
             Err(error) => return Err(error.into()),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn wait_with_messages(
     transport: &mut WebSocketTransport,
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
     accumulator: &mut TranscriptAccumulator,
     raw_response: &mut Vec<u8>,
     duration: Duration,
@@ -305,15 +251,9 @@ async fn wait_with_messages(
         }
         match tokio::time::timeout(remaining, transport.receive(cancellation)).await {
             Err(_) => return Ok(()),
-            Ok(Ok(Some(message))) => process_incoming(
-                message,
-                realtime,
-                values,
-                secrets,
-                runtime,
-                accumulator,
-                raw_response,
-            )?,
+            Ok(Ok(Some(message))) => {
+                process_incoming(message, realtime, accumulator, raw_response)?
+            }
             Ok(Ok(None)) => return Err(RealtimeSessionError::ClosedBeforeComplete),
             Ok(Err(error)) => return Err(error.into()),
         }
@@ -321,13 +261,9 @@ async fn wait_with_messages(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn wait_until_complete(
     transport: &mut WebSocketTransport,
     realtime: &RealtimeWorkflow,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
     accumulator: &mut TranscriptAccumulator,
     raw_response: &mut Vec<u8>,
     timeout: Duration,
@@ -341,15 +277,9 @@ async fn wait_until_complete(
         }
         match tokio::time::timeout(remaining, transport.receive(cancellation)).await {
             Err(_) => return Err(RealtimeSessionError::FinalizationTimeout),
-            Ok(Ok(Some(message))) => process_incoming(
-                message,
-                realtime,
-                values,
-                secrets,
-                runtime,
-                accumulator,
-                raw_response,
-            )?,
+            Ok(Ok(Some(message))) => {
+                process_incoming(message, realtime, accumulator, raw_response)?
+            }
             Ok(Ok(None)) => return Err(RealtimeSessionError::ClosedBeforeComplete),
             Ok(Err(error)) => return Err(error.into()),
         }
@@ -357,13 +287,9 @@ async fn wait_until_complete(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_incoming(
     message: Message,
     realtime: &RealtimeWorkflow,
-    _values: &BTreeMap<String, String>,
-    _secrets: &BTreeMap<String, String>,
-    _runtime: &RuntimeTemplateValues,
     accumulator: &mut TranscriptAccumulator,
     raw_response: &mut Vec<u8>,
 ) -> Result<(), RealtimeSessionError> {
@@ -440,54 +366,22 @@ fn completion_matches(
 async fn send_message(
     transport: &mut WebSocketTransport,
     message: &RealtimeMessage,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     chunk: Option<&AudioChunk>,
     cancellation: &CancellationToken,
 ) -> Result<(), RealtimeSessionError> {
     match message {
         RealtimeMessage::Json { value } => {
-            let text = render_json(
-                value,
-                values,
-                secrets,
-                runtime,
-                parameters,
-                schema_version,
-                chunk,
-            )?
-            .to_string();
+            let text = render_json(value, render_context, chunk)?.to_string();
             transport.send_text(text, cancellation).await?;
         }
         RealtimeMessage::Text { value } => {
             transport
-                .send_text(
-                    render_text(
-                        value,
-                        values,
-                        secrets,
-                        runtime,
-                        parameters,
-                        schema_version,
-                        chunk,
-                    )?,
-                    cancellation,
-                )
+                .send_text(render_text(value, render_context, chunk)?, cancellation)
                 .await?;
         }
         RealtimeMessage::Binary { value } => {
-            let encoded = render_text(
-                value,
-                values,
-                secrets,
-                runtime,
-                parameters,
-                schema_version,
-                chunk,
-            )?;
+            let encoded = render_text(value, render_context, chunk)?;
             let bytes = STANDARD
                 .decode(encoded)
                 .map_err(|_| RealtimeSessionError::InvalidBinaryTemplate)?;
@@ -500,11 +394,7 @@ async fn send_message(
 async fn send_audio(
     transport: &mut WebSocketTransport,
     message: &RealtimeAudioMessage,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     chunk: &AudioChunk,
     cancellation: &CancellationToken,
 ) -> Result<(), RealtimeSessionError> {
@@ -517,15 +407,7 @@ async fn send_audio(
         RealtimeAudioMessage::Text { value } => {
             transport
                 .send_text(
-                    render_text(
-                        value,
-                        values,
-                        secrets,
-                        runtime,
-                        parameters,
-                        schema_version,
-                        Some(chunk),
-                    )?,
+                    render_text(value, render_context, Some(chunk))?,
                     cancellation,
                 )
                 .await?
@@ -533,16 +415,7 @@ async fn send_audio(
         RealtimeAudioMessage::Json { value } => {
             transport
                 .send_text(
-                    render_json(
-                        value,
-                        values,
-                        secrets,
-                        runtime,
-                        parameters,
-                        schema_version,
-                        Some(chunk),
-                    )?
-                    .to_string(),
+                    render_json(value, render_context, Some(chunk))?.to_string(),
                     cancellation,
                 )
                 .await?
@@ -553,11 +426,7 @@ async fn send_audio(
 
 fn render_text(
     value: &str,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     chunk: Option<&AudioChunk>,
 ) -> Result<String, RealtimeSessionError> {
     let captures = BTreeMap::new();
@@ -566,23 +435,24 @@ fn render_text(
         ..Default::default()
     };
     let context = TemplateContext {
-        values,
-        secrets,
+        values: render_context.values,
+        secrets: render_context.secrets,
         captures: &captures,
         audio: &audio,
-        runtime,
+        runtime: render_context.runtime,
     };
-    render_text_with_context(value, &context, parameters, schema_version)
-        .map_err(map_template_render_error)
+    render_text_with_context(
+        value,
+        &context,
+        render_context.parameters,
+        render_context.schema_version,
+    )
+    .map_err(map_template_render_error)
 }
 
 fn render_json(
     value: &serde_json::Value,
-    values: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, String>,
-    runtime: &RuntimeTemplateValues,
-    parameters: &[ParameterDefinition],
-    schema_version: WorkflowSchemaVersion,
+    render_context: &RealtimeRenderContext<'_>,
     chunk: Option<&AudioChunk>,
 ) -> Result<serde_json::Value, RealtimeSessionError> {
     let captures = BTreeMap::new();
@@ -591,14 +461,19 @@ fn render_json(
         ..Default::default()
     };
     let context = TemplateContext {
-        values,
-        secrets,
+        values: render_context.values,
+        secrets: render_context.secrets,
         captures: &captures,
         audio: &audio,
-        runtime,
+        runtime: render_context.runtime,
     };
-    render_json_with_context(value, &context, parameters, schema_version)
-        .map_err(map_template_render_error)
+    render_json_with_context(
+        value,
+        &context,
+        render_context.parameters,
+        render_context.schema_version,
+    )
+    .map_err(map_template_render_error)
 }
 
 fn map_template_render_error(error: TypedTemplateRenderError) -> RealtimeSessionError {
@@ -806,17 +681,20 @@ mod tests {
             parameter("vocabulary", ParameterType::JsonObject),
             parameter("language_hints", ParameterType::JsonArray),
         ];
+        let render_context = RealtimeRenderContext::new(
+            &values,
+            &secrets,
+            &runtime,
+            &parameters,
+            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+        );
 
         let initial = render_json(
             &serde_json::json!({
                 "sample_rate": "{{var:sample_rate}}",
                 "vocabulary": "{{var:vocabulary}}",
             }),
-            &values,
-            &secrets,
-            &runtime,
-            &parameters,
-            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+            &render_context,
             None,
         )
         .unwrap();
@@ -827,11 +705,7 @@ mod tests {
                 "language_hints": "{{var:language_hints}}",
                 "audio": "{{audio:chunk_base64}}",
             }),
-            &values,
-            &secrets,
-            &runtime,
-            &parameters,
-            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+            &render_context,
             Some(&AudioChunk {
                 bytes: vec![1, 2],
                 duration_ms: 20,
@@ -856,13 +730,16 @@ mod tests {
             })
         );
 
-        let legacy = render_json(
-            &serde_json::json!({"sample_rate": "{{var:sample_rate}}"}),
+        let legacy_render_context = RealtimeRenderContext::new(
             &values,
             &secrets,
             &runtime,
             &parameters,
             WorkflowSchemaVersion(LEGACY_SCHEMA_VERSION),
+        );
+        let legacy = render_json(
+            &serde_json::json!({"sample_rate": "{{var:sample_rate}}"}),
+            &legacy_render_context,
             None,
         )
         .unwrap();
@@ -885,17 +762,16 @@ mod tests {
                 label: "English".into(),
             },
         ];
-
-        let error = render_text(
-            "languages={{var:languages}}",
+        let parameters = [languages];
+        let render_context = RealtimeRenderContext::new(
             &values,
             &secrets,
             &runtime,
-            &[languages],
+            &parameters,
             WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
-            None,
-        )
-        .unwrap_err();
+        );
+
+        let error = render_text("languages={{var:languages}}", &render_context, None).unwrap_err();
 
         match error {
             RealtimeSessionError::TypedTemplate(message) => {
@@ -921,6 +797,13 @@ mod tests {
             parameter("vocabulary", ParameterType::JsonObject),
             parameter("language_hints", ParameterType::JsonArray),
         ];
+        let render_context = RealtimeRenderContext::new(
+            &values,
+            &secrets,
+            &runtime,
+            &parameters,
+            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+        );
 
         // Text and binary realtime message payloads both call render_text
         // before any frame is sent (and before a binary template is decoded).
@@ -933,16 +816,7 @@ mod tests {
                 "binary" => format!("{{{{var:{id}}}}}"),
                 _ => unreachable!(),
             };
-            let error = render_text(
-                &template,
-                &values,
-                &secrets,
-                &runtime,
-                &parameters,
-                WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
-                None,
-            )
-            .unwrap_err();
+            let error = render_text(&template, &render_context, None).unwrap_err();
 
             match error {
                 RealtimeSessionError::TypedTemplate(message) => {

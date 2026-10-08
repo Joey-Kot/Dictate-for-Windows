@@ -13,7 +13,7 @@ use crate::audio_segments::{
     SegmentPlan, SegmentPlanError, SegmentPlanOutcome, SourceInterval, build_segment_plan,
 };
 use crate::cache;
-use crate::converter::{AudioConverter, ConvertError, SourceFrameInterval};
+use crate::converter::{AudioConverter, ConvertError, SegmentExportRequest, SourceFrameInterval};
 
 /// Files for one generated upload batch.
 ///
@@ -166,12 +166,14 @@ async fn prepare_segmented_upload_in_directory(
     converter
         .export_segments(
             cancellation,
-            &export_config,
-            input,
-            &files,
-            &intervals,
-            plan.source_rate,
-            plan.total_frames,
+            SegmentExportRequest {
+                config: &export_config,
+                input,
+                outputs: &files,
+                intervals: &intervals,
+                expected_source_rate: plan.source_rate,
+                expected_source_frames: plan.total_frames,
+            },
         )
         .await?;
     Ok(files)
@@ -233,23 +235,18 @@ mod tests {
         async fn export_segments(
             &self,
             _: &CancellationToken,
-            config: &Config,
-            _: &Path,
-            outputs: &[PathBuf],
-            intervals: &[SourceFrameInterval],
-            _: u32,
-            _: u64,
+            request: SegmentExportRequest<'_>,
         ) -> Result<(), ConvertError> {
             let mut calls = self.calls.lock();
-            calls.export_enable_vad.push(config.enable_vad);
-            calls.exports.push(intervals.to_vec());
+            calls.export_enable_vad.push(request.config.enable_vad);
+            calls.exports.push(request.intervals.to_vec());
             drop(calls);
             if self.export_error {
                 return Err(ConvertError::Failed {
                     message: "simulated segment export failure".into(),
                 });
             }
-            for output in outputs {
+            for output in request.outputs {
                 std::fs::write(output, b"segment").map_err(|error| ConvertError::Failed {
                     message: error.to_string(),
                 })?;

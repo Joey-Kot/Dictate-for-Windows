@@ -153,31 +153,39 @@ pub struct StageContext<'a> {
     audio_values: AudioTemplateValues,
 }
 
+/// Borrowed inputs used to build one HTTP stage context.
+///
+/// Grouping the immutable execution inputs keeps construction explicit while
+/// avoiding a long positional constructor for the stage renderer.
+#[derive(Debug)]
+pub struct StageContextInputs<'a> {
+    pub values: &'a BTreeMap<String, String>,
+    pub secrets: &'a BTreeMap<String, String>,
+    pub captures: &'a BTreeMap<String, String>,
+    pub parameters: &'a [ParameterDefinition],
+    pub schema_version: WorkflowSchemaVersion,
+    pub audio: &'a PreparedAudio,
+    pub runtime: &'a RuntimeTemplateValues,
+    pub encoded_audio: bool,
+}
+
 impl<'a> StageContext<'a> {
     /// Renders one stage against a single audio-template snapshot.
     ///
     /// Base64 and data-URI audio must be read into memory by design.  Building
     /// that value once here prevents a workflow with URL, header, and JSON
     /// templates from repeatedly reading and encoding the same file.
-    pub async fn new(
-        values: &'a BTreeMap<String, String>,
-        secrets: &'a BTreeMap<String, String>,
-        captures: &'a BTreeMap<String, String>,
-        parameters: &'a [ParameterDefinition],
-        schema_version: WorkflowSchemaVersion,
-        audio: &'a PreparedAudio,
-        runtime: &'a RuntimeTemplateValues,
-        encoded_audio: bool,
-    ) -> Result<Self, BodyError> {
+    pub async fn new(inputs: StageContextInputs<'a>) -> Result<Self, BodyError> {
+        let audio_values = inputs.audio.template_values(inputs.encoded_audio).await?;
         Ok(Self {
-            values,
-            secrets,
-            captures,
-            parameters,
-            schema_version,
-            audio,
-            runtime,
-            audio_values: audio.template_values(encoded_audio).await?,
+            values: inputs.values,
+            secrets: inputs.secrets,
+            captures: inputs.captures,
+            parameters: inputs.parameters,
+            schema_version: inputs.schema_version,
+            audio: inputs.audio,
+            runtime: inputs.runtime,
+            audio_values,
         })
     }
 
@@ -695,16 +703,16 @@ mod tests {
         let audio = PreparedAudio::from_path(&path, Some("audio/wav"))
             .await
             .unwrap();
-        let context = StageContext::new(
-            &values,
-            &secrets,
-            &captures,
-            &parameters,
-            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
-            &audio,
-            &runtime,
-            false,
-        )
+        let context = StageContext::new(StageContextInputs {
+            values: &values,
+            secrets: &secrets,
+            captures: &captures,
+            parameters: &parameters,
+            schema_version: WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+            audio: &audio,
+            runtime: &runtime,
+            encoded_audio: false,
+        })
         .await
         .unwrap();
 

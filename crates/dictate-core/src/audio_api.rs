@@ -450,11 +450,13 @@ mod tests {
                 }),
             },
         };
-        let mut config = Config::default();
-        config.advanced_audio_api = AdvancedAudioConfig {
-            enabled: true,
-            workflow: Some(workflow),
-            ..AdvancedAudioConfig::default()
+        let config = Config {
+            advanced_audio_api: AdvancedAudioConfig {
+                enabled: true,
+                workflow: Some(workflow),
+                ..AdvancedAudioConfig::default()
+            },
+            ..Config::default()
         };
         AudioApiClient::new(config).expect("test realtime workflow must validate")
     }

@@ -14,10 +14,11 @@ use super::accumulator::{TranscriptAccumulator, TranscriptAccumulatorError, Tran
 use super::extractor::{self, ResponseData, ResponseExtractionError};
 use super::http::{
     BodyError, HttpEngine, HttpEngineError, HttpResponseData, PreparedAudio, ResponseReadError,
-    StageContext, read_response_limited,
+    StageContext, StageContextInputs, read_response_limited,
 };
 use super::realtime::{
-    LiveChunkSource, run_realtime_session_with_parameters, run_recorded_replay_with_parameters,
+    LiveChunkSource, RealtimeRenderContext, run_realtime_session_with_parameters,
+    run_recorded_replay_with_parameters,
 };
 use super::remote_audio::{PublishedRemoteAudio, cleanup_remote_audio, publish_remote_audio};
 use super::request_stream::{JsonChunksDecoder, NdjsonDecoder, SseDecoder, StreamFrameError};
@@ -145,18 +146,16 @@ impl AdvancedAudioClient {
         };
         self.debug_stage("[asr-stream] realtime");
         let runtime = runtime_values();
-        run_realtime_session_with_parameters(
-            realtime,
+        let render_context = RealtimeRenderContext::new(
             &self.values,
             &self.secrets,
             &runtime,
             &self.workflow.parameters,
             self.workflow.schema_version,
-            source,
-            cancellation,
-        )
-        .await
-        .map_err(AdvancedAudioError::Realtime)
+        );
+        run_realtime_session_with_parameters(realtime, &render_context, source, cancellation)
+            .await
+            .map_err(AdvancedAudioError::Realtime)
     }
 
     /// Runs the workflow for a prepared audio file and returns one final
@@ -259,13 +258,16 @@ impl AdvancedAudioClient {
         let mut delay = self.config.retry_base_delay.max(0.0);
         for attempt in 0..max_attempts {
             self.debug_stage("[asr-stream] replay");
-            match run_recorded_replay_with_parameters(
-                realtime,
+            let render_context = RealtimeRenderContext::new(
                 &self.values,
                 &self.secrets,
                 runtime,
                 &self.workflow.parameters,
                 self.workflow.schema_version,
+            );
+            match run_recorded_replay_with_parameters(
+                realtime,
+                &render_context,
                 file_path,
                 cancellation,
             )
@@ -410,19 +412,19 @@ impl AdvancedAudioClient {
         cancellation: &CancellationToken,
         captures: &BTreeMap<String, String>,
     ) -> Result<reqwest::Response, AdvancedAudioError> {
-        let context = StageContext::new(
-            &self.values,
-            &self.secrets,
+        let context = StageContext::new(StageContextInputs {
+            values: &self.values,
+            secrets: &self.secrets,
             captures,
-            &self.workflow.parameters,
-            self.workflow.schema_version,
+            parameters: &self.workflow.parameters,
+            schema_version: self.workflow.schema_version,
             audio,
             runtime,
-            matches!(
+            encoded_audio: matches!(
                 &self.workflow.audio.delivery,
                 AudioDelivery::Base64 | AudioDelivery::DataUri
             ),
-        )
+        })
         .await?;
         self.http
             .send(stage, &context, cancellation)

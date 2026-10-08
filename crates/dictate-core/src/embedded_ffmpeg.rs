@@ -1,9 +1,11 @@
 use crate::{
     Config,
-    converter::{AudioConverter, ConvertError, SegmentAnalysis, SourceFrameInterval, paths_equal},
+    converter::{AudioConverter, ConvertError, SegmentAnalysis, SegmentExportRequest, paths_equal},
 };
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "static-libav")]
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default)]
@@ -86,33 +88,33 @@ impl AudioConverter for EmbeddedFfmpegConverter {
     async fn export_segments(
         &self,
         cancellation: &CancellationToken,
-        config: &Config,
-        input: &Path,
-        outputs: &[PathBuf],
-        intervals: &[SourceFrameInterval],
-        expected_source_rate: u32,
-        expected_source_frames: u64,
+        request: SegmentExportRequest<'_>,
     ) -> Result<(), ConvertError> {
         if cancellation.is_cancelled() {
             return Err(ConvertError::Canceled);
         }
-        if outputs.iter().any(|output| paths_equal(input, output)) {
+        if request
+            .outputs
+            .iter()
+            .any(|output| paths_equal(request.input, output))
+        {
             return Err(ConvertError::SamePath);
         }
         #[cfg(not(feature = "static-libav"))]
         {
-            let _ = (
+            let _ = request;
+            Err(ConvertError::LibAvUnavailable)
+        }
+        #[cfg(feature = "static-libav")]
+        {
+            let SegmentExportRequest {
                 config,
                 input,
                 outputs,
                 intervals,
                 expected_source_rate,
                 expected_source_frames,
-            );
-            Err(ConvertError::LibAvUnavailable)
-        }
-        #[cfg(feature = "static-libav")]
-        {
+            } = request;
             let (config, input, outputs, intervals, token) = (
                 config.clone(),
                 input.to_path_buf(),
@@ -146,7 +148,11 @@ mod native {
         include!("embedded_ffmpeg_tests.rs");
     }
     use super::*;
-    use crate::{audio_intervals::prepare_intervals, converter::settings_for, vad::Vad};
+    use crate::{
+        audio_intervals::prepare_intervals,
+        converter::{SourceFrameInterval, settings_for},
+        vad::Vad,
+    };
     use std::ffi::{CStr, CString, c_char, c_void};
     #[repr(C)]
     #[derive(Clone, Copy)]
