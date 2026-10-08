@@ -16,7 +16,9 @@ use super::http::{
     BodyError, HttpEngine, HttpEngineError, HttpResponseData, PreparedAudio, ResponseReadError,
     StageContext, read_response_limited,
 };
-use super::realtime::{LiveChunkSource, run_realtime_session, run_recorded_replay};
+use super::realtime::{
+    LiveChunkSource, run_realtime_session_with_parameters, run_recorded_replay_with_parameters,
+};
 use super::remote_audio::{PublishedRemoteAudio, cleanup_remote_audio, publish_remote_audio};
 use super::request_stream::{JsonChunksDecoder, NdjsonDecoder, SseDecoder, StreamFrameError};
 use super::schema::*;
@@ -143,11 +145,13 @@ impl AdvancedAudioClient {
         };
         self.debug_stage("[asr-stream] realtime");
         let runtime = runtime_values();
-        run_realtime_session(
+        run_realtime_session_with_parameters(
             realtime,
             &self.values,
             &self.secrets,
             &runtime,
+            &self.workflow.parameters,
+            self.workflow.schema_version,
             source,
             cancellation,
         )
@@ -255,11 +259,13 @@ impl AdvancedAudioClient {
         let mut delay = self.config.retry_base_delay.max(0.0);
         for attempt in 0..max_attempts {
             self.debug_stage("[asr-stream] replay");
-            match run_recorded_replay(
+            match run_recorded_replay_with_parameters(
                 realtime,
                 &self.values,
                 &self.secrets,
                 runtime,
+                &self.workflow.parameters,
+                self.workflow.schema_version,
                 file_path,
                 cancellation,
             )
@@ -408,6 +414,8 @@ impl AdvancedAudioClient {
             &self.values,
             &self.secrets,
             captures,
+            &self.workflow.parameters,
+            self.workflow.schema_version,
             audio,
             runtime,
             matches!(

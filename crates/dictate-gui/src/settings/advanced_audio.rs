@@ -9,14 +9,30 @@ use crate::advanced_audio_prompt::{self, CompilerOutput};
 use dictate_core::advanced_audio::schema::{PollCondition, ResponseExtractor, StreamAction};
 use dictate_core::advanced_audio::{
     AdvancedAudioConfig, AdvancedAudioWorkflow, AdvancedRecognition, AudioDelivery, HttpStage,
-    RemoteAudioConfig, validate_advanced_audio_config, validate_workflow,
+    ParameterOption, ParameterType, RemoteAudioConfig, VisibilityCondition,
+    validate_remote_audio_config, validate_workflow,
 };
 use std::collections::BTreeSet;
+use std::mem::size_of;
+use windows::Win32::UI::Controls::{
+    ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, NMHDR, NMTTDISPINFOW,
+    TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_POP, TTM_SETMAXTIPWIDTH,
+    TTM_SETTIPBKCOLOR, TTM_SETTIPTEXTCOLOR, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTS_USEVISUALSTYLE, TTTOOLINFOW,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetParent, SWP_NOZORDER, SetParent, WM_MOUSEWHEEL, WM_NCDESTROY, WM_SETFOCUS,
-    WS_EX_CONTROLPARENT,
+    GetDlgCtrlID, GetNextDlgTabItem, GetParent, HWND_TOPMOST, LB_ADDSTRING, LB_GETCURSEL,
+    LB_GETSEL, LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LB_SETSEL,
+    LBN_SELCHANGE, LBS_HASSTRINGS, LBS_MULTIPLESEL, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    LBS_OWNERDRAWFIXED, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetParent, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NOTIFY,
+    WM_SETFOCUS, WS_EX_CONTROLPARENT,
 };
+use windows::core::PWSTR;
 
 pub(super) const GROUP: &str = "Advanced";
 pub(super) const TIMER: usize = 0x6c09;
@@ -44,16 +60,36 @@ const ID_DYNAMIC_NEXT: usize = 0x6c16;
 const ID_SUMMARY: usize = 0x6c17;
 const ID_RESET: usize = 0x6c18;
 const ID_GENERATION_STATUS: usize = 0x6c19;
+const ID_USER_REQUIREMENTS: usize = 0x6c1a;
+const ID_DYNAMIC_BOOLEAN: usize = 0x6c1b;
+const ID_DYNAMIC_SELECT: usize = 0x6c1c;
+const ID_DYNAMIC_MULTI_SELECT: usize = 0x6c1d;
+const ID_DYNAMIC_JSON_OBJECT: usize = 0x6c1e;
+const ID_DYNAMIC_JSON_ARRAY: usize = 0x6c1f;
 const ID_REMOTE_FIELD_BASE: usize = 0x6c20;
+const ID_DYNAMIC_SELECT_LIST: usize = 0x6c40;
+const ID_DYNAMIC_MULTI_SELECT_LIST: usize = 0x6c41;
+const ID_DYNAMIC_VALUE_LABEL_TOOLTIP: usize = 0x6c42;
+const ID_DYNAMIC_SECRET_LABEL_TOOLTIP: usize = 0x6c43;
 const REMOTE_VIEWPORT_SUBCLASS_ID: usize = 0x6c01;
 const REMOTE_CONTROL_SUBCLASS_ID: usize = 0x6c02;
 const REMOTE_REVEAL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 34;
+const DYNAMIC_SELECT_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 35;
+const DYNAMIC_MULTI_SELECT_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 36;
+const DYNAMIC_MULTI_SELECT_SYNC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 37;
+const DYNAMIC_SELECT_PICK: usize = 1;
+const DYNAMIC_SELECT_CLOSE: usize = 2;
+const DYNAMIC_SELECT_CLOSE_IF_OUTSIDE: usize = 3;
+const DYNAMIC_SELECT_TOGGLE: usize = 4;
+const DYNAMIC_SELECT_TAB: usize = 5;
 
 const ENABLE_KEY: &str = "__advanced_audio_enabled";
 const WORKFLOW_KEY: &str = "__advanced_audio_workflow";
 const VALIDATE_KEY: &str = "__advanced_audio_validate";
 const TEST_KEY: &str = "__advanced_audio_test";
 const MATERIAL_KEY: &str = "__advanced_audio_material";
+const USER_REQUIREMENTS_KEY: &str = "__advanced_audio_user_requirements";
+const DYNAMIC_BOOLEAN_KEY: &str = "__advanced_audio_dynamic_boolean";
 const GENERATE_KEY: &str = "__advanced_audio_generate";
 const CANCEL_GENERATION_KEY: &str = "__advanced_audio_cancel_generation";
 const RESET_KEY: &str = "__advanced_audio_reset";
@@ -168,6 +204,9 @@ const REMOTE_OSS_FIELDS: [(&str, &str, bool); 6] = [
 
 const EDIT_LEFT: i32 = CONTENT_LEFT;
 const EDIT_WIDTH: i32 = 536;
+const GENERATION_INPUT_GAP: i32 = 12;
+const GENERATION_INPUT_WIDTH: i32 = (EDIT_WIDTH - GENERATION_INPUT_GAP) / 2;
+const MATERIAL_LEFT: i32 = EDIT_LEFT + GENERATION_INPUT_WIDTH + GENERATION_INPUT_GAP;
 const MATERIAL_TOP: i32 = 158;
 const MATERIAL_HEIGHT: i32 = 60;
 const GENERATION_ACTION_TOP: i32 = 228;
@@ -181,6 +220,16 @@ const WORKFLOW_TOP: i32 = 296;
 const WORKFLOW_HEIGHT: i32 = 82;
 const VALUES_LABEL_TOP: i32 = 386;
 const VALUES_TOP: i32 = 410;
+const JSON_EDITOR_HEIGHT: i32 = 76;
+// Keep dynamically declared choice rows consistent with the shared language
+// and audio selectors while retaining the three-row visible limit.
+const MULTI_SELECT_ROW_HEIGHT: i32 = dropdown::ROW_HEIGHT;
+const DYNAMIC_SELECT_MAX_ROWS: usize = 3;
+const MULTI_SELECT_VISIBLE_ROWS: usize = DYNAMIC_SELECT_MAX_ROWS;
+const DYNAMIC_LABEL_TOOLTIP_MAX_WIDTH: i32 = 320;
+// Win32 `SS_ENDELLIPSIS`: make the available hover detail discoverable without
+// widening the form or shrinking its editor.
+const STATIC_STYLE_END_ELLIPSIS: u32 = 0x0000_4000;
 const SECRETS_LABEL_TOP: i32 = 458;
 const SECRETS_TOP: i32 = 482;
 const VALIDATION_ACTION_TOP: i32 = 532;
@@ -218,7 +267,25 @@ pub(super) struct Page {
     dynamic_values_heading: HWND,
     dynamic_secrets_heading: HWND,
     dynamic_value_label: HWND,
+    dynamic_label_tooltip: HWND,
+    dynamic_value_label_tooltip_text: Vec<u16>,
+    dynamic_secret_label_tooltip_text: Vec<u16>,
     dynamic_value_editor: HWND,
+    dynamic_boolean: HWND,
+    dynamic_select: HWND,
+    dynamic_select_panel: HWND,
+    dynamic_select_list: HWND,
+    dynamic_select_scrollbar: HWND,
+    dynamic_multi_select: HWND,
+    dynamic_multi_select_panel: HWND,
+    dynamic_multi_select_list: HWND,
+    dynamic_multi_select_scrollbar: HWND,
+    // The parameter ID and token make an asynchronously posted selection
+    // update harmless if the user switches or rebinds a dynamic page first.
+    dynamic_multi_select_sync_pending: Option<DynamicMultiSelectSync>,
+    dynamic_multi_select_sync_token: usize,
+    dynamic_json_object: HWND,
+    dynamic_json_array: HWND,
     dynamic_secret_label: HWND,
     dynamic_secret_editor: HWND,
     dynamic_previous: HWND,
@@ -313,6 +380,9 @@ struct DynamicInput {
     id: String,
     label: String,
     default: Option<String>,
+    parameter_type: ParameterType,
+    options: Vec<ParameterOption>,
+    visible_when: Option<VisibilityCondition>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -320,6 +390,17 @@ struct DynamicForm {
     parameters: Vec<DynamicInput>,
     secrets: Vec<DynamicInput>,
     page: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DynamicPage {
+    parameter_index: Option<usize>,
+    secret_index: Option<usize>,
+}
+
+struct DynamicMultiSelectSync {
+    token: usize,
+    parameter_id: String,
 }
 
 impl DynamicForm {
@@ -332,6 +413,11 @@ impl DynamicForm {
                     id: definition.id.clone(),
                     label: declaration_name(&definition.label, &definition.id),
                     default: definition.default.clone(),
+                    parameter_type: definition
+                        .effective_type(workflow.schema_version)
+                        .unwrap_or(ParameterType::Text),
+                    options: definition.options.clone(),
+                    visible_when: definition.visible_when.clone(),
                 })
                 .collect(),
             secrets: workflow
@@ -341,14 +427,102 @@ impl DynamicForm {
                     id: definition.id.clone(),
                     label: declaration_name(&definition.label, &definition.id),
                     default: None,
+                    parameter_type: ParameterType::Text,
+                    options: Vec::new(),
+                    visible_when: None,
                 })
                 .collect(),
             page: 0,
         }
     }
 
-    fn page_count(&self) -> usize {
-        self.parameters.len().max(self.secrets.len())
+    fn visible_parameter_indices(
+        &self,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<usize> {
+        self.parameters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, definition)| {
+                self.parameter_is_visible(definition, values)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn parameter_is_visible(
+        &self,
+        definition: &DynamicInput,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        let Some(condition) = &definition.visible_when else {
+            return true;
+        };
+        let value = values
+            .get(&condition.parameter)
+            .map(String::as_str)
+            .or_else(|| {
+                self.parameters
+                    .iter()
+                    .find(|source| source.id == condition.parameter)
+                    .and_then(|source| source.default.as_deref())
+            })
+            .unwrap_or_default();
+        condition.equals.as_deref() == Some(value)
+            || condition.one_of.iter().any(|candidate| candidate == value)
+    }
+
+    fn pages(&self, values: &std::collections::BTreeMap<String, String>) -> Vec<DynamicPage> {
+        let parameters = self.visible_parameter_indices(values);
+        let mut parameter = 0;
+        let mut secret = 0;
+        let mut pages = Vec::new();
+        while parameter < parameters.len() || secret < self.secrets.len() {
+            let parameter_index = parameters.get(parameter).copied();
+            if parameter_index.is_some_and(|index| {
+                matches!(
+                    self.parameters[index].parameter_type,
+                    ParameterType::Select
+                        | ParameterType::MultiSelect
+                        | ParameterType::JsonObject
+                        | ParameterType::JsonArray
+                )
+            }) {
+                pages.push(DynamicPage {
+                    parameter_index,
+                    secret_index: None,
+                });
+                parameter += 1;
+                continue;
+            }
+            pages.push(DynamicPage {
+                parameter_index,
+                secret_index: (secret < self.secrets.len()).then_some(secret),
+            });
+            parameter += usize::from(parameter_index.is_some());
+            secret += usize::from(secret < self.secrets.len());
+        }
+        pages
+    }
+
+    fn current_page(
+        &self,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Option<DynamicPage> {
+        self.pages(values).get(self.page).copied()
+    }
+
+    fn normalize_page(&mut self, values: &std::collections::BTreeMap<String, String>) {
+        self.page = self.page.min(self.pages(values).len().saturating_sub(1));
+    }
+
+    fn has_visibility_dependents(&self, parameter_id: &str) -> bool {
+        self.parameters.iter().any(|definition| {
+            definition
+                .visible_when
+                .as_ref()
+                .is_some_and(|condition| condition.parameter == parameter_id)
+        })
     }
 }
 
@@ -377,7 +551,23 @@ impl Page {
             dynamic_values_heading: HWND::default(),
             dynamic_secrets_heading: HWND::default(),
             dynamic_value_label: HWND::default(),
+            dynamic_label_tooltip: HWND::default(),
+            dynamic_value_label_tooltip_text: vec![0],
+            dynamic_secret_label_tooltip_text: vec![0],
             dynamic_value_editor: HWND::default(),
+            dynamic_boolean: HWND::default(),
+            dynamic_select: HWND::default(),
+            dynamic_select_panel: HWND::default(),
+            dynamic_select_list: HWND::default(),
+            dynamic_select_scrollbar: HWND::default(),
+            dynamic_multi_select: HWND::default(),
+            dynamic_multi_select_panel: HWND::default(),
+            dynamic_multi_select_list: HWND::default(),
+            dynamic_multi_select_scrollbar: HWND::default(),
+            dynamic_multi_select_sync_pending: None,
+            dynamic_multi_select_sync_token: 0,
+            dynamic_json_object: HWND::default(),
+            dynamic_json_array: HWND::default(),
             dynamic_secret_label: HWND::default(),
             dynamic_secret_editor: HWND::default(),
             dynamic_previous: HWND::default(),
@@ -428,12 +618,40 @@ pub(super) fn create(
     state.control_groups.insert(enable.0 as usize, GROUP);
     register_normal_control(state, enable);
 
-    create_editor_label(state, "advanced_audio_material", 132, true, instance)?;
-    create_editor(
+    create_generation_editor_label(
+        state,
+        "advanced_audio_user_requirements",
+        EDIT_LEFT,
+        GENERATION_INPUT_WIDTH,
+        instance,
+    )?;
+    create_editor_at(
+        state,
+        USER_REQUIREMENTS_KEY,
+        ID_USER_REQUIREMENTS,
+        "",
+        EDIT_LEFT,
+        GENERATION_INPUT_WIDTH,
+        MATERIAL_TOP,
+        MATERIAL_HEIGHT,
+        false,
+        true,
+        instance,
+    )?;
+    create_generation_editor_label(
+        state,
+        "advanced_audio_material",
+        MATERIAL_LEFT,
+        GENERATION_INPUT_WIDTH,
+        instance,
+    )?;
+    create_editor_at(
         state,
         MATERIAL_KEY,
         ID_MATERIAL,
         "",
+        MATERIAL_LEFT,
+        GENERATION_INPUT_WIDTH,
         MATERIAL_TOP,
         MATERIAL_HEIGHT,
         false,
@@ -583,12 +801,35 @@ fn create_editor_label(
     generation: bool,
     instance: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), String> {
+    create_editor_label_at(state, key, EDIT_LEFT, EDIT_WIDTH, y, generation, instance)
+}
+
+fn create_generation_editor_label(
+    state: &mut SettingsState,
+    key: &'static str,
+    left: i32,
+    width: i32,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<(), String> {
+    create_editor_label_at(state, key, left, width, 132, true, instance)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_editor_label_at(
+    state: &mut SettingsState,
+    key: &'static str,
+    left: i32,
+    width: i32,
+    y: i32,
+    generation: bool,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<(), String> {
     let label = create_label(
         state,
         state.language.text(key),
-        CONTENT_LEFT,
+        left,
         y,
-        EDIT_WIDTH,
+        width,
         22,
         instance,
     )?;
@@ -614,6 +855,25 @@ fn create_editor(
     generation: bool,
     instance: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), String> {
+    create_editor_at(
+        state, key, id, text, EDIT_LEFT, EDIT_WIDTH, y, height, password, generation, instance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_editor_at(
+    state: &mut SettingsState,
+    key: &'static str,
+    id: usize,
+    text: &str,
+    left: i32,
+    width: i32,
+    y: i32,
+    height: i32,
+    password: bool,
+    generation: bool,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<(), String> {
     let mut style = WS_CHILD
         | WS_VISIBLE
         | WS_TABSTOP
@@ -626,15 +886,15 @@ fn create_editor(
         w!("EDIT"),
         text,
         style,
-        EDIT_LEFT + 6,
+        left + 6,
         y + 5,
-        EDIT_WIDTH - 12,
+        width - 12,
         height - 10,
         id,
         instance,
     )?;
     apply_dark_theme(editor);
-    if key == MATERIAL_KEY {
+    if matches!(key, MATERIAL_KEY | USER_REQUIREMENTS_KEY) {
         // A native multiline EDIT otherwise accepts only 32,767 characters.
         // Leave request-size validation to the configured Rewrite API.
         unsafe {
@@ -658,9 +918,9 @@ fn create_editor(
     dropdown_scrollbar::attach_edit(editor, state.dpi)?;
     state.input_frames.push(InputFrame {
         rect: RECT {
-            left: EDIT_LEFT,
+            left,
             top: y,
-            right: EDIT_LEFT + EDIT_WIDTH,
+            right: left + width,
             bottom: y + height,
         },
         group: GROUP,
@@ -704,12 +964,23 @@ fn create_dynamic_form_controls(
 
     let (value_label, value_editor) =
         create_dynamic_input(state, ID_DYNAMIC_VALUE, VALUES_TOP, false, instance)?;
+    let dynamic_boolean = create_dynamic_boolean(state, instance)?;
+    let dynamic_select = create_dynamic_select(state, instance)?;
+    let dynamic_multi_select = create_dynamic_multi_select(state, instance)?;
+    let dynamic_json_object = create_dynamic_json_editor(state, ID_DYNAMIC_JSON_OBJECT, instance)?;
+    let dynamic_json_array = create_dynamic_json_editor(state, ID_DYNAMIC_JSON_ARRAY, instance)?;
     let (secret_label, secret_editor) =
         create_dynamic_input(state, ID_DYNAMIC_SECRET, SECRETS_TOP, true, instance)?;
     state.advanced_audio.dynamic_value_label = value_label;
     state.advanced_audio.dynamic_value_editor = value_editor;
+    state.advanced_audio.dynamic_boolean = dynamic_boolean;
+    state.advanced_audio.dynamic_select = dynamic_select;
+    state.advanced_audio.dynamic_multi_select = dynamic_multi_select;
+    state.advanced_audio.dynamic_json_object = dynamic_json_object;
+    state.advanced_audio.dynamic_json_array = dynamic_json_array;
     state.advanced_audio.dynamic_secret_label = secret_label;
     state.advanced_audio.dynamic_secret_editor = secret_editor;
+    create_dynamic_label_tooltip(state, instance);
 
     for (key, id, x, label) in [
         (
@@ -888,13 +1159,16 @@ fn create_dynamic_input(
 ) -> Result<(HWND, HWND), String> {
     let editor_left = CONTENT_LEFT + LABEL_WIDTH + 10;
     let editor_width = EDIT_WIDTH - LABEL_WIDTH - 10;
-    let label = create_label(
+    let label = create_child(
         state,
+        w!("STATIC"),
         "",
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | SS_CENTERIMAGE_STYLE | STATIC_STYLE_END_ELLIPSIS),
         CONTENT_LEFT,
         y,
         LABEL_WIDTH,
         FIELD_HEIGHT,
+        0,
         instance,
     )?;
     register_dynamic_control(state, label);
@@ -937,6 +1211,401 @@ fn create_dynamic_input(
     });
     register_dynamic_control(state, editor);
     Ok((label, editor))
+}
+
+fn create_dynamic_label_tooltip(
+    state: &mut SettingsState,
+    instance: windows::Win32::Foundation::HMODULE,
+) {
+    let classes = INITCOMMONCONTROLSEX {
+        dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_WIN95_CLASSES,
+    };
+    unsafe {
+        let _ = InitCommonControlsEx(&classes);
+    }
+    let Ok(tooltip) = (unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            TOOLTIPS_CLASSW,
+            w!(""),
+            WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX | TTS_USEVISUALSTYLE),
+            0,
+            0,
+            0,
+            0,
+            Some(state.hwnd),
+            None,
+            Some(instance.into()),
+            None,
+        )
+    }) else {
+        // The labels still use a native ellipsis when the optional common
+        // control cannot be created, so a visual enhancement cannot prevent
+        // the settings window from opening.
+        return;
+    };
+
+    apply_dark_theme(tooltip);
+    unsafe {
+        let _ = SetWindowPos(
+            tooltip,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = SendMessageW(
+            tooltip,
+            TTM_SETMAXTIPWIDTH,
+            None,
+            Some(LPARAM(
+                platform::scale(DYNAMIC_LABEL_TOOLTIP_MAX_WIDTH, state.dpi) as isize,
+            )),
+        );
+        let _ = SendMessageW(
+            tooltip,
+            TTM_SETTIPBKCOLOR,
+            Some(WPARAM(rgb(26, 35, 39).0 as usize)),
+            None,
+        );
+        let _ = SendMessageW(
+            tooltip,
+            TTM_SETTIPTEXTCOLOR,
+            Some(WPARAM(rgb(235, 242, 243).0 as usize)),
+            None,
+        );
+        for tooltip_id in [
+            ID_DYNAMIC_VALUE_LABEL_TOOLTIP,
+            ID_DYNAMIC_SECRET_LABEL_TOOLTIP,
+        ] {
+            let tool = dynamic_label_tool_info(state.hwnd, tooltip_id, RECT::default());
+            let _ = SendMessageW(
+                tooltip,
+                TTM_ADDTOOLW,
+                None,
+                Some(LPARAM((&raw const tool) as isize)),
+            );
+        }
+    }
+    state.advanced_audio.dynamic_label_tooltip = tooltip;
+}
+
+fn dynamic_label_tool_info(owner: HWND, tooltip_id: usize, rect: RECT) -> TTTOOLINFOW {
+    TTTOOLINFOW {
+        cbSize: size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_SUBCLASS,
+        hwnd: owner,
+        uId: tooltip_id,
+        rect,
+        lpszText: PWSTR::from_raw((-1_isize) as *mut u16),
+        ..Default::default()
+    }
+}
+
+fn dynamic_label_tool_rect(state: &SettingsState, top: i32, visible: bool) -> RECT {
+    if !visible {
+        return RECT::default();
+    }
+    let scale = |value| platform::scale(value, state.dpi);
+    RECT {
+        left: scale(CONTENT_LEFT),
+        top: scale(top),
+        right: scale(CONTENT_LEFT + LABEL_WIDTH),
+        bottom: scale(top + FIELD_HEIGHT),
+    }
+}
+
+fn sync_dynamic_label_tooltip_rects(
+    state: &SettingsState,
+    value_visible: bool,
+    secret_visible: bool,
+) {
+    let tooltip = state.advanced_audio.dynamic_label_tooltip;
+    if tooltip.is_invalid() {
+        return;
+    }
+    unsafe {
+        for (tooltip_id, top, visible) in [
+            (ID_DYNAMIC_VALUE_LABEL_TOOLTIP, VALUES_TOP, value_visible),
+            (ID_DYNAMIC_SECRET_LABEL_TOOLTIP, SECRETS_TOP, secret_visible),
+        ] {
+            let tool = dynamic_label_tool_info(
+                state.hwnd,
+                tooltip_id,
+                dynamic_label_tool_rect(state, top, visible),
+            );
+            let _ = SendMessageW(
+                tooltip,
+                TTM_NEWTOOLRECTW,
+                None,
+                Some(LPARAM((&raw const tool) as isize)),
+            );
+        }
+    }
+}
+
+fn pop_dynamic_label_tooltip(state: &SettingsState) {
+    let tooltip = state.advanced_audio.dynamic_label_tooltip;
+    if !tooltip.is_invalid() {
+        unsafe {
+            let _ = SendMessageW(tooltip, TTM_POP, None, None);
+        }
+    }
+}
+
+fn resize_dynamic_label_tooltip(state: &SettingsState) {
+    let tooltip = state.advanced_audio.dynamic_label_tooltip;
+    if tooltip.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = SendMessageW(
+            tooltip,
+            TTM_SETMAXTIPWIDTH,
+            None,
+            Some(LPARAM(
+                platform::scale(DYNAMIC_LABEL_TOOLTIP_MAX_WIDTH, state.dpi) as isize,
+            )),
+        );
+    }
+    sync_dynamic_label_tooltip_rects(
+        state,
+        unsafe { IsWindowVisible(state.advanced_audio.dynamic_value_label).as_bool() },
+        unsafe { IsWindowVisible(state.advanced_audio.dynamic_secret_label).as_bool() },
+    );
+}
+
+fn dynamic_input_bounds() -> (i32, i32) {
+    let left = CONTENT_LEFT + LABEL_WIDTH + 10;
+    let width = EDIT_WIDTH - LABEL_WIDTH - 10;
+    (left, width)
+}
+
+fn create_dynamic_boolean(
+    state: &mut SettingsState,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<HWND, String> {
+    let (left, _) = dynamic_input_bounds();
+    let checkbox = create_child(
+        state,
+        w!("BUTTON"),
+        "",
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
+        left,
+        VALUES_TOP,
+        FIELD_HEIGHT,
+        FIELD_HEIGHT,
+        ID_DYNAMIC_BOOLEAN,
+        instance,
+    )?;
+    state.boolean_values.insert(DYNAMIC_BOOLEAN_KEY, false);
+    state
+        .boolean_ids
+        .insert(ID_DYNAMIC_BOOLEAN, DYNAMIC_BOOLEAN_KEY);
+    register_dynamic_control(state, checkbox);
+    Ok(checkbox)
+}
+
+fn create_dynamic_select(
+    state: &mut SettingsState,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<HWND, String> {
+    let (left, width) = dynamic_input_bounds();
+    let select = create_child(
+        state,
+        w!("BUTTON"),
+        "",
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
+        left,
+        VALUES_TOP,
+        width,
+        FIELD_HEIGHT,
+        ID_DYNAMIC_SELECT,
+        instance,
+    )?;
+    let panel = dropdown::create_panel(state, instance)?;
+    let list = create_child(
+        state,
+        w!("LISTBOX"),
+        "",
+        WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_TABSTOP.0
+                | (LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT) as u32,
+        ),
+        0,
+        0,
+        width,
+        dropdown::ROW_HEIGHT,
+        ID_DYNAMIC_SELECT_LIST,
+        instance,
+    )?;
+    apply_dark_theme(list);
+    dropdown::track_hover(list, true)?;
+    unsafe {
+        SetParent(list, Some(panel)).map_err(|error| error.to_string())?;
+        if !SetWindowSubclass(
+            select,
+            Some(dynamic_select_proc),
+            ID_DYNAMIC_SELECT,
+            state.hwnd.0 as usize,
+        )
+        .as_bool()
+            || !SetWindowSubclass(
+                list,
+                Some(dynamic_select_proc),
+                ID_DYNAMIC_SELECT_LIST,
+                state.hwnd.0 as usize,
+            )
+            .as_bool()
+        {
+            return Err("Unable to initialize dynamic select dropdown".into());
+        }
+    }
+    let scrollbar = dropdown_scrollbar::create(state, panel, list, instance)?;
+    register_dynamic_control(state, select);
+    state.advanced_audio.dynamic_select_panel = panel;
+    state.advanced_audio.dynamic_select_list = list;
+    state.advanced_audio.dynamic_select_scrollbar = scrollbar;
+    Ok(select)
+}
+
+fn create_dynamic_multi_select(
+    state: &mut SettingsState,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<HWND, String> {
+    let (left, width) = dynamic_input_bounds();
+    let button = create_child(
+        state,
+        w!("BUTTON"),
+        "",
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
+        left,
+        VALUES_TOP,
+        width,
+        FIELD_HEIGHT,
+        ID_DYNAMIC_MULTI_SELECT,
+        instance,
+    )?;
+    let panel = dropdown::create_panel(state, instance)?;
+    let list = create_child(
+        state,
+        w!("LISTBOX"),
+        "",
+        WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_TABSTOP.0
+                | (LBS_HASSTRINGS
+                    | LBS_MULTIPLESEL
+                    | LBS_NOINTEGRALHEIGHT
+                    | LBS_NOTIFY
+                    | LBS_OWNERDRAWFIXED) as u32,
+        ),
+        0,
+        0,
+        width,
+        MULTI_SELECT_ROW_HEIGHT,
+        ID_DYNAMIC_MULTI_SELECT_LIST,
+        instance,
+    )?;
+    apply_dark_theme(list);
+    dropdown::track_hover(list, true)?;
+    unsafe {
+        SetParent(list, Some(panel)).map_err(|error| error.to_string())?;
+        if !SetWindowSubclass(
+            button,
+            Some(dynamic_multi_select_proc),
+            ID_DYNAMIC_MULTI_SELECT,
+            state.hwnd.0 as usize,
+        )
+        .as_bool()
+            || !SetWindowSubclass(
+                list,
+                Some(dynamic_multi_select_proc),
+                ID_DYNAMIC_MULTI_SELECT_LIST,
+                state.hwnd.0 as usize,
+            )
+            .as_bool()
+        {
+            return Err("Unable to initialize dynamic multi-select dropdown".into());
+        }
+        SendMessageW(
+            list,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(
+                platform::scale(MULTI_SELECT_ROW_HEIGHT, state.dpi) as isize
+            )),
+        );
+    }
+    let scrollbar = dropdown_scrollbar::create(state, panel, list, instance)?;
+    register_dynamic_control(state, button);
+    state.advanced_audio.dynamic_multi_select_panel = panel;
+    state.advanced_audio.dynamic_multi_select_list = list;
+    state.advanced_audio.dynamic_multi_select_scrollbar = scrollbar;
+    Ok(button)
+}
+
+fn create_dynamic_json_editor(
+    state: &mut SettingsState,
+    id: usize,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<HWND, String> {
+    let (left, width) = dynamic_input_bounds();
+    let editor = create_child(
+        state,
+        w!("EDIT"),
+        "",
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WINDOW_STYLE(
+                (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32 | WS_CLIPCHILDREN.0,
+            ),
+        left + 3,
+        VALUES_TOP + 3,
+        width - 6,
+        JSON_EDITOR_HEIGHT - 6,
+        id,
+        instance,
+    )?;
+    apply_dark_theme(editor);
+    // JSON configuration can legitimately be longer than the native EDIT
+    // control's default multiline limit. Core remains responsible for
+    // validating the JSON shape and request size.
+    unsafe {
+        SendMessageW(
+            editor,
+            windows::Win32::UI::Controls::EM_SETLIMITTEXT,
+            Some(WPARAM(i32::MAX as usize)),
+            None,
+        );
+    }
+    let margin = platform::scale(7, state.dpi) as u32;
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM((margin | (margin << 16)) as isize)),
+        );
+    }
+    dropdown_scrollbar::attach_edit(editor, state.dpi)?;
+    state.input_frames.push(InputFrame {
+        rect: RECT {
+            left,
+            top: VALUES_TOP,
+            right: left + width,
+            bottom: VALUES_TOP + JSON_EDITOR_HEIGHT,
+        },
+        group: GROUP,
+        control: editor,
+    });
+    register_dynamic_control(state, editor);
+    Ok(editor)
 }
 
 fn refresh_dynamic_form(state: &mut SettingsState) {
@@ -983,19 +1652,30 @@ fn refresh_dynamic_form(state: &mut SettingsState) {
         }
     }
 
+    normalize_dynamic_page(state);
     sync_dynamic_form_page(state);
 }
 
+fn normalize_dynamic_page(state: &mut SettingsState) {
+    let values = state.advanced_audio.config.values.clone();
+    if let Some(form) = &mut state.advanced_audio.dynamic_form {
+        form.normalize_page(&values);
+    }
+}
+
 fn sync_dynamic_form_page(state: &mut SettingsState) {
+    // A queued listbox notification belongs to the page that was visible when
+    // it was posted. Rebinding the shared listbox invalidates that update.
+    state.advanced_audio.dynamic_multi_select_sync_pending = None;
+    close_dynamic_select(state);
+    pop_dynamic_label_tooltip(state);
     let (value, secret) = current_dynamic_inputs(state);
-    let value_label = state.advanced_audio.dynamic_value_label;
-    let value_editor = state.advanced_audio.dynamic_value_editor;
     let secret_label = state.advanced_audio.dynamic_secret_label;
     let secret_editor = state.advanced_audio.dynamic_secret_editor;
 
     state.advanced_audio.updating_dynamic_controls = true;
-    set_dynamic_input_text(value_label, value_editor, value);
-    set_dynamic_input_text(secret_label, secret_editor, secret);
+    sync_dynamic_value_controls(state, value.as_ref());
+    set_dynamic_text_input(secret_label, secret_editor, secret.as_ref(), state);
     state.advanced_audio.updating_dynamic_controls = false;
     sync_summary_control(state);
 }
@@ -1023,64 +1703,274 @@ fn sync_summary_control(state: &SettingsState) {
     }
 }
 
-fn current_dynamic_inputs(
-    state: &SettingsState,
-) -> (Option<(String, String)>, Option<(String, String)>) {
+fn current_dynamic_inputs(state: &SettingsState) -> (Option<DynamicInput>, Option<DynamicInput>) {
     let page = &state.advanced_audio;
     let Some(form) = &page.dynamic_form else {
         return (None, None);
     };
-    let value = form.parameters.get(form.page).map(|definition| {
-        (
-            definition.label.clone(),
-            page.config
-                .values
-                .get(&definition.id)
-                .cloned()
-                .or_else(|| definition.default.clone())
-                .unwrap_or_default(),
-        )
-    });
-    let secret = form.secrets.get(form.page).map(|definition| {
-        (
-            definition.label.clone(),
-            page.config
-                .secrets
-                .get(&definition.id)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    });
+    let Some(slot) = form.current_page(&page.config.values) else {
+        return (None, None);
+    };
+    let value = slot
+        .parameter_index
+        .and_then(|index| form.parameters.get(index))
+        .cloned();
+    let secret = slot
+        .secret_index
+        .and_then(|index| form.secrets.get(index))
+        .cloned();
     (value, secret)
 }
 
-fn set_dynamic_input_text(label: HWND, editor: HWND, value: Option<(String, String)>) {
-    let (label_text, value_text) = value.unwrap_or_default();
-    let label_text = wide(&label_text);
-    let value_text = wide(&value_text);
+fn dynamic_input_value(
+    values: &std::collections::BTreeMap<String, String>,
+    definition: &DynamicInput,
+) -> String {
+    values
+        .get(&definition.id)
+        .cloned()
+        .or_else(|| definition.default.clone())
+        .unwrap_or_default()
+}
+
+fn set_dynamic_text_input(
+    label: HWND,
+    editor: HWND,
+    definition: Option<&DynamicInput>,
+    state: &SettingsState,
+) {
+    let (label_text, value_text) = definition.map_or_else(
+        || (String::new(), String::new()),
+        |definition| {
+            (
+                definition.label.clone(),
+                dynamic_input_value(&state.advanced_audio.config.secrets, definition),
+            )
+        },
+    );
     unsafe {
-        let _ = SetWindowTextW(label, PCWSTR(label_text.as_ptr()));
-        let _ = SetWindowTextW(editor, PCWSTR(value_text.as_ptr()));
+        if read_text(label) != label_text {
+            let label_text = wide(&label_text);
+            let _ = SetWindowTextW(label, PCWSTR(label_text.as_ptr()));
+        }
+        if read_text(editor) != value_text {
+            let value_text = wide(&value_text);
+            let _ = SetWindowTextW(editor, PCWSTR(value_text.as_ptr()));
+        }
     }
 }
 
-fn sync_dynamic_input(state: &mut SettingsState, id: usize) {
+fn sync_dynamic_value_controls(state: &mut SettingsState, definition: Option<&DynamicInput>) {
+    let label = state.advanced_audio.dynamic_value_label;
+    let editor = state.advanced_audio.dynamic_value_editor;
+    let boolean = state.advanced_audio.dynamic_boolean;
+    let json_object = state.advanced_audio.dynamic_json_object;
+    let json_array = state.advanced_audio.dynamic_json_array;
+    let (label_text, value) = definition.map_or_else(
+        || (String::new(), String::new()),
+        |definition| {
+            (
+                definition.label.clone(),
+                dynamic_input_value(&state.advanced_audio.config.values, definition),
+            )
+        },
+    );
+    let label_text_wide = wide(&label_text);
+    unsafe {
+        if read_text(label) != label_text {
+            let _ = SetWindowTextW(label, PCWSTR(label_text_wide.as_ptr()));
+        }
+    }
+    match definition.map(|definition| definition.parameter_type) {
+        Some(ParameterType::Text | ParameterType::Integer | ParameterType::Number) => {
+            set_dynamic_editor_value(editor, &value);
+        }
+        Some(ParameterType::Boolean) => {
+            state
+                .boolean_values
+                .insert(DYNAMIC_BOOLEAN_KEY, value == "true");
+            unsafe {
+                let _ = InvalidateRect(Some(boolean), None, true);
+            }
+        }
+        Some(ParameterType::Select) => {
+            sync_dynamic_select_options(state, definition.expect("select definition"), &value);
+        }
+        Some(ParameterType::MultiSelect) => {
+            sync_dynamic_multi_select_options(
+                state,
+                definition.expect("multi-select definition"),
+                &value,
+            );
+        }
+        Some(ParameterType::JsonObject) => set_dynamic_editor_value(json_object, &value),
+        Some(ParameterType::JsonArray) => set_dynamic_editor_value(json_array, &value),
+        None => {}
+    }
+}
+
+fn set_dynamic_editor_value(editor: HWND, value: &str) {
+    if read_text(editor) != value {
+        let value = wide(value);
+        unsafe {
+            let _ = SetWindowTextW(editor, PCWSTR(value.as_ptr()));
+        }
+    }
+}
+
+fn dynamic_option_label(option: &ParameterOption) -> &str {
+    if option.label.is_empty() {
+        &option.value
+    } else {
+        &option.label
+    }
+}
+
+fn sync_dynamic_select_options(state: &SettingsState, definition: &DynamicInput, value: &str) {
+    let button = state.advanced_audio.dynamic_select;
+    let list = state.advanced_audio.dynamic_select_list;
+    let selected = definition
+        .options
+        .iter()
+        .position(|option| option.value == value);
+    let label = selected
+        .and_then(|index| definition.options.get(index))
+        .map(dynamic_option_label)
+        .unwrap_or(value);
+    unsafe {
+        if read_text(button) != label {
+            let _ = SetWindowTextW(button, PCWSTR(wide(label).as_ptr()));
+        }
+        SendMessageW(list, LB_RESETCONTENT, None, None);
+        for option in &definition.options {
+            let text = wide(dynamic_option_label(option));
+            SendMessageW(
+                list,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+        }
+        SendMessageW(
+            list,
+            LB_SETCURSEL,
+            Some(WPARAM(selected.unwrap_or(usize::MAX))),
+            None,
+        );
+        SendMessageW(
+            list,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(
+                platform::scale(dropdown::ROW_HEIGHT, state.dpi) as isize
+            )),
+        );
+    }
+    if dynamic_select_is_open(state) {
+        let _ = layout_dynamic_select_popup(state);
+    }
+}
+
+fn sync_dynamic_multi_select_options(
+    state: &SettingsState,
+    definition: &DynamicInput,
+    value: &str,
+) {
+    let list = state.advanced_audio.dynamic_multi_select_list;
+    let selected = serde_json::from_str::<Vec<String>>(value).unwrap_or_default();
+    unsafe {
+        SendMessageW(list, LB_RESETCONTENT, None, None);
+        SendMessageW(
+            list,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(
+                platform::scale(MULTI_SELECT_ROW_HEIGHT, state.dpi) as isize
+            )),
+        );
+        for (index, option) in definition.options.iter().enumerate() {
+            let text = wide(dynamic_option_label(option));
+            SendMessageW(
+                list,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+            if selected.iter().any(|item| item == &option.value) {
+                SendMessageW(
+                    list,
+                    LB_SETSEL,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(index as isize)),
+                );
+            }
+        }
+    }
+    set_dynamic_multi_select_button_text(state, definition, &selected);
+    if dynamic_multi_select_is_open(state) {
+        let _ = layout_dynamic_multi_select_popup(state);
+    }
+}
+
+fn set_dynamic_multi_select_button_text(
+    state: &SettingsState,
+    definition: &DynamicInput,
+    selected: &[String],
+) {
+    let text = selected
+        .iter()
+        .map(|value| {
+            definition
+                .options
+                .iter()
+                .find(|option| option.value == *value)
+                .map(dynamic_option_label)
+                .unwrap_or(value)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let button = state.advanced_audio.dynamic_multi_select;
+    unsafe {
+        if read_text(button) != text {
+            let _ = SetWindowTextW(button, PCWSTR(wide(&text).as_ptr()));
+        }
+        let _ = InvalidateRect(Some(button), None, true);
+    }
+}
+
+fn sync_dynamic_text_input(state: &mut SettingsState, id: usize) {
     if state.advanced_audio.updating_dynamic_controls {
         return;
     }
-    let (definition_id, editor, secret) = {
+    let (definition, editor, secret) = {
         let page = &state.advanced_audio;
         let Some(form) = &page.dynamic_form else {
             return;
         };
+        let Some(slot) = form.current_page(&page.config.values) else {
+            return;
+        };
         let (definition, editor, secret) = match id {
             ID_DYNAMIC_VALUE => (
-                form.parameters.get(form.page),
+                slot.parameter_index
+                    .and_then(|index| form.parameters.get(index)),
                 page.dynamic_value_editor,
                 false,
             ),
+            ID_DYNAMIC_JSON_OBJECT => (
+                slot.parameter_index
+                    .and_then(|index| form.parameters.get(index)),
+                page.dynamic_json_object,
+                false,
+            ),
+            ID_DYNAMIC_JSON_ARRAY => (
+                slot.parameter_index
+                    .and_then(|index| form.parameters.get(index)),
+                page.dynamic_json_array,
+                false,
+            ),
             ID_DYNAMIC_SECRET => (
-                form.secrets.get(form.page),
+                slot.secret_index.and_then(|index| form.secrets.get(index)),
                 page.dynamic_secret_editor,
                 true,
             ),
@@ -1089,7 +1979,19 @@ fn sync_dynamic_input(state: &mut SettingsState, id: usize) {
         let Some(definition) = definition else {
             return;
         };
-        (definition.id.clone(), editor, secret)
+        let accepts_input = matches!(
+            (id, definition.parameter_type),
+            (
+                ID_DYNAMIC_VALUE,
+                ParameterType::Text | ParameterType::Integer | ParameterType::Number
+            ) | (ID_DYNAMIC_JSON_OBJECT, ParameterType::JsonObject)
+                | (ID_DYNAMIC_JSON_ARRAY, ParameterType::JsonArray)
+                | (ID_DYNAMIC_SECRET, _)
+        );
+        if !accepts_input {
+            return;
+        }
+        (definition.clone(), editor, secret)
     };
     let value = read_text(editor);
     let target = if secret {
@@ -1097,18 +1999,618 @@ fn sync_dynamic_input(state: &mut SettingsState, id: usize) {
     } else {
         &mut state.advanced_audio.config.values
     };
+    store_dynamic_input_value(target, &definition.id, value);
+}
+
+fn store_dynamic_input_value(
+    values: &mut std::collections::BTreeMap<String, String>,
+    id: &str,
+    value: String,
+) {
     if value.is_empty() {
-        target.remove(&definition_id);
+        values.remove(id);
     } else {
-        target.insert(definition_id, value);
+        values.insert(id.into(), value);
     }
 }
 
+fn sync_dynamic_boolean(state: &mut SettingsState) {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return;
+    };
+    if definition.parameter_type != ParameterType::Boolean {
+        return;
+    }
+    let value = !state
+        .boolean_values
+        .get(DYNAMIC_BOOLEAN_KEY)
+        .copied()
+        .unwrap_or(false);
+    state.boolean_values.insert(DYNAMIC_BOOLEAN_KEY, value);
+    state
+        .advanced_audio
+        .config
+        .values
+        .insert(definition.id, if value { "true" } else { "false" }.into());
+}
+
+fn sync_dynamic_multi_select(state: &mut SettingsState) {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return;
+    };
+    if definition.parameter_type != ParameterType::MultiSelect {
+        return;
+    }
+    let list = state.advanced_audio.dynamic_multi_select_list;
+    let selected = definition
+        .options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            (unsafe { SendMessageW(list, LB_GETSEL, Some(WPARAM(index)), None).0 > 0 })
+                .then(|| option.value.clone())
+        })
+        .collect::<Vec<_>>();
+    let default = definition
+        .default
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    if selected.is_empty() && default.is_empty() {
+        state.advanced_audio.config.values.remove(&definition.id);
+    } else {
+        state.advanced_audio.config.values.insert(
+            definition.id.clone(),
+            serde_json::to_string(&selected).expect("string arrays serialize"),
+        );
+    }
+    set_dynamic_multi_select_button_text(state, &definition, &selected);
+}
+
+fn dynamic_multi_select_is_open(state: &SettingsState) -> bool {
+    let page = &state.advanced_audio;
+    !page.dynamic_multi_select_panel.is_invalid()
+        && unsafe { IsWindowVisible(page.dynamic_multi_select_panel).as_bool() }
+}
+
+fn layout_dynamic_multi_select_popup(state: &SettingsState) -> bool {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return false;
+    };
+    if definition.parameter_type != ParameterType::MultiSelect {
+        return false;
+    }
+    let page = &state.advanced_audio;
+    let panel = page.dynamic_multi_select_panel;
+    let list = page.dynamic_multi_select_list;
+    let scrollbar = page.dynamic_multi_select_scrollbar;
+    if panel.is_invalid() || list.is_invalid() || scrollbar.is_invalid() {
+        return false;
+    }
+    let rows = definition.options.len().clamp(1, MULTI_SELECT_VISIBLE_ROWS) as i32;
+    let list_height = platform::scale(rows * MULTI_SELECT_ROW_HEIGHT, state.dpi);
+    let width = dropdown::position(
+        panel,
+        page.dynamic_multi_select,
+        rows * MULTI_SELECT_ROW_HEIGHT,
+        state.dpi,
+    );
+    let list_width = dropdown_scrollbar::position(
+        scrollbar,
+        width,
+        list_height,
+        state.dpi,
+        definition.options.len() > MULTI_SELECT_VISIBLE_ROWS,
+    );
+    unsafe {
+        let _ = SetWindowPos(
+            list,
+            Some(HWND_TOP),
+            platform::scale(dropdown::PADDING, state.dpi),
+            platform::scale(dropdown::PADDING, state.dpi),
+            list_width,
+            list_height,
+            SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(list, SW_SHOW);
+    }
+    true
+}
+
+fn dynamic_select_is_open(state: &SettingsState) -> bool {
+    let panel = state.advanced_audio.dynamic_select_panel;
+    !panel.is_invalid() && unsafe { IsWindowVisible(panel).as_bool() }
+}
+
+fn layout_dynamic_select_popup(state: &SettingsState) -> bool {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return false;
+    };
+    if definition.parameter_type != ParameterType::Select {
+        return false;
+    }
+    let page = &state.advanced_audio;
+    let panel = page.dynamic_select_panel;
+    let list = page.dynamic_select_list;
+    let scrollbar = page.dynamic_select_scrollbar;
+    if panel.is_invalid() || list.is_invalid() || scrollbar.is_invalid() {
+        return false;
+    }
+    let rows = definition.options.len().clamp(1, DYNAMIC_SELECT_MAX_ROWS) as i32;
+    let list_height = platform::scale(rows * dropdown::ROW_HEIGHT, state.dpi);
+    let width = dropdown::position(
+        panel,
+        page.dynamic_select,
+        rows * dropdown::ROW_HEIGHT,
+        state.dpi,
+    );
+    let list_width = dropdown_scrollbar::position(
+        scrollbar,
+        width,
+        list_height,
+        state.dpi,
+        definition.options.len() > DYNAMIC_SELECT_MAX_ROWS,
+    );
+    unsafe {
+        let _ = SetWindowPos(
+            list,
+            Some(HWND_TOP),
+            platform::scale(dropdown::PADDING, state.dpi),
+            platform::scale(dropdown::PADDING, state.dpi),
+            list_width,
+            list_height,
+            SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(list, SW_SHOW);
+    }
+    true
+}
+
+fn open_dynamic_select(state: &mut SettingsState) {
+    if !layout_dynamic_select_popup(state) {
+        return;
+    }
+    close_dynamic_multi_select(state);
+    let panel = state.advanced_audio.dynamic_select_panel;
+    let list = state.advanced_audio.dynamic_select_list;
+    let button = state.advanced_audio.dynamic_select;
+    unsafe {
+        let _ = ShowWindow(panel, SW_SHOW);
+        let _ = SetFocus(Some(list));
+        let _ = InvalidateRect(Some(button), None, true);
+    }
+}
+
+fn close_dynamic_select_popup(state: &mut SettingsState) {
+    let panel = state.advanced_audio.dynamic_select_panel;
+    let button = state.advanced_audio.dynamic_select;
+    if panel.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(panel, SW_HIDE);
+        let _ = InvalidateRect(Some(button), None, true);
+    }
+}
+
+fn open_dynamic_multi_select(state: &mut SettingsState) {
+    if !layout_dynamic_multi_select_popup(state) {
+        return;
+    }
+    close_dynamic_select_popup(state);
+    let panel = state.advanced_audio.dynamic_multi_select_panel;
+    let list = state.advanced_audio.dynamic_multi_select_list;
+    let button = state.advanced_audio.dynamic_multi_select;
+    unsafe {
+        let _ = ShowWindow(panel, SW_SHOW);
+        let _ = SetFocus(Some(list));
+        let _ = InvalidateRect(Some(button), None, true);
+    }
+}
+
+fn close_dynamic_multi_select(state: &mut SettingsState) {
+    let panel = state.advanced_audio.dynamic_multi_select_panel;
+    let button = state.advanced_audio.dynamic_multi_select;
+    if panel.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(panel, SW_HIDE);
+        let _ = InvalidateRect(Some(button), None, true);
+    }
+}
+
+pub(super) fn close_dynamic_select(state: &mut SettingsState) {
+    close_dynamic_select_popup(state);
+    close_dynamic_multi_select(state);
+}
+
+fn toggle_dynamic_select(state: &mut SettingsState) {
+    if dynamic_select_is_open(state) {
+        close_dynamic_select_popup(state);
+    } else {
+        open_dynamic_select(state);
+    }
+}
+
+fn toggle_dynamic_multi_select(state: &mut SettingsState) {
+    if dynamic_multi_select_is_open(state) {
+        close_dynamic_multi_select(state);
+    } else {
+        open_dynamic_multi_select(state);
+    }
+}
+
+fn choose_dynamic_select_option(state: &mut SettingsState) {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return;
+    };
+    if definition.parameter_type != ParameterType::Select {
+        return;
+    }
+    let selected = unsafe {
+        SendMessageW(
+            state.advanced_audio.dynamic_select_list,
+            LB_GETCURSEL,
+            None,
+            None,
+        )
+        .0
+    };
+    let Some(option) = usize::try_from(selected)
+        .ok()
+        .and_then(|index| definition.options.get(index))
+    else {
+        return;
+    };
+    let refresh_dynamic_layout = current_dynamic_value_affects_visibility(state);
+    state
+        .advanced_audio
+        .config
+        .values
+        .insert(definition.id.clone(), option.value.clone());
+    unsafe {
+        let _ = SetWindowTextW(
+            state.advanced_audio.dynamic_select,
+            PCWSTR(wide(dynamic_option_label(option)).as_ptr()),
+        );
+    }
+    close_dynamic_select_popup(state);
+    dynamic_input_changed(state, refresh_dynamic_layout);
+}
+
+unsafe extern "system" fn dynamic_select_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    parent: usize,
+) -> LRESULT {
+    let parent = HWND(parent as *mut std::ffi::c_void);
+    let list = unsafe { GetDlgCtrlID(hwnd) as usize == ID_DYNAMIC_SELECT_LIST };
+    let post = |action: usize, detail: LPARAM| unsafe {
+        let _ = PostMessageW(Some(parent), DYNAMIC_SELECT_ACTION, WPARAM(action), detail);
+    };
+    if message == WM_KEYDOWN {
+        let key = wparam.0 as u16;
+        if list && [VK_RETURN.0, VK_SPACE.0, VK_ESCAPE.0, VK_TAB.0].contains(&key) {
+            post(
+                if key == VK_TAB.0 {
+                    DYNAMIC_SELECT_TAB
+                } else if key == VK_ESCAPE.0 {
+                    DYNAMIC_SELECT_CLOSE
+                } else {
+                    DYNAMIC_SELECT_PICK
+                },
+                LPARAM((unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0) as isize),
+            );
+            return LRESULT(0);
+        }
+        if !list && [VK_DOWN.0, VK_RETURN.0, VK_SPACE.0].contains(&key) {
+            post(DYNAMIC_SELECT_TOGGLE, LPARAM(0));
+            return LRESULT(0);
+        }
+        if !list && key == VK_TAB.0 {
+            post(
+                DYNAMIC_SELECT_TAB,
+                LPARAM((unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0) as isize),
+            );
+            return LRESULT(0);
+        }
+    }
+    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if list && message == WM_LBUTTONUP {
+        let hit = unsafe { SendMessageW(hwnd, LB_ITEMFROMPOINT, None, Some(lparam)) }.0 as usize;
+        if hit >> 16 == 0 {
+            post(DYNAMIC_SELECT_PICK, LPARAM(0));
+        }
+    } else if message == WM_KILLFOCUS {
+        post(DYNAMIC_SELECT_CLOSE_IF_OUTSIDE, LPARAM(wparam.0 as isize));
+    }
+    result
+}
+
+unsafe extern "system" fn dynamic_multi_select_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    parent: usize,
+) -> LRESULT {
+    let parent = HWND(parent as *mut std::ffi::c_void);
+    let list = unsafe { GetDlgCtrlID(hwnd) as usize == ID_DYNAMIC_MULTI_SELECT_LIST };
+    let post = |action: usize, detail: LPARAM| unsafe {
+        let _ = PostMessageW(
+            Some(parent),
+            DYNAMIC_MULTI_SELECT_ACTION,
+            WPARAM(action),
+            detail,
+        );
+    };
+    if message == WM_KEYDOWN {
+        let key = wparam.0 as u16;
+        if list && [VK_RETURN.0, VK_ESCAPE.0, VK_TAB.0].contains(&key) {
+            post(
+                if key == VK_TAB.0 {
+                    DYNAMIC_SELECT_TAB
+                } else {
+                    DYNAMIC_SELECT_CLOSE
+                },
+                LPARAM((unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0) as isize),
+            );
+            return LRESULT(0);
+        }
+        if !list && [VK_DOWN.0, VK_RETURN.0, VK_SPACE.0].contains(&key) {
+            post(DYNAMIC_SELECT_TOGGLE, LPARAM(0));
+            return LRESULT(0);
+        }
+        if !list && key == VK_TAB.0 {
+            post(
+                DYNAMIC_SELECT_TAB,
+                LPARAM((unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0) as isize),
+            );
+            return LRESULT(0);
+        }
+    }
+    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if list && message == WM_KILLFOCUS {
+        post(DYNAMIC_SELECT_CLOSE_IF_OUTSIDE, LPARAM(wparam.0 as isize));
+    }
+    result
+}
+
+pub(super) fn handle_message(
+    state: &mut SettingsState,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> bool {
+    if message == WM_NOTIFY {
+        return handle_dynamic_label_tooltip_notification(state, lparam);
+    }
+    if message == DYNAMIC_MULTI_SELECT_SYNC {
+        if !state
+            .advanced_audio
+            .dynamic_multi_select_sync_pending
+            .as_ref()
+            .is_some_and(|pending| pending.token == wparam.0)
+        {
+            return true;
+        }
+        let parameter_id = state
+            .advanced_audio
+            .dynamic_multi_select_sync_pending
+            .take()
+            .expect("matching pending multi-select sync")
+            .parameter_id;
+        let active = current_dynamic_inputs(state).0.is_some_and(|definition| {
+            definition.parameter_type == ParameterType::MultiSelect && definition.id == parameter_id
+        });
+        if active
+            && !state.saving
+            && enabled(state)
+            && !is_generating(state)
+            && !state.advanced_audio.updating_dynamic_controls
+        {
+            // LBN_SELCHANGE is delivered while the native LISTBOX is still
+            // processing its selection. Read and persist its state only after
+            // that notification has returned to avoid re-entering it through
+            // LB_GETSEL and repaint messages.
+            sync_dynamic_multi_select(state);
+            dynamic_input_changed(state, false);
+        }
+        return true;
+    }
+    if message == DYNAMIC_MULTI_SELECT_ACTION {
+        return handle_dynamic_multi_select_action(state, wparam, lparam);
+    }
+    if message != DYNAMIC_SELECT_ACTION {
+        return false;
+    }
+    let action = wparam.0;
+    let select_button = state.advanced_audio.dynamic_select;
+    let select_list = state.advanced_audio.dynamic_select_list;
+    let select_scrollbar = state.advanced_audio.dynamic_select_scrollbar;
+    let select_active = current_dynamic_inputs(state)
+        .0
+        .is_some_and(|definition| definition.parameter_type == ParameterType::Select);
+    match action {
+        DYNAMIC_SELECT_TOGGLE if !state.saving && enabled(state) && !is_generating(state) => {
+            if select_active {
+                toggle_dynamic_select(state);
+            }
+        }
+        DYNAMIC_SELECT_PICK if !state.saving && enabled(state) && !is_generating(state) => {
+            if select_active {
+                choose_dynamic_select_option(state);
+                unsafe {
+                    if IsWindowVisible(select_button).as_bool() {
+                        let _ = SetFocus(Some(select_button));
+                    }
+                }
+            }
+        }
+        DYNAMIC_SELECT_CLOSE => {
+            close_dynamic_select_popup(state);
+            unsafe {
+                let _ = SetFocus(Some(select_button));
+            }
+        }
+        DYNAMIC_SELECT_CLOSE_IF_OUTSIDE => {
+            let focus = unsafe { GetFocus() };
+            if ![select_button, select_list, select_scrollbar].contains(&focus) {
+                close_dynamic_select_popup(state);
+            }
+        }
+        DYNAMIC_SELECT_TAB => {
+            close_dynamic_select_popup(state);
+            unsafe {
+                if let Ok(next) = GetNextDlgTabItem(state.hwnd, Some(select_button), lparam.0 != 0)
+                {
+                    let _ = SetFocus(Some(next));
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_dynamic_label_tooltip_notification(state: &mut SettingsState, lparam: LPARAM) -> bool {
+    if lparam.0 == 0 || state.advanced_audio.dynamic_label_tooltip.is_invalid() {
+        return false;
+    }
+    let header = unsafe { &*(lparam.0 as *const NMHDR) };
+    if header.hwndFrom != state.advanced_audio.dynamic_label_tooltip
+        || header.code != TTN_GETDISPINFOW
+    {
+        return false;
+    }
+    let notification = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
+    match notification.hdr.idFrom {
+        ID_DYNAMIC_VALUE_LABEL_TOOLTIP => {
+            state.advanced_audio.dynamic_value_label_tooltip_text =
+                wide(&read_text(state.advanced_audio.dynamic_value_label));
+            notification.lpszText = PWSTR(
+                state
+                    .advanced_audio
+                    .dynamic_value_label_tooltip_text
+                    .as_mut_ptr(),
+            );
+        }
+        ID_DYNAMIC_SECRET_LABEL_TOOLTIP => {
+            state.advanced_audio.dynamic_secret_label_tooltip_text =
+                wide(&read_text(state.advanced_audio.dynamic_secret_label));
+            notification.lpszText = PWSTR(
+                state
+                    .advanced_audio
+                    .dynamic_secret_label_tooltip_text
+                    .as_mut_ptr(),
+            );
+        }
+        _ => return false,
+    }
+    true
+}
+
+pub(super) fn destroy(state: &mut SettingsState) {
+    let tooltip = std::mem::take(&mut state.advanced_audio.dynamic_label_tooltip);
+    if !tooltip.is_invalid() {
+        unsafe {
+            let _ = DestroyWindow(tooltip);
+        }
+    }
+}
+
+fn handle_dynamic_multi_select_action(
+    state: &mut SettingsState,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> bool {
+    let action = wparam.0;
+    let button = state.advanced_audio.dynamic_multi_select;
+    let list = state.advanced_audio.dynamic_multi_select_list;
+    let scrollbar = state.advanced_audio.dynamic_multi_select_scrollbar;
+    let active = current_dynamic_inputs(state)
+        .0
+        .is_some_and(|definition| definition.parameter_type == ParameterType::MultiSelect);
+    match action {
+        DYNAMIC_SELECT_TOGGLE if !state.saving && enabled(state) && !is_generating(state) => {
+            if active {
+                toggle_dynamic_multi_select(state);
+            }
+        }
+        DYNAMIC_SELECT_CLOSE => {
+            close_dynamic_multi_select(state);
+            unsafe {
+                let _ = SetFocus(Some(button));
+            }
+        }
+        DYNAMIC_SELECT_CLOSE_IF_OUTSIDE => {
+            let focus = unsafe { GetFocus() };
+            if ![button, list, scrollbar].contains(&focus) {
+                close_dynamic_multi_select(state);
+            }
+        }
+        DYNAMIC_SELECT_TAB => {
+            close_dynamic_multi_select(state);
+            unsafe {
+                if let Ok(next) = GetNextDlgTabItem(state.hwnd, Some(button), lparam.0 != 0) {
+                    let _ = SetFocus(Some(next));
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn dynamic_input_changed(state: &mut SettingsState, refresh_dynamic_layout: bool) {
+    state.advanced_audio.validation = ValidationState::NotValidated;
+    state.advanced_audio.test_requested = false;
+    if refresh_dynamic_layout {
+        normalize_dynamic_page(state);
+        sync_dynamic_form_page(state);
+        update_controls(state);
+        unsafe {
+            let _ = InvalidateRect(Some(state.hwnd), None, true);
+        }
+    } else {
+        // A normal edit already repaints its own native control. Repaint only
+        // the validation/test feedback that its changed value invalidates,
+        // rather than flashing the whole settings page for each character.
+        let scale = |value| platform::scale(value, state.dpi);
+        let feedback = RECT {
+            left: scale(CONTENT_LEFT),
+            top: scale(VALIDATION_ACTION_TOP),
+            right: scale(CONTENT_LEFT + EDIT_WIDTH),
+            bottom: scale(WINDOW_HEIGHT - FOOTER_HEIGHT),
+        };
+        unsafe {
+            let _ = InvalidateRect(Some(state.hwnd), Some(&feedback), true);
+        }
+    }
+}
+
+fn current_dynamic_value_affects_visibility(state: &SettingsState) -> bool {
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return false;
+    };
+    state
+        .advanced_audio
+        .dynamic_form
+        .as_ref()
+        .is_some_and(|form| form.has_visibility_dependents(&definition.id))
+}
+
 fn change_dynamic_page(state: &mut SettingsState, offset: isize) {
+    let values = state.advanced_audio.config.values.clone();
     let Some(form) = &mut state.advanced_audio.dynamic_form else {
         return;
     };
-    let page_count = form.page_count();
+    let page_count = form.pages(&values).len();
     if page_count == 0 {
         return;
     }
@@ -1122,6 +2624,12 @@ fn change_dynamic_page(state: &mut SettingsState, offset: isize) {
     sync_dynamic_form_page(state);
     sync_visibility(state);
     update_controls(state);
+    // Dynamic input frames are painted by the parent window. A page change can
+    // hide a text or secret editor, so repaint the parent once to erase its
+    // former frame before the next page is shown.
+    unsafe {
+        let _ = InvalidateRect(Some(state.hwnd), None, true);
+    }
 }
 
 fn create_remote_editor_controls(
@@ -1576,6 +3084,20 @@ pub(super) fn resize(state: &mut SettingsState) {
     if !state.advanced_audio.generation_status.is_invalid() {
         set_font(state.advanced_audio.generation_status, state.small_font);
     }
+    if !state.advanced_audio.dynamic_multi_select_list.is_invalid() {
+        unsafe {
+            SendMessageW(
+                state.advanced_audio.dynamic_multi_select_list,
+                LB_SETITEMHEIGHT,
+                Some(WPARAM(0)),
+                Some(LPARAM(
+                    platform::scale(MULTI_SELECT_ROW_HEIGHT, state.dpi) as isize
+                )),
+            );
+        }
+    }
+    sync_dynamic_form_page(state);
+    resize_dynamic_label_tooltip(state);
     layout_remote_viewport(state);
 }
 
@@ -1833,15 +3355,85 @@ fn create_remote_label(
 }
 
 pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -> bool {
-    if matches!(id, ID_DYNAMIC_VALUE | ID_DYNAMIC_SECRET) && notification == EN_CHANGE {
+    if matches!(
+        id,
+        ID_DYNAMIC_VALUE | ID_DYNAMIC_SECRET | ID_DYNAMIC_JSON_OBJECT | ID_DYNAMIC_JSON_ARRAY
+    ) && notification == EN_CHANGE
+    {
         if !state.advanced_audio.updating_dynamic_controls {
-            sync_dynamic_input(state, id);
-            state.advanced_audio.validation = ValidationState::NotValidated;
-            state.advanced_audio.test_requested = false;
-            sync_summary_control(state);
+            sync_dynamic_text_input(state, id);
+            dynamic_input_changed(state, false);
         }
-        unsafe {
-            let _ = InvalidateRect(Some(state.hwnd), None, true);
+        return true;
+    }
+    if id == ID_DYNAMIC_BOOLEAN && notification == BN_CLICKED {
+        if !state.saving && !is_generating(state) && !state.advanced_audio.updating_dynamic_controls
+        {
+            let refresh_dynamic_layout = current_dynamic_value_affects_visibility(state);
+            sync_dynamic_boolean(state);
+            dynamic_input_changed(state, refresh_dynamic_layout);
+        }
+        return true;
+    }
+    if id == ID_DYNAMIC_SELECT && notification == BN_CLICKED {
+        if !state.saving && !is_generating(state) && !state.advanced_audio.updating_dynamic_controls
+        {
+            toggle_dynamic_select(state);
+        }
+        return true;
+    }
+    if id == ID_DYNAMIC_SELECT_LIST && notification == LBN_SELCHANGE {
+        return true;
+    }
+    if id == ID_DYNAMIC_MULTI_SELECT && notification == BN_CLICKED {
+        if !state.saving && !is_generating(state) && !state.advanced_audio.updating_dynamic_controls
+        {
+            toggle_dynamic_multi_select(state);
+        }
+        return true;
+    }
+    if id == ID_DYNAMIC_MULTI_SELECT_LIST && notification == LBN_SELCHANGE {
+        if !state.saving
+            && !is_generating(state)
+            && !state.advanced_audio.updating_dynamic_controls
+            && state
+                .advanced_audio
+                .dynamic_multi_select_sync_pending
+                .is_none()
+        {
+            let parameter_id = current_dynamic_inputs(state)
+                .0
+                .filter(|definition| definition.parameter_type == ParameterType::MultiSelect)
+                .map(|definition| definition.id);
+            if let Some(parameter_id) = parameter_id {
+                let token = state
+                    .advanced_audio
+                    .dynamic_multi_select_sync_token
+                    .wrapping_add(1);
+                state.advanced_audio.dynamic_multi_select_sync_token = token;
+                state.advanced_audio.dynamic_multi_select_sync_pending =
+                    Some(DynamicMultiSelectSync {
+                        token,
+                        parameter_id,
+                    });
+                let posted = unsafe {
+                    PostMessageW(
+                        Some(state.hwnd),
+                        DYNAMIC_MULTI_SELECT_SYNC,
+                        WPARAM(token),
+                        LPARAM(0),
+                    )
+                };
+                if posted.is_err()
+                    && state
+                        .advanced_audio
+                        .dynamic_multi_select_sync_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.token == token)
+                {
+                    state.advanced_audio.dynamic_multi_select_sync_pending = None;
+                }
+            }
         }
         return true;
     }
@@ -1864,7 +3456,10 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
         }
         return true;
     }
-    if id == ID_MATERIAL && notification == EN_CHANGE && !is_generating(state) {
+    if matches!(id, ID_MATERIAL | ID_USER_REQUIREMENTS)
+        && notification == EN_CHANGE
+        && !is_generating(state)
+    {
         state.advanced_audio.generation = GenerationState::Idle;
         sync_visibility(state);
         unsafe {
@@ -2099,31 +3694,10 @@ fn validate_remote_draft(
     workflow: &AdvancedAudioWorkflow,
     remote_audio: &RemoteAudioConfig,
 ) -> Result<(), String> {
-    if !workflow_requires_remote(workflow) {
-        return Ok(());
-    }
-
-    // The portable Workflow validation intentionally lets users fill dynamic
-    // values and secrets later. Populate only the required declaration slots
-    // here so Core can validate the stored remote-audio configuration without
-    // turning an unfinished values/secrets draft into a workflow error.
-    let mut config = AdvancedAudioConfig::default();
-    config.enabled = true;
-    config.workflow = Some(workflow.clone());
-    config.remote_audio = remote_audio.clone();
-    config.values = workflow
-        .parameters
-        .iter()
-        .filter(|definition| definition.required && definition.default.is_none())
-        .map(|definition| (definition.id.clone(), String::new()))
-        .collect();
-    config.secrets = workflow
-        .secrets
-        .iter()
-        .filter(|definition| definition.required)
-        .map(|definition| (definition.id.clone(), "configured".into()))
-        .collect();
-    validate_advanced_audio_config(&config).map_err(|errors| {
+    // Dynamic values and secrets may still be incomplete while the user is
+    // editing a workflow. Validate only the remote-hosting portion here;
+    // Core validates every typed value before a workflow can run or save.
+    validate_remote_audio_config(workflow, remote_audio).map_err(|errors| {
         errors
             .errors()
             .iter()
@@ -2336,6 +3910,8 @@ pub(super) fn sync_visibility(state: &SettingsState) {
         .map(|group| group.0)
         .unwrap_or_default();
     if active != GROUP {
+        pop_dynamic_label_tooltip(state);
+        sync_dynamic_label_tooltip_rects(state, false, false);
         return;
     }
     let page = &state.advanced_audio;
@@ -2394,6 +3970,14 @@ fn generation_status_message(state: &SettingsState) -> Option<String> {
             "{}: {message}",
             state.language.text("advanced_audio_needs_more_information")
         )),
+        GenerationState::Unsupported(message) => Some(format!(
+            "{}: {message}",
+            state.language.text("advanced_audio_unsupported")
+        )),
+        GenerationState::Failed(message) => Some(format!(
+            "{}: {message}",
+            state.language.text("advanced_audio_generation_failed")
+        )),
         _ => None,
     }
 }
@@ -2413,21 +3997,48 @@ fn sync_generation_status_control(state: &SettingsState, visible: bool) {
 
 fn sync_dynamic_visibility(state: &SettingsState, visible: bool) {
     let page = &state.advanced_audio;
-    let (value_visible, secret_visible, navigation_visible) = page
+    let (value, secret) = current_dynamic_inputs(state);
+    let page_count = page
         .dynamic_form
         .as_ref()
-        .map(|form| {
-            (
-                visible && form.parameters.get(form.page).is_some(),
-                visible && form.secrets.get(form.page).is_some(),
-                visible && form.page_count() > 1,
-            )
-        })
-        .unwrap_or((false, false, false));
+        .map(|form| form.pages(&page.config.values).len())
+        .unwrap_or_default();
+    let value_visible = visible && value.is_some();
+    let secret_visible = visible && secret.is_some();
+    let navigation_visible = visible && page_count > 1;
     set_controls_visible(&[page.dynamic_values_heading], value_visible);
+    set_controls_visible(&[page.dynamic_value_label], value_visible);
+    let active_value_control = value_visible.then(|| {
+        match value
+            .as_ref()
+            .expect("visible dynamic value")
+            .parameter_type
+        {
+            ParameterType::Text | ParameterType::Integer | ParameterType::Number => {
+                page.dynamic_value_editor
+            }
+            ParameterType::Boolean => page.dynamic_boolean,
+            ParameterType::Select => page.dynamic_select,
+            ParameterType::MultiSelect => page.dynamic_multi_select,
+            ParameterType::JsonObject => page.dynamic_json_object,
+            ParameterType::JsonArray => page.dynamic_json_array,
+        }
+    });
+    for control in [
+        page.dynamic_value_editor,
+        page.dynamic_boolean,
+        page.dynamic_select,
+        page.dynamic_multi_select,
+        page.dynamic_json_object,
+        page.dynamic_json_array,
+    ] {
+        set_controls_visible(&[control], active_value_control == Some(control));
+    }
+    // Dynamic dropdown panels are opened explicitly. A normal page or
+    // visibility sync must never leave a stale popup above another field.
     set_controls_visible(
-        &[page.dynamic_value_label, page.dynamic_value_editor],
-        value_visible,
+        &[page.dynamic_select_panel, page.dynamic_multi_select_panel],
+        false,
     );
     set_controls_visible(&[page.dynamic_secrets_heading], secret_visible);
     set_controls_visible(
@@ -2438,12 +4049,18 @@ fn sync_dynamic_visibility(state: &SettingsState, visible: bool) {
         &[page.dynamic_previous, page.dynamic_next],
         navigation_visible,
     );
+    if !value_visible || !secret_visible {
+        pop_dynamic_label_tooltip(state);
+    }
+    sync_dynamic_label_tooltip_rects(state, value_visible, secret_visible);
 }
 
 fn set_controls_visible(controls: &[HWND], visible: bool) {
     unsafe {
         for control in controls {
-            let _ = ShowWindow(*control, if visible { SW_SHOW } else { SW_HIDE });
+            if IsWindowVisible(*control).as_bool() != visible {
+                let _ = ShowWindow(*control, if visible { SW_SHOW } else { SW_HIDE });
+            }
         }
     }
 }
@@ -2490,6 +4107,7 @@ fn confirm_workflow_test(state: &SettingsState, preview: &WorkflowTestPreview) -
 
 fn start_generation(state: &mut SettingsState) {
     let material = read_text(state.controls[MATERIAL_KEY]);
+    let user_requirements = read_text(state.controls[USER_REQUIREMENTS_KEY]);
     if material.trim().is_empty() {
         state.advanced_audio.generation = GenerationState::Failed(
             state
@@ -2497,6 +4115,7 @@ fn start_generation(state: &mut SettingsState) {
                 .text("advanced_audio_material_required")
                 .into(),
         );
+        sync_visibility(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, true);
         }
@@ -2507,7 +4126,9 @@ fn start_generation(state: &mut SettingsState) {
     // replacement for an incomplete Advanced Audio workflow.
     let mut config = state.runtime.config();
     config.rewrite = rewrite::read(state);
-    let redacted_material = advanced_audio_prompt::redact_generation_material(&material);
+    let redacted_user_requirements =
+        advanced_audio_prompt::redact_generation_material(&user_requirements);
+    let redacted_vendor_material = advanced_audio_prompt::redact_generation_material(&material);
     let cancel = tokio_util::sync::CancellationToken::new();
     let worker_cancel = cancel.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -2529,7 +4150,8 @@ fn start_generation(state: &mut SettingsState) {
         {
             Ok(executor) => executor.block_on(advanced_audio_prompt::compile_workflow(
                 config,
-                redacted_material,
+                redacted_user_requirements,
+                redacted_vendor_material,
                 &worker_cancel,
             )),
             Err(error) => Err(error.to_string()),
@@ -2541,6 +4163,10 @@ fn start_generation(state: &mut SettingsState) {
 fn reset_workflow_draft(state: &mut SettingsState) {
     let empty = wide("");
     unsafe {
+        let _ = SetWindowTextW(
+            state.controls[USER_REQUIREMENTS_KEY],
+            PCWSTR(empty.as_ptr()),
+        );
         let _ = SetWindowTextW(state.controls[MATERIAL_KEY], PCWSTR(empty.as_ptr()));
         let _ = SetWindowTextW(state.controls[WORKFLOW_KEY], PCWSTR(empty.as_ptr()));
     }
@@ -2651,7 +4277,13 @@ pub(super) fn update_controls(state: &SettingsState) {
         state.connectivity_status,
         super::ConnectivityStatus::Testing
     );
-    for key in [MATERIAL_KEY, WORKFLOW_KEY, VALIDATE_KEY, GENERATE_KEY] {
+    for key in [
+        USER_REQUIREMENTS_KEY,
+        MATERIAL_KEY,
+        WORKFLOW_KEY,
+        VALIDATE_KEY,
+        GENERATE_KEY,
+    ] {
         if let Some(control) = state.controls.get(key) {
             unsafe {
                 let _ = EnableWindow(*control, enabled && !generating);
@@ -2659,22 +4291,48 @@ pub(super) fn update_controls(state: &SettingsState) {
             }
         }
     }
-    let (value_available, secret_available, page, page_count) = state
+    let (value, secret) = current_dynamic_inputs(state);
+    let value_type = value.as_ref().map(|definition| definition.parameter_type);
+    let (page, page_count) = state
         .advanced_audio
         .dynamic_form
         .as_ref()
         .map(|form| {
             (
-                form.parameters.get(form.page).is_some(),
-                form.secrets.get(form.page).is_some(),
                 form.page,
-                form.page_count(),
+                form.pages(&state.advanced_audio.config.values).len(),
             )
         })
-        .unwrap_or((false, false, 0, 0));
+        .unwrap_or((0, 0));
     for (control, available) in [
-        (state.advanced_audio.dynamic_value_editor, value_available),
-        (state.advanced_audio.dynamic_secret_editor, secret_available),
+        (
+            state.advanced_audio.dynamic_value_editor,
+            matches!(
+                value_type,
+                Some(ParameterType::Text | ParameterType::Integer | ParameterType::Number)
+            ),
+        ),
+        (
+            state.advanced_audio.dynamic_boolean,
+            value_type == Some(ParameterType::Boolean),
+        ),
+        (
+            state.advanced_audio.dynamic_select,
+            value_type == Some(ParameterType::Select),
+        ),
+        (
+            state.advanced_audio.dynamic_multi_select,
+            value_type == Some(ParameterType::MultiSelect),
+        ),
+        (
+            state.advanced_audio.dynamic_json_object,
+            value_type == Some(ParameterType::JsonObject),
+        ),
+        (
+            state.advanced_audio.dynamic_json_array,
+            value_type == Some(ParameterType::JsonArray),
+        ),
+        (state.advanced_audio.dynamic_secret_editor, secret.is_some()),
     ] {
         unsafe {
             let _ = EnableWindow(control, enabled && !generating && available);
@@ -2784,6 +4442,94 @@ pub(super) fn is_button(id: usize) -> bool {
     )
 }
 
+pub(super) fn is_dynamic_select_button(id: usize) -> bool {
+    matches!(id, ID_DYNAMIC_SELECT | ID_DYNAMIC_MULTI_SELECT)
+}
+
+pub(super) fn dynamic_select_is_open_for_draw(state: &SettingsState, id: usize) -> bool {
+    match id {
+        ID_DYNAMIC_SELECT => dynamic_select_is_open(state),
+        ID_DYNAMIC_MULTI_SELECT => dynamic_multi_select_is_open(state),
+        _ => false,
+    }
+}
+
+pub(super) fn is_dynamic_list(id: usize) -> bool {
+    matches!(id, ID_DYNAMIC_SELECT_LIST | ID_DYNAMIC_MULTI_SELECT_LIST)
+}
+
+pub(super) fn dynamic_list_item_height(id: usize, dpi: u32) -> Option<i32> {
+    match id {
+        ID_DYNAMIC_SELECT_LIST => Some(platform::scale(dropdown::ROW_HEIGHT, dpi)),
+        ID_DYNAMIC_MULTI_SELECT_LIST => Some(platform::scale(MULTI_SELECT_ROW_HEIGHT, dpi)),
+        _ => None,
+    }
+}
+
+pub(super) fn draw_dynamic_list(state: &SettingsState, item: &DRAWITEMSTRUCT) -> bool {
+    let id = if item.hwndItem == state.advanced_audio.dynamic_select_list {
+        ID_DYNAMIC_SELECT_LIST
+    } else if item.hwndItem == state.advanced_audio.dynamic_multi_select_list {
+        ID_DYNAMIC_MULTI_SELECT_LIST
+    } else {
+        item.CtlID as usize
+    };
+    let Some(definition) = current_dynamic_inputs(state).0 else {
+        return is_dynamic_list(id);
+    };
+    let matches_type = matches!(
+        (id, definition.parameter_type),
+        (ID_DYNAMIC_SELECT_LIST, ParameterType::Select)
+            | (ID_DYNAMIC_MULTI_SELECT_LIST, ParameterType::MultiSelect)
+    );
+    if !matches_type {
+        return is_dynamic_list(id);
+    }
+    let Some(option) = definition.options.get(item.itemID as usize) else {
+        return true;
+    };
+    let selected = match definition.parameter_type {
+        ParameterType::Select => {
+            dynamic_input_value(&state.advanced_audio.config.values, &definition) == option.value
+        }
+        ParameterType::MultiSelect => item.itemState.0 & ODS_SELECTED.0 != 0,
+        _ => false,
+    };
+    unsafe {
+        dropdown::draw_row(
+            item.hDC,
+            item.rcItem,
+            selected,
+            item.itemState.0 & ODS_SELECTED.0 != 0
+                || dropdown::hovered_row(item.hwndItem, item.itemID),
+            state.dpi,
+        );
+        let mut rect = item.rcItem;
+        rect.left += platform::scale(14, state.dpi);
+        rect.right -= platform::scale(8, state.dpi);
+        SetTextColor(
+            item.hDC,
+            if selected {
+                rgb(231, 250, 246)
+            } else {
+                rgb(190, 205, 208)
+            },
+        );
+        SetBkMode(item.hDC, TRANSPARENT);
+        let old = SelectObject(item.hDC, HGDIOBJ(state.font.0));
+        let mut text = wide(dynamic_option_label(option));
+        let text_len = text.len().saturating_sub(1);
+        DrawTextW(
+            item.hDC,
+            &mut text[..text_len],
+            &mut rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        SelectObject(item.hDC, old);
+    }
+    true
+}
+
 pub(super) fn is_generation_status_control(state: &SettingsState, control: HWND) -> bool {
     control == state.advanced_audio.generation_status
 }
@@ -2832,23 +4578,9 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
             );
             return;
         }
-        GenerationState::NeedsMoreInformation(_) => return,
-        GenerationState::Unsupported(message) => {
-            let text = format!(
-                "{}: {message}",
-                state.language.text("advanced_audio_unsupported")
-            );
-            paint_generation_status(state, hdc, &text, rgb(221, 183, 105));
-            return;
-        }
-        GenerationState::Failed(message) => {
-            let text = format!(
-                "{}: {message}",
-                state.language.text("advanced_audio_generation_failed")
-            );
-            paint_generation_status(state, hdc, &text, rgb(255, 142, 145));
-            return;
-        }
+        GenerationState::NeedsMoreInformation(_)
+        | GenerationState::Unsupported(_)
+        | GenerationState::Failed(_) => return,
     }
 
     if state.advanced_audio.test_requested {
@@ -3421,5 +5153,131 @@ mod tests {
             preview.targets[1].display(Language::Chinese),
             "服务端动态返回的 HTTP(S) URL（主机未知）"
         );
+    }
+
+    fn dynamic_input(
+        id: &str,
+        parameter_type: ParameterType,
+        default: Option<&str>,
+        visible_when: Option<VisibilityCondition>,
+    ) -> DynamicInput {
+        DynamicInput {
+            id: id.into(),
+            label: id.into(),
+            default: default.map(Into::into),
+            parameter_type,
+            options: Vec::new(),
+            visible_when,
+        }
+    }
+
+    #[test]
+    fn conditional_dynamic_parameters_recompute_without_clearing_hidden_values() {
+        let form = DynamicForm {
+            parameters: vec![
+                dynamic_input("enable_extra", ParameterType::Boolean, Some("false"), None),
+                dynamic_input(
+                    "extra_value",
+                    ParameterType::Text,
+                    None,
+                    Some(VisibilityCondition {
+                        parameter: "enable_extra".into(),
+                        equals: Some("true".into()),
+                        one_of: Vec::new(),
+                    }),
+                ),
+            ],
+            secrets: Vec::new(),
+            page: 0,
+        };
+        let mut values = BTreeMap::from([("extra_value".into(), "retained".into())]);
+
+        assert_eq!(form.visible_parameter_indices(&values), vec![0]);
+        assert_eq!(values.get("extra_value"), Some(&"retained".into()));
+
+        values.insert("enable_extra".into(), "true".into());
+        assert_eq!(form.visible_parameter_indices(&values), vec![0, 1]);
+
+        values.insert("enable_extra".into(), "false".into());
+        assert_eq!(form.visible_parameter_indices(&values), vec![0]);
+        assert_eq!(values.get("extra_value"), Some(&"retained".into()));
+    }
+
+    #[test]
+    fn only_condition_sources_require_dynamic_layout_refresh() {
+        let form = DynamicForm {
+            parameters: vec![
+                dynamic_input("mode", ParameterType::Select, None, None),
+                dynamic_input("note", ParameterType::Text, None, None),
+                dynamic_input(
+                    "extra",
+                    ParameterType::Text,
+                    None,
+                    Some(VisibilityCondition {
+                        parameter: "mode".into(),
+                        equals: Some("advanced".into()),
+                        one_of: Vec::new(),
+                    }),
+                ),
+            ],
+            secrets: Vec::new(),
+            page: 0,
+        };
+
+        assert!(form.has_visibility_dependents("mode"));
+        assert!(!form.has_visibility_dependents("note"));
+        assert!(!form.has_visibility_dependents("extra"));
+    }
+
+    #[test]
+    fn select_and_multi_select_receive_dedicated_pages() {
+        let form = DynamicForm {
+            parameters: vec![
+                dynamic_input("text", ParameterType::Text, None, None),
+                dynamic_input("choice", ParameterType::Select, None, None),
+                dynamic_input("choices", ParameterType::MultiSelect, None, None),
+            ],
+            secrets: vec![dynamic_input("secret", ParameterType::Text, None, None)],
+            page: 0,
+        };
+        let pages = form.pages(&BTreeMap::new());
+
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| (page.parameter_index, page.secret_index))
+                .collect::<Vec<_>>(),
+            vec![(Some(0), Some(0)), (Some(1), None), (Some(2), None)]
+        );
+    }
+
+    #[test]
+    fn json_inputs_receive_dedicated_pages_and_preserve_raw_text() {
+        let form = DynamicForm {
+            parameters: vec![
+                dynamic_input("text", ParameterType::Text, None, None),
+                dynamic_input("hotwords", ParameterType::JsonObject, None, None),
+                dynamic_input("language_hints", ParameterType::JsonArray, None, None),
+            ],
+            secrets: vec![dynamic_input("secret", ParameterType::Text, None, None)],
+            page: 0,
+        };
+        let pages = form.pages(&BTreeMap::new());
+
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| (page.parameter_index, page.secret_index))
+                .collect::<Vec<_>>(),
+            vec![(Some(0), Some(0)), (Some(1), None), (Some(2), None)]
+        );
+
+        let raw_object = "{\r\n  \"term\": [\"alpha\", \"beta\"]\r\n}";
+        let raw_array = "[\r\n  \"zh\",\r\n  \"en\"\r\n]";
+        let mut values = BTreeMap::new();
+        store_dynamic_input_value(&mut values, "hotwords", raw_object.into());
+        store_dynamic_input_value(&mut values, "language_hints", raw_array.into());
+        assert_eq!(values.get("hotwords"), Some(&raw_object.into()));
+        assert_eq!(values.get("language_hints"), Some(&raw_array.into()));
     }
 }

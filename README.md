@@ -191,7 +191,7 @@ stateDiagram-v2
 - Legacy ASR endpoints must accept `multipart/form-data` and return JSON.
 - The Legacy Audio API treats only HTTP 200 as success; Rewrite accepts successful status codes and requires a parseable, nonempty text result.
 - The optional Advanced Audio API supports bounded request, streaming-response, asynchronous polling, and WebSocket realtime workflows. It may use HTTP, HTTPS, WebSocket, or secure WebSocket endpoints; localhost and LAN targets are allowed.
-- Advanced Audio API version 1 does not support gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflows, branches, loops, user scripts, custom signer code, provider-specific realtime resume, or foreground insertion of live partial text.
+- The current Advanced Audio API boundary does not support gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflows, branches, loops, user scripts, custom signer code, provider-specific realtime resume, or foreground insertion of live partial text.
 - The HTTP client does not use the system proxy, automatically follow redirects, or enable automatic response compression.
 - Embedded libav runs on a blocking worker thread, with cancellation callbacks integrated into decoding, interval processing, and file I/O. Cleanup waits for the worker thread to close its output.
 - Transcription and Rewrite share the existing text output flow, which uses the focus and selection at the time of insertion. Changing focus while waiting changes the final output target; the program does not restore the window or selection from when the task was triggered.
@@ -267,7 +267,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 |---|---|
 | Display | Interface language, configuration file location, floating window opacity, and floating window scale |
 | Audio API | Legacy endpoint, Token, model, language, prompt, text path, and extra fields |
-| Advanced Audio API | Enable switch, workflow generation and validation, declared Values and Secrets, raw Workflow JSON, Remote hosting, and Test workflow |
+| Advanced Audio API | Enable switch, separate user-requirements and vendor-material inputs, workflow generation and validation, typed Values including JSON-object and JSON-array editors with conditional display, Secrets, raw Workflow JSON, Remote hosting, and Test workflow |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
 | Rewrite API | Provider, Base URL, API Key, Model, prompt list, ADD PROMPT, and connectivity test |
 | Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API |
@@ -338,15 +338,19 @@ Core passes diagnostics to the GUI through an optional receiver interface; the l
 
 Advanced Audio API is a bounded, declarative ASR protocol workflow. It is disabled by default: an absent `ADVANCED_AUDIO_API` key, or `ADVANCED_AUDIO_API.enabled=false`, preserves the existing Legacy Audio API without migration. When Advanced Audio API is enabled, its validated workflow takes precedence for transcription. `API_ENDPOINT`, `TOKEN`, `MODEL`, `LANGUAGE`, `PROMPT`, `TEXT_PATH`, and `ExtraConfig` remain stored and editable as Legacy settings but do not participate in Advanced transcription.
 
-`dictate-core` owns the serializable schema, validation, transports, remote-audio handling, signing, cancellation, and execution. GUI and CLI use that same Core engine. The GUI can generate a workflow from vendor documentation or request/response examples through the configured Rewrite API; CLI has no workflow generator and does not require an LLM to execute a saved workflow.
+`dictate-core` owns the serializable schema, validation, transports, remote-audio handling, signing, cancellation, and execution. GUI and CLI use that same Core engine. The GUI can generate a workflow through the configured Rewrite API from separately supplied user requirements and vendor documentation or request/response examples; CLI has no workflow generator and does not require an LLM to execute a saved workflow.
 
 ### Workflow and settings
 
-The GUI's **Advanced Audio API** page lets you paste vendor material, generate a workflow, inspect its summary and warnings, validate it, edit its raw Workflow JSON, and configure Remote hosting. Generated output must pass the Core validator; a failed generated workflow receives at most one repair attempt. Vendor material is best-effort redacted locally before generation.
+The GUI's **Advanced Audio API** page has separate fields for optional user requirements or preferences and vendor material, then lets you generate a workflow, inspect its summary and warnings, validate it, edit its raw Workflow JSON, and configure Remote hosting. The application, rather than text embedded in either field, assigns those roles. Both inputs are best-effort redacted locally and sent as structured data to the configured Rewrite service. There is no client-side character cap; the Rewrite service can still reject a request that exceeds its own request or token limits. Generated output must pass the Core validator; a failed generated workflow receives at most one repair attempt.
+
+User requirements can express a preference only among protocol facts established by the vendor material and supported by the schema. They cannot override the schema, safety rules, or required output format, and the compiler prompt directs it to use instructions embedded in vendor material only as reference data rather than compiler instructions. If vendor material does not establish a requested field's request location and required wire shape, the compiler is directed to return `needs_more_information`; it is directed to return `unsupported` only when the material establishes a necessary protocol requirement that the schema cannot express. This input classification and prompt constraint does not claim that an LLM is immune to every prompt-injection attempt. It preserves a distinct place for the user's stated goal without guessing that a document's beginning or end is a separate instruction.
 
 When Advanced Audio API is enabled, the Legacy Audio API page remains editable and displays that its settings are not used for transcription.
 
-The workflow declares its own **Values** and **Secrets**. The GUI creates controls from those declarations, stores their values separately from the workflow, and masks secret input. Core validation checks schema version, template references, declaration IDs, stage ordering, delivery compatibility, and remote-hosting requirements before any network request. Workflows cannot run arbitrary code, scripts, shells, branches, loops, or arbitrary local-file paths.
+Newly generated workflows use schema version 2; previously saved version-1 workflows remain supported as text-only parameters and are not silently migrated. A workflow declares its own **Values** and **Secrets**. The GUI creates text, integer, number, boolean, single-select, multi-select, JSON-object, and JSON-array controls from version-2 declarations, stores their values separately from the workflow, and masks secret input. JSON-object and JSON-array controls are scrollable multiline JSON editors and each receives a dedicated dynamic-form page. Selection options come from the workflow. A bounded `visible_when` condition can change only GUI presentation based on an earlier unconditional boolean or single-select value; it creates no request branch, hidden values are retained, and normal required-value checks still apply.
+
+Configuration storage keeps Values as strings. A multi-select is a string containing a JSON string array; `json_object` and `json_array` are strings containing a JSON object and JSON array respectively. In a version-2 JSON body or realtime JSON message, a whole leaf exactly equal to `{{var:id}}` can render an integer, number, boolean, multi-select, JSON-object, or JSON-array value as its native JSON type. Ordinary scalar values in other template positions render as text. `multi_select`, `json_object`, and `json_array` are rejected before network I/O in a mixed JSON string or any string template context: HTTP URL, query, header, URL-encoded form, multipart text or bytes, raw bytes, WebSocket connection URL/query/header/subprotocol, and realtime text or binary messages. They are never silently joined, stringified, or otherwise serialized. Core validation checks schema version, parameter values, template references, declaration IDs, stage ordering, delivery compatibility, and remote-hosting requirements before any network request. Workflows cannot run arbitrary code, scripts, shells, branches, loops, or arbitrary local-file paths.
 
 The configuration stores the enabled state, workflow, Values, Secrets, and Remote hosting under `ADVANCED_AUDIO_API`. Do not hand-write a workflow from an informal example; use the schema and contract below as the source of truth.
 
@@ -368,11 +372,11 @@ Cancellation covers uploads, HTTP request and response work, poll waits, result 
 
 For a realtime workflow, Dictate streams paced `pcm_s16le` microphone audio while retaining the complete local WAV. `unbounded` pacing and `keep_session` pause behavior are rejected. Pausing finalizes the current session and resuming starts a new one. A live network failure, or cancellation during live finalization, discards partial/committed live transcript state, finishes recording, then replays the complete WAV from byte zero in a fresh session. Retrying likewise starts a fresh replay session from zero. Partial text is never sent to the foreground application; only one final transcript uses the normal clipboard or SendInput output. CLI `--file` can run a realtime workflow as recorded replay.
 
-### Testing, diagnostics, and version-1 boundary
+### Testing, diagnostics, and current boundary
 
 **Test workflow** shows the target hosts, remote-upload requirement, recognition mode, and whether the test is recorded realtime replay before the user confirms network access. After confirmation, it uses fixed short audio through the same Core workflow. `UPLOAD_DEBUG` records only fixed Advanced phase labels: it does not log rendered URLs, query strings, headers, request or response bodies, audio, captures, transcripts, Secrets, storage credentials, signatures, or presigned URLs.
 
-Version 1 intentionally excludes gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflow stages/branches/loops, user scripts, custom signer code, provider-specific realtime resume, and foreground insertion of live partial text.
+The current implementation intentionally excludes gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflow stages/branches/loops, user scripts, custom signer code, provider-specific realtime resume, and foreground insertion of live partial text.
 
 ## Command-line interface
 
@@ -1138,6 +1142,7 @@ FFmpeg 8.1 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoder
 ## Security and privacy
 
 - Recording and transcoding take place locally. Legacy converted audio is sent to `API_ENDPOINT`; Advanced audio or its declared remote reference is sent to the workflow's configured targets. When Rewrite is triggered, text copied from the target application, the prompt, and extra parameters are sent to the configured Rewrite service; reading temporarily changes the clipboard, and its backup is restored before the request is sent.
+- When generating an Advanced workflow, optional user requirements and vendor material are best-effort redacted locally, then sent as separate structured fields to the configured Rewrite service. Their contents cannot change their application-assigned roles or override the workflow compiler's schema and safety rules. The GUI imposes no manual length limit, but the service's request or token limits can still reject the input.
 - `TOKEN`, `REWRITE.api_key`, each prompt's `api_key`, Advanced Secrets, and remote-storage credentials are stored in plain text in the JSON configuration. The GUI's password fields only mask their display and provide no encryption on disk.
 - Keep `VERIFY_SSL=true` for public services.
 - `VERIFY_SSL=false` accepts invalid certificates, potentially exposing connections to man-in-the-middle attacks.

@@ -10,9 +10,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use tokio_util::sync::CancellationToken;
 
 use crate::advanced_audio::auth::{BuiltinRequestSigner, SigningRequest};
-use crate::advanced_audio::schema::RealtimeConnect;
+use crate::advanced_audio::http::{TypedTemplateRenderError, render_text_with_context};
+use crate::advanced_audio::schema::{ParameterDefinition, RealtimeConnect, WorkflowSchemaVersion};
 use crate::advanced_audio::template::{
-    AudioTemplateValues, RuntimeTemplateValues, Template, TemplateContext, TemplateError,
+    AudioTemplateValues, RuntimeTemplateValues, TemplateContext, TemplateError,
 };
 
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -32,18 +33,20 @@ impl WebSocketTransport {
         values: &BTreeMap<String, String>,
         secrets: &BTreeMap<String, String>,
         runtime: &RuntimeTemplateValues,
+        parameters: &[ParameterDefinition],
+        schema_version: WorkflowSchemaVersion,
         cancellation: &CancellationToken,
     ) -> Result<Self, WebSocketError> {
         if cancellation.is_cancelled() {
             return Err(WebSocketError::Canceled);
         }
         let context = template_context(values, secrets, runtime, None);
-        let raw_url = render(&connect.url, &context)?;
+        let raw_url = render(&connect.url, &context, parameters, schema_version)?;
         let mut url = reqwest::Url::parse(&raw_url).map_err(|_| WebSocketError::InvalidUrl)?;
         {
             let mut pairs = url.query_pairs_mut();
             for (name, value) in &connect.query {
-                pairs.append_pair(name, &render(value, &context)?);
+                pairs.append_pair(name, &render(value, &context, parameters, schema_version)?);
             }
         }
 
@@ -51,8 +54,13 @@ impl WebSocketTransport {
         for (name, value) in &connect.headers {
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| WebSocketError::InvalidHeaderName)?;
-            let value = reqwest::header::HeaderValue::from_str(&render(value, &context)?)
-                .map_err(|_| WebSocketError::InvalidHeaderValue)?;
+            let value = reqwest::header::HeaderValue::from_str(&render(
+                value,
+                &context,
+                parameters,
+                schema_version,
+            )?)
+            .map_err(|_| WebSocketError::InvalidHeaderValue)?;
             signing_headers.insert(name, value);
         }
         signing_headers.insert(
@@ -60,8 +68,13 @@ impl WebSocketTransport {
             reqwest::header::HeaderValue::from_static("dictate-client/advanced-audio-v1"),
         );
         if let Some(subprotocol) = &connect.subprotocol {
-            let value = reqwest::header::HeaderValue::from_str(&render(subprotocol, &context)?)
-                .map_err(|_| WebSocketError::InvalidHeaderValue)?;
+            let value = reqwest::header::HeaderValue::from_str(&render(
+                subprotocol,
+                &context,
+                parameters,
+                schema_version,
+            )?)
+            .map_err(|_| WebSocketError::InvalidHeaderValue)?;
             signing_headers.insert(
                 reqwest::header::HeaderName::from_static("sec-websocket-protocol"),
                 value,
@@ -182,10 +195,21 @@ pub(super) fn template_context<'a>(
     }
 }
 
-pub(super) fn render(input: &str, context: &TemplateContext<'_>) -> Result<String, WebSocketError> {
-    Template::parse(input)
-        .and_then(|template| template.render(context))
-        .map_err(WebSocketError::Template)
+pub(super) fn render(
+    input: &str,
+    context: &TemplateContext<'_>,
+    parameters: &[ParameterDefinition],
+    schema_version: WorkflowSchemaVersion,
+) -> Result<String, WebSocketError> {
+    render_text_with_context(input, context, parameters, schema_version)
+        .map_err(map_template_render_error)
+}
+
+fn map_template_render_error(error: TypedTemplateRenderError) -> WebSocketError {
+    match error {
+        TypedTemplateRenderError::Template(error) => WebSocketError::Template(error),
+        error => WebSocketError::TypedTemplate(error.to_string()),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -208,4 +232,168 @@ pub enum WebSocketError {
     Canceled,
     #[error("realtime websocket template failed: {0}")]
     Template(#[source] TemplateError),
+    #[error("realtime websocket typed parameter failed: {0}")]
+    TypedTemplate(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::advanced_audio::CURRENT_SCHEMA_VERSION;
+    use crate::advanced_audio::schema::{ParameterDefinition, ParameterType, SignerConfig};
+
+    #[tokio::test]
+    async fn multi_select_connection_template_is_rejected_before_network_io() {
+        let connect = RealtimeConnect {
+            url: "ws://{{var:languages}}/realtime".into(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            signer: SignerConfig::None,
+            subprotocol: None,
+        };
+        let values = BTreeMap::from([("languages".into(), r#"["zh","en"]"#.into())]);
+        let parameters = [ParameterDefinition {
+            id: "languages".into(),
+            label: "Languages".into(),
+            required: false,
+            default: None,
+            description: None,
+            parameter_type: Some(ParameterType::MultiSelect),
+            options: vec![],
+            visible_when: None,
+        }];
+        let secrets = BTreeMap::new();
+        let runtime = RuntimeTemplateValues::default();
+
+        let error = WebSocketTransport::connect(
+            &connect,
+            &values,
+            &secrets,
+            &runtime,
+            &parameters,
+            WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+            &CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("multi_select URL use must fail before attempting a connection");
+
+        match error {
+            WebSocketError::TypedTemplate(message) => {
+                assert!(message.contains("languages"));
+                assert!(!message.contains("zh"));
+                assert!(!message.contains("en"));
+            }
+            error => panic!("expected typed template error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_object_and_array_connection_fields_are_rejected_before_network_io() {
+        let vocabulary = r#"{"wake_phrase":"redacted-vocabulary"}"#;
+        let language_hints = r#"["redacted-language-hint"]"#;
+        let values = BTreeMap::from([
+            ("vocabulary".into(), vocabulary.into()),
+            ("language_hints".into(), language_hints.into()),
+        ]);
+        let parameters = [
+            ParameterDefinition {
+                id: "vocabulary".into(),
+                label: "Vocabulary".into(),
+                required: false,
+                default: None,
+                description: None,
+                parameter_type: Some(ParameterType::JsonObject),
+                options: vec![],
+                visible_when: None,
+            },
+            ParameterDefinition {
+                id: "language_hints".into(),
+                label: "Language hints".into(),
+                required: false,
+                default: None,
+                description: None,
+                parameter_type: Some(ParameterType::JsonArray),
+                options: vec![],
+                visible_when: None,
+            },
+        ];
+        let secrets = BTreeMap::new();
+        let runtime = RuntimeTemplateValues::default();
+        let cancellation = CancellationToken::new();
+        let static_url = "ws://127.0.0.1:1/realtime";
+        let connections = vec![
+            (
+                "URL",
+                RealtimeConnect {
+                    url: "ws://{{var:vocabulary}}/realtime".into(),
+                    query: BTreeMap::new(),
+                    headers: BTreeMap::new(),
+                    signer: SignerConfig::None,
+                    subprotocol: None,
+                },
+                "vocabulary",
+                vocabulary,
+            ),
+            (
+                "query",
+                RealtimeConnect {
+                    url: static_url.into(),
+                    query: BTreeMap::from([("languages".into(), "{{var:language_hints}}".into())]),
+                    headers: BTreeMap::new(),
+                    signer: SignerConfig::None,
+                    subprotocol: None,
+                },
+                "language_hints",
+                language_hints,
+            ),
+            (
+                "header",
+                RealtimeConnect {
+                    url: static_url.into(),
+                    query: BTreeMap::new(),
+                    headers: BTreeMap::from([("x-vocabulary".into(), "{{var:vocabulary}}".into())]),
+                    signer: SignerConfig::None,
+                    subprotocol: None,
+                },
+                "vocabulary",
+                vocabulary,
+            ),
+            (
+                "subprotocol",
+                RealtimeConnect {
+                    url: static_url.into(),
+                    query: BTreeMap::new(),
+                    headers: BTreeMap::new(),
+                    signer: SignerConfig::None,
+                    subprotocol: Some("{{var:language_hints}}".into()),
+                },
+                "language_hints",
+                language_hints,
+            ),
+        ];
+
+        for (field, connect, id, stored) in connections {
+            let error = WebSocketTransport::connect(
+                &connect,
+                &values,
+                &secrets,
+                &runtime,
+                &parameters,
+                WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION),
+                &cancellation,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{field} must fail before opening a connection"));
+
+            match error {
+                WebSocketError::TypedTemplate(message) => {
+                    assert!(message.contains(id));
+                    assert!(!message.contains(stored));
+                }
+                error => panic!("expected {field} template error, got {error:?}"),
+            }
+        }
+    }
 }

@@ -20,12 +20,19 @@ keeps all existing `API_ENDPOINT`, `TOKEN`, `MODEL`, `LANGUAGE`, `PROMPT`,
 
 ## Versioning and configuration
 
-The current workflow schema version is `1`. A workflow must include
+The GUI compiler prompt requests schema version `2` for newly generated
+workflows. This build accepts both versions `1` and `2`. A workflow must include
 `schema_version`, `name`, `audio`, and `recognition`; `parameters` and
 `secrets` may be omitted and then default to empty arrays. When Advanced is
 enabled, or when a workflow is explicitly validated, an unknown schema version
 fails explicitly. It is never guessed or silently executed. A disabled draft is
 inert so a user can retain it while using Legacy.
+
+Version 1 remains supported for existing saved workflows without automatic
+upgrade. Its parameter declarations are text-only and must not contain the
+version-2 `type`, `options`, or `visible_when` fields. Version 2 requires a
+`type` for every parameter and adds the finite typed-input model described
+below.
 
 `ADVANCED_AUDIO_API` has this stored shape:
 
@@ -40,9 +47,69 @@ inert so a user can retain it while using Legacy.
 ```
 
 Values and secrets are separate from the workflow. A workflow declares their
-IDs, labels, required state, and optional value defaults. Defaults are literal
-strings, not a second template-evaluation phase. A workflow must never embed a
-real credential.
+IDs, labels, required state, and optional value defaults. `values` remains a
+map of strings even for version-2 parameters, preserving the stored
+configuration shape. Defaults are likewise literal strings, not a second
+template-evaluation phase. A workflow must never embed a real credential.
+
+For example, a version-2 configuration can store an integer, a boolean, a
+multi-select value, a JSON object, and a JSON array as follows:
+
+```json
+{
+  "sample_rate": "16000",
+  "timestamps": "true",
+  "languages": "[\"zh\",\"en\"]",
+  "vocabulary": "{\"wake_phrase\":\"Dictate\"}",
+  "language_hints": "[\"zh\",\"en\"]"
+}
+```
+
+## Dynamic parameters and rendering
+
+Version 2 supports the parameter types `text`, `integer`, `number`,
+`boolean`, `select`, `multi_select`, `json_object`, and `json_array`. The GUI
+presents text, integer, and number values as text inputs; boolean as a
+checkbox; `select` as a single choice; `multi_select` as a multiple-choice
+list; and `json_object` or `json_array` as a scrollable multiline JSON editor.
+The two JSON editors each occupy a dedicated dynamic-form page. `select` and
+`multi_select` require a nonempty set of distinct `options`, each with a stable
+string `value` and a display `label`; options are not valid for JSON-object or
+JSON-array parameters.
+
+The stored string must be valid for its declared type: `integer` and `number`
+use JSON number text, `boolean` is exactly `true` or `false`, and `select`
+uses one declared option value. A `multi_select` value or default is a string
+whose contents are a JSON array of distinct declared option values, such as
+`"[\"zh\",\"en\"]"`. A `json_object` value or default is a string whose
+contents parse as a JSON object; a `json_array` value or default is a string
+whose contents parse as a JSON array. None of these is stored as a raw JSON
+value in configuration.
+
+Typed conversion is deliberately narrow. In a version-2 JSON body or JSON
+realtime message, only a JSON string leaf that is exactly `{{var:id}}` renders
+as that parameter's native JSON value: integers and numbers become JSON
+numbers, booleans become JSON booleans, `multi_select` and `json_array` become
+JSON arrays, and `json_object` becomes a JSON object. `text` and `select`
+remain JSON strings. A variable embedded in a larger JSON string renders as
+text only for scalar types. Version-1 variables remain text even when they
+occupy a complete JSON leaf.
+
+`multi_select` has no implicit CSV or other text serialization; `json_object`
+and `json_array` have no text serialization at all. All three are rejected
+before network I/O if used in a JSON string other than a complete leaf or in
+any string template context, including HTTP URL, query, and header values,
+URL-encoded forms, multipart text or bytes, raw bytes, WebSocket connection
+URL/query/header/subprotocol fields, and realtime text or binary messages.
+This avoids silently changing the provider request shape.
+
+`visible_when` is version-2 GUI presentation metadata only. It contains a
+source parameter plus exactly one of `equals` or a nonempty `one_of` array. The
+source must be an earlier, unconditional boolean or `select` parameter with a
+default, and comparison values must belong to that source's domain. A visibility
+condition creates neither a workflow branch nor conditional request fields.
+When a control becomes hidden, its stored value remains present and normal
+required-value validation still applies.
 
 ## Bounded protocol model
 
@@ -106,9 +173,10 @@ The only supported template values are:
 {{runtime:uuid}}        {{runtime:unix_seconds}} {{runtime:unix_millis}}
 ```
 
-There are no template functions, expressions, conditionals, loops, scripts,
-environment variables, file references, shells, registry access, dynamic DLLs,
-or arbitrary disk writes. The validator verifies declared variables/secrets,
+There are no template functions, expressions, request-time conditionals, loops,
+scripts, environment variables, file references, shells, registry access,
+dynamic DLLs, or arbitrary disk writes. The validator verifies declared
+variables/secrets,
 capture ordering, fixed namespaces, and compatible audio placeholders before
 any network connection is made. The workflow cannot select an arbitrary local
 path: audio comes only from the current prepared recording, recorder stream,
@@ -139,7 +207,8 @@ into the foreground application.
 ## Remote audio hosting
 
 Remote hosting is configured in Advanced settings rather than embedded in a
-workflow. Version 1 supports WebDAV, S3-Compatible storage, and Aliyun OSS.
+workflow. The current implementation supports WebDAV, S3-Compatible storage,
+and Aliyun OSS.
 WebDAV keeps its upload endpoint separate from the public HTTPS download URL,
 and can provide only `public_https_url`. S3-Compatible and Aliyun OSS can
 provide a public HTTPS URL or their respective cloud URI; neither representation
@@ -153,7 +222,7 @@ outcome. Once an upload request has been issued, an upload failure, failed
 recognition, or cancellation forces a best-effort DELETE regardless of that
 setting, while retaining the original error.
 
-## Realtime version-1 behavior
+## Realtime behavior
 
 Only WebSocket realtime is implemented. It accepts `pcm_s16le`, realtime
 pacing, 1–8 channels, sample rates from 1 to 384000 Hz, and chunk durations
@@ -166,6 +235,40 @@ partial and committed transcript state, completes the local recording, and
 replays the audio from zero. Each replay retry creates a fresh session from
 audio zero, never merging partial text from an earlier attempt.
 
+## GUI workflow-generation input
+
+The GUI keeps the user's intended outcome or preferences separate from vendor
+documentation and request/response examples. Before calling the configured
+Rewrite API, it applies best-effort credential redaction to both inputs and
+serializes them as application-generated data:
+
+```json
+{
+  "input_version": 1,
+  "user_requirements": "...",
+  "vendor_material": "..."
+}
+```
+
+The application assigns each role from the envelope fields; labels, delimiters,
+or role claims inside either string do not change that classification. The
+compiler prompt directs it to treat both fields as data rather than
+instructions: `user_requirements` may influence only choices documented by
+`vendor_material` and supported by the schema, while `vendor_material` is used
+only as evidence for protocol facts. If vendor material does not establish a
+requested field's request location and required wire shape, the prompt directs
+the compiler to return `needs_more_information`; it directs `unsupported` only
+when vendor material explicitly establishes a necessary protocol requirement or
+JSON shape that the supplied schema cannot express. The prompt does not
+authorize either field to override the schema, safety rules, or required JSON
+output shape. This input classification and prompt constraint is not a claim
+that an LLM is immune to every prompt-injection attempt.
+
+The GUI does not impose a manual character limit on either input. The native
+multiline controls use their maximum supported text limit, so a request that is
+too large is left for the configured Rewrite API to reject according to its own
+request or token limits.
+
 ## Privacy, diagnostics, and limits
 
 With `UPLOAD_DEBUG`, Advanced operations log only fixed phase labels. They do
@@ -174,8 +277,9 @@ transcripts. Workflow secrets, remote-storage credentials, URL userinfo/query
 credentials, presigned URLs, AWS/TC3 signatures, and values from sensitive
 captures are redacted before diagnostic or error-response paths. Debug output
 for Advanced config and remote references also redacts credentials and cleanup
-details. Before sending vendor material to Rewrite for GUI workflow generation,
-the GUI applies best-effort credential redaction.
+details. Before sending GUI workflow-generation input to Rewrite, the GUI
+applies best-effort credential redaction to both user requirements and vendor
+material.
 
 The bounded limits are: workflow JSON 256 KiB; one template 32 KiB; at most
 64 parameters, secrets, headers, query entries, captures, or stream rules; at
@@ -189,7 +293,7 @@ HTTP workflows may use `http` or `https`, and WebSocket workflows may use
 `ws` or `wss`; localhost and LAN targets are allowed. A
 `public_https_url` remains HTTPS-only.
 
-## Deliberately unsupported in version 1
+## Deliberately unsupported
 
 - gRPC and custom HTTP/2 event streams;
 - callback-only or webhook-only completion;

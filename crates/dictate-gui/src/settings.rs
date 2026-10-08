@@ -623,6 +623,9 @@ unsafe extern "system" fn settings_proc(
     if rewrite::handle_message(state, message, wparam, lparam) {
         return LRESULT(0);
     }
+    if advanced_audio::handle_message(state, message, wparam, lparam) {
+        return LRESULT(0);
+    }
     match message {
         WM_CREATE => {
             if let Err(error) = create_controls(state) {
@@ -673,6 +676,7 @@ unsafe extern "system" fn settings_proc(
             {
                 hotkeys::deactivate();
                 rewrite::close_provider(state);
+                advanced_audio::close_dynamic_select(state);
                 set_language_dropdown(state, false);
                 audio::close_all(state);
                 if let Some(picker) = &mut state.microphone {
@@ -737,6 +741,7 @@ unsafe extern "system" fn settings_proc(
         }
         WM_LBUTTONDOWN => {
             rewrite::close_provider(state);
+            advanced_audio::close_dynamic_select(state);
             audio::close_all(state);
             if let Some(picker) = &mut state.microphone {
                 picker.set_open(false, state.language, state.dpi);
@@ -756,6 +761,9 @@ unsafe extern "system" fn settings_proc(
             if rewrite::draw(state, item) {
                 return LRESULT(1);
             }
+            if advanced_audio::draw_dynamic_list(state, item) {
+                return LRESULT(1);
+            }
             if item.CtlID as usize == ID_MICROPHONE_LIST {
                 if let Some(picker) = &state.microphone {
                     picker.draw(state, item);
@@ -772,7 +780,12 @@ unsafe extern "system" fn settings_proc(
         windows::Win32::UI::WindowsAndMessaging::WM_MEASUREITEM => {
             let item =
                 unsafe { &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT) };
-            if item.CtlID as usize == ID_MICROPHONE_LIST
+            if let Some(height) =
+                advanced_audio::dynamic_list_item_height(item.CtlID as usize, state.dpi)
+            {
+                item.itemHeight = height as u32;
+                LRESULT(1)
+            } else if item.CtlID as usize == ID_MICROPHONE_LIST
                 || item.CtlID as usize == rewrite::ID_PROMPTS
                 || (audio::ID_LIST_BASE..audio::ID_LIST_BASE + 6).contains(&(item.CtlID as usize))
             {
@@ -960,6 +973,7 @@ unsafe extern "system" fn settings_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            advanced_audio::destroy(state);
             state.connectivity_cancel.cancel();
             advanced_audio::cancel_generation(state);
             hotkeys::deactivate();
@@ -1674,6 +1688,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         if id == ID_LANGUAGE
             || id == rewrite::ID_PROVIDER
             || id == ID_MICROPHONE
+            || advanced_audio::is_dynamic_select_button(id)
             || state
                 .audio_pickers
                 .iter()
@@ -1685,6 +1700,8 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
                 state.rewrite.provider_open
             } else if id == ID_MICROPHONE {
                 state.microphone.as_ref().is_some_and(|p| p.open)
+            } else if advanced_audio::is_dynamic_select_button(id) {
+                advanced_audio::dynamic_select_is_open_for_draw(state, id)
             } else {
                 state
                     .audio_pickers
@@ -1984,6 +2001,11 @@ unsafe fn draw_button_text(
     right_padding: i32,
 ) {
     let text = read_text(item.hwndItem);
+    // The button chrome is already painted by the caller. Avoid sending an
+    // empty Rust slice through the Win32 text-drawing FFI for a blank caption.
+    if text.is_empty() {
+        return;
+    }
     let mut text = text.encode_utf16().collect::<Vec<_>>();
     let mut rect = item.rcItem;
     rect.left += left_padding;

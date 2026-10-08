@@ -5,6 +5,9 @@ mod request;
 mod response;
 
 pub use body::{BodyError, PreparedAudio, StageContext};
+pub(crate) use body::{
+    TypedTemplateRenderError, render_json_with_context, render_text_with_context,
+};
 pub use request::{HttpEngine, HttpEngineError};
 pub use response::{HttpResponseData, ResponseReadError, read_response_limited};
 

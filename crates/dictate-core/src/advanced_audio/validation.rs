@@ -9,9 +9,9 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::CURRENT_SCHEMA_VERSION;
 use super::schema::*;
 use super::template::{AudioPlaceholder, Placeholder, Template, is_identifier};
+use super::{CURRENT_SCHEMA_VERSION, LEGACY_SCHEMA_VERSION, is_supported_schema_version};
 
 const MAX_WORKFLOW_NAME_BYTES: usize = 256;
 const MAX_WORKFLOW_JSON_BYTES: usize = 256 * 1024;
@@ -116,7 +116,19 @@ pub fn validate_advanced_audio_config(
     };
     validate_workflow_into(workflow, &mut errors);
     validate_config_values(config, workflow, &mut errors);
-    validate_remote_audio(config, workflow, &mut errors);
+    validate_remote_audio(&config.remote_audio, workflow, &mut errors);
+    errors.finish()
+}
+
+/// Validates only whether a remote-audio configuration can satisfy a
+/// workflow's selected delivery form.  GUI drafts can use this without
+/// inventing placeholder values for required typed parameters or secrets.
+pub fn validate_remote_audio_config(
+    workflow: &AdvancedAudioWorkflow,
+    remote_audio: &RemoteAudioConfig,
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationErrors::default();
+    validate_remote_audio(remote_audio, workflow, &mut errors);
     errors.finish()
 }
 
@@ -130,12 +142,12 @@ fn validate_workflow_into(workflow: &AdvancedAudioWorkflow, errors: &mut Validat
             format!("serialized workflow exceeds {MAX_WORKFLOW_JSON_BYTES} bytes"),
         );
     }
-    if workflow.schema_version.0 != CURRENT_SCHEMA_VERSION {
+    if !is_supported_schema_version(workflow.schema_version.0) {
         errors.push(
             "schema_version",
             format!(
-                "Unsupported Workflow Schema Version {}; this build supports {}",
-                workflow.schema_version.0, CURRENT_SCHEMA_VERSION
+                "Unsupported Workflow Schema Version {}; this build supports {} and {}",
+                workflow.schema_version.0, LEGACY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
             ),
         );
     }
@@ -164,8 +176,18 @@ fn validate_workflow_into(workflow: &AdvancedAudioWorkflow, errors: &mut Validat
             &mut parameters,
             errors,
         );
-        if let Some(default) = &definition.default {
-            validate_literal_default(default, &format!("{path}.default"), errors);
+        validate_parameter_definition(definition, workflow.schema_version, &path, errors);
+    }
+    if workflow.schema_version.0 == CURRENT_SCHEMA_VERSION {
+        for (index, definition) in workflow.parameters.iter().enumerate() {
+            if let Some(condition) = &definition.visible_when {
+                validate_visibility_condition(
+                    condition,
+                    &workflow.parameters[..index],
+                    &format!("parameters[{index}].visible_when"),
+                    errors,
+                );
+            }
         }
     }
 
@@ -359,6 +381,207 @@ fn validate_definition(
     }
 }
 
+fn validate_parameter_definition(
+    definition: &ParameterDefinition,
+    schema_version: WorkflowSchemaVersion,
+    path: &str,
+    errors: &mut ValidationErrors,
+) {
+    match schema_version.0 {
+        LEGACY_SCHEMA_VERSION => {
+            if definition.parameter_type.is_some() {
+                errors.push(
+                    format!("{path}.type"),
+                    "is only supported by workflow schema version 2",
+                );
+            }
+            if !definition.options.is_empty() {
+                errors.push(
+                    format!("{path}.options"),
+                    "is only supported by workflow schema version 2",
+                );
+            }
+            if definition.visible_when.is_some() {
+                errors.push(
+                    format!("{path}.visible_when"),
+                    "is only supported by workflow schema version 2",
+                );
+            }
+            if let Some(default) = &definition.default {
+                validate_literal_default(default, &format!("{path}.default"), errors);
+            }
+        }
+        CURRENT_SCHEMA_VERSION => {
+            let Some(parameter_type) = definition.parameter_type else {
+                errors.push(
+                    format!("{path}.type"),
+                    "is required for workflow schema version 2",
+                );
+                return;
+            };
+            validate_parameter_options(definition, parameter_type, path, errors);
+            if let Some(default) = &definition.default {
+                validate_literal_parameter_value(
+                    definition,
+                    schema_version,
+                    default,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+        }
+        _ => {
+            // Version support has already been reported above.  Do not infer
+            // a future schema's type/default semantics from this build.
+        }
+    }
+}
+
+fn validate_parameter_options(
+    definition: &ParameterDefinition,
+    parameter_type: ParameterType,
+    path: &str,
+    errors: &mut ValidationErrors,
+) {
+    let selection = matches!(
+        parameter_type,
+        ParameterType::Select | ParameterType::MultiSelect
+    );
+    if !selection {
+        if !definition.options.is_empty() {
+            errors.push(
+                format!("{path}.options"),
+                "is allowed only for select or multi_select parameters",
+            );
+        }
+        return;
+    }
+    if definition.options.is_empty() {
+        errors.push(
+            format!("{path}.options"),
+            "must contain at least one option for a selection parameter",
+        );
+        return;
+    }
+    let mut values = BTreeSet::new();
+    for (index, option) in definition.options.iter().enumerate() {
+        let option_path = format!("{path}.options[{index}]");
+        validate_text(
+            &option.value,
+            &format!("{option_path}.value"),
+            true,
+            256,
+            errors,
+        );
+        validate_text(
+            &option.label,
+            &format!("{option_path}.label"),
+            true,
+            256,
+            errors,
+        );
+        if !values.insert(option.value.clone()) {
+            errors.push(
+                format!("{option_path}.value"),
+                format!("duplicate option value '{}'", option.value),
+            );
+        }
+    }
+}
+
+fn validate_visibility_condition(
+    condition: &VisibilityCondition,
+    preceding: &[ParameterDefinition],
+    path: &str,
+    errors: &mut ValidationErrors,
+) {
+    if !is_identifier(&condition.parameter) {
+        errors.push(format!("{path}.parameter"), "must be an ASCII identifier");
+    }
+    let has_equals = condition.equals.is_some();
+    let has_one_of = !condition.one_of.is_empty();
+    if has_equals == has_one_of {
+        errors.push(
+            path,
+            "must contain exactly one of equals or a nonempty one_of array",
+        );
+        return;
+    }
+    let Some(source) = preceding
+        .iter()
+        .rev()
+        .find(|definition| definition.id == condition.parameter)
+    else {
+        errors.push(
+            format!("{path}.parameter"),
+            "must reference an earlier unconditional boolean or select parameter",
+        );
+        return;
+    };
+    if source.visible_when.is_some() {
+        errors.push(
+            format!("{path}.parameter"),
+            "must reference an unconditional parameter",
+        );
+    }
+    if source.default.is_none() {
+        errors.push(
+            format!("{path}.parameter"),
+            "must reference a parameter with a default value",
+        );
+    }
+    let Some(parameter_type) = source.parameter_type else {
+        errors.push(
+            format!("{path}.parameter"),
+            "must reference a valid version-2 boolean or select parameter",
+        );
+        return;
+    };
+    if !matches!(
+        parameter_type,
+        ParameterType::Boolean | ParameterType::Select
+    ) {
+        errors.push(
+            format!("{path}.parameter"),
+            "must reference a boolean or select parameter",
+        );
+        return;
+    }
+    let values = condition
+        .equals
+        .as_deref()
+        .into_iter()
+        .chain(condition.one_of.iter().map(String::as_str));
+    let mut seen = BTreeSet::new();
+    for (index, value) in values.enumerate() {
+        let value_path = if has_equals {
+            format!("{path}.equals")
+        } else {
+            format!("{path}.one_of[{index}]")
+        };
+        if !seen.insert(value) {
+            errors.push(value_path, "must not contain duplicate comparison values");
+            continue;
+        }
+        let valid = match parameter_type {
+            ParameterType::Boolean => matches!(value, "true" | "false"),
+            ParameterType::Select => source.options.iter().any(|option| option.value == value),
+            ParameterType::Text
+            | ParameterType::Integer
+            | ParameterType::Number
+            | ParameterType::MultiSelect
+            | ParameterType::JsonObject
+            | ParameterType::JsonArray => false,
+        };
+        if !valid {
+            errors.push(
+                value_path,
+                "must be a declared value of the referenced parameter",
+            );
+        }
+    }
+}
+
 /// Defaults are persisted user values, not another evaluation phase.  Keeping
 /// them literal prevents a configuration that validates but later inserts an
 /// unrendered `{{runtime:*}}` or other placeholder into a request.
@@ -377,6 +600,28 @@ fn validate_literal_default(value: &str, path: &str, errors: &mut ValidationErro
     }
 }
 
+fn validate_literal_parameter_value(
+    definition: &ParameterDefinition,
+    schema_version: WorkflowSchemaVersion,
+    value: &str,
+    path: &str,
+    errors: &mut ValidationErrors,
+) {
+    // A text/select default is still a stored string, so it must not become
+    // a hidden second template-evaluation phase. Structured JSON values are
+    // parsed once as complete leaves and are never text-rendered, so their
+    // contents remain literal JSON data.
+    if matches!(
+        definition.effective_type(schema_version),
+        Ok(ParameterType::Text | ParameterType::Select)
+    ) {
+        validate_literal_default(value, path, errors);
+    }
+    if let Err(error) = definition.parse_value(schema_version, value) {
+        errors.push(path, error.to_string());
+    }
+}
+
 fn validate_config_values(
     config: &AdvancedAudioConfig,
     workflow: &AdvancedAudioWorkflow,
@@ -385,14 +630,22 @@ fn validate_config_values(
     let values: BTreeSet<_> = config.values.keys().cloned().collect();
     let secrets: BTreeSet<_> = config.secrets.keys().cloned().collect();
     for parameter in &workflow.parameters {
-        if parameter.required
-            && !config.values.contains_key(&parameter.id)
-            && parameter.default.is_none()
-        {
-            errors.push(
-                format!("ADVANCED_AUDIO_API.values.{}", parameter.id),
-                "required value is missing",
-            );
+        let value_path = format!("ADVANCED_AUDIO_API.values.{}", parameter.id);
+        let configured = config.values.get(&parameter.id);
+        let effective = configured.or(parameter.default.as_ref());
+        match effective {
+            Some(value) => {
+                if workflow.schema_version.0 == CURRENT_SCHEMA_VERSION {
+                    if let Err(error) = parameter.parse_value(workflow.schema_version, value) {
+                        errors.push(&value_path, error.to_string());
+                    }
+                    if parameter.required && is_empty_required_value(parameter, value) {
+                        errors.push(&value_path, "required value must not be empty");
+                    }
+                }
+            }
+            None if parameter.required => errors.push(value_path, "required value is missing"),
+            None => {}
         }
     }
     for secret in &workflow.secrets {
@@ -432,8 +685,26 @@ fn validate_config_values(
     }
 }
 
+fn is_empty_required_value(parameter: &ParameterDefinition, value: &str) -> bool {
+    match parameter.parameter_type {
+        Some(ParameterType::Text) => value.is_empty(),
+        Some(ParameterType::MultiSelect) => parameter
+            .parse_value(WorkflowSchemaVersion(CURRENT_SCHEMA_VERSION), value)
+            .is_ok_and(|value| matches!(value, Value::Array(ref values) if values.is_empty())),
+        Some(
+            ParameterType::Integer
+            | ParameterType::Number
+            | ParameterType::Boolean
+            | ParameterType::Select
+            | ParameterType::JsonObject
+            | ParameterType::JsonArray,
+        )
+        | None => false,
+    }
+}
+
 fn validate_remote_audio(
-    config: &AdvancedAudioConfig,
+    remote_audio: &RemoteAudioConfig,
     workflow: &AdvancedAudioWorkflow,
     errors: &mut ValidationErrors,
 ) {
@@ -445,7 +716,7 @@ fn validate_remote_audio(
     if !needed {
         return;
     }
-    match (&config.remote_audio, delivery) {
+    match (remote_audio, delivery) {
         (RemoteAudioConfig::None, _) => errors.push(
             "ADVANCED_AUDIO_API.remote_audio",
             "remote hosting is required by the selected audio delivery",
@@ -1666,7 +1937,7 @@ fn validate_url(value: &str, path: &str, schemes: &[&str], errors: &mut Validati
 /// GUI code must not maintain a second handwritten workflow schema.
 pub fn workflow_schema_description() -> String {
     let description = concat!(
-        "Root fields: schema_version:number (exact version), name:string, parameters:ParameterDefinition[], secrets:SecretDefinition[], audio:AudioSpec, recognition:Recognition. ParameterDefinition is id, label, required:boolean, optional default:string literal, optional description:string; SecretDefinition is id, label, required:boolean, optional description:string; IDs are ASCII identifiers.\n",
+        "Root fields: schema_version:number (exact version 2), name:string, parameters:ParameterDefinition[], secrets:SecretDefinition[], audio:AudioSpec, recognition:Recognition. ParameterDefinition is id, label, required:boolean, type:text|integer|number|boolean|select|multi_select|json_object|json_array, optional default:string literal, optional description:string, optional options:ParameterOption[], optional visible_when:VisibilityCondition. ParameterOption is value:string plus label:string. select and multi_select require nonempty unique options; their defaults must use declared option values. All parameter defaults and saved values are strings. A multi_select default or saved value is a string whose contents are a JSON string array of unique option values, for example \"[\\\"zh\\\",\\\"en\\\"]\"; never emit an actual JSON array for its default. json_object and json_array defaults or saved values are strings whose contents are respectively a JSON object or JSON array; never emit a raw JSON object or array for their defaults. integer/number/boolean defaults are their JSON textual forms, such as 16000, 0.5, true, or false, stored as strings. VisibilityCondition is parameter:string plus exactly one of equals:string or nonempty one_of:string[]; it may reference only an earlier unconditional boolean/select parameter with a default, and is GUI presentation metadata only: it creates no request branch and never relaxes required values. SecretDefinition is id, label, required:boolean, optional description:string; IDs are ASCII identifiers. Generate schema version 2 only; this build separately retains schema version 1 text-only workflows for existing configurations.\n",
         "AudioSpec is delivery:AudioDelivery plus optional mime:string. Delivery type is multipart_file|raw_audio|base64|data_uri|public_https_url|cloud_uri|provider_upload|realtime_chunks.\n",
         "Recognition is tagged by mode: request(request:HttpStage, final_text:ResponseExtractor); request_stream(request:HttpStage, stream:StreamResponse); async_poll(optional prepare:HttpStage, submit:HttpStage, optional poll:PollStage, result_steps:HttpStage[] at most 2, final_text:ResponseExtractor); realtime_session(realtime:RealtimeWorkflow). No arbitrary steps, callbacks, branches, or loops exist; only poll repeats.\n",
         "HttpStage has method GET|POST|PUT|PATCH|DELETE, url, optional query:string map, headers:string map, body:HttpBody, accepted_statuses:number[] default [200], signer:SignerConfig, captures:Capture[]. A literal HttpStage URL, including async_poll result_steps, must start with http:// or https:// before any template. When an earlier response documents a complete absolute HTTP(S) URL, a later HttpStage URL may be exactly {{capture:id}}; its rendered value is checked for an absolute HTTP(S) URL before the request. Relative paths and other template-only URLs are invalid. HttpBody is tagged none; json(value:any JSON); form_urlencoded(fields:string map); multipart(fields of name plus text(value), bytes(base64 value), or audio_file); raw_audio; raw_bytes(value). Typed audio_file is the only multipart binary audio field. Multipart/raw_audio remain streaming and cannot use a dynamic signer.\n",
@@ -1675,7 +1946,7 @@ pub fn workflow_schema_description() -> String {
         "PollStage has request, interval_ms, timeout_ms, pending/success/failure PollCondition arrays. Poll uses GET or POST only and cannot carry/refer to audio. PollCondition has from, operator eq|ne|exists|not_exists|is_true|is_false|in, value for eq/ne or values for in; each condition array is nonempty.\n",
         "SignerConfig is tagged none; aws_sigv4(region, service, access_key_secret, secret_key_secret, optional session_token_secret); or tencent_tc3(service, secret_id_secret, secret_key_secret). Referenced secret IDs must be declared.\n",
         "RealtimeWorkflow has transport websocket only, connect, optional initial_messages, audio_stream, audio_message, receive_rules, optional finish_messages, completion, pause_behavior restart_session only, finalization_timeout_ms. Connect has url, optional query/headers, signer, optional subprotocol. RealtimeMessage is tagged json(value), text(value), binary(value). audio_stream supports pcm_s16le and pacing realtime. audio_message text/json must contain {{audio:chunk_base64}}; connect/query/headers/subprotocol/initial/finish may not use audio templates. Realtime receive_rules need an explicit complete action unless completion declares an event or JSONPath completion condition.\n",
-        "Templates only allow {{var:id}}, {{secret:id}}, {{capture:id}}, {{audio:filename|mime|size|base64|data_uri|public_url|cloud_uri|chunk_base64}}, {{runtime:uuid|unix_seconds|unix_millis}}. Declarations, stage ordering, and delivery compatibility must validate. No other namespace, expression, code, file/environment access, or executable action exists."
+        "A typed var preserves its native JSON type only when it is the complete value of a JSON leaf, exactly {{var:id}}. In URL, query, header, form, multipart text, raw bytes, realtime text/binary, or a mixed JSON string, vars render as text. multi_select, json_object, and json_array may be used only as that complete JSON leaf; reject them in every other template location before network I/O. json_object and json_array have no text serialization. Templates only allow {{var:id}}, {{secret:id}}, {{capture:id}}, {{audio:filename|mime|size|base64|data_uri|public_url|cloud_uri|chunk_base64}}, {{runtime:uuid|unix_seconds|unix_millis}}. Declarations, stage ordering, and delivery compatibility must validate. No other namespace, expression, code, file/environment access, or executable action exists."
     );
     format!("Advanced Audio API Workflow Schema v{CURRENT_SCHEMA_VERSION}\n\n{description}")
 }
@@ -1691,6 +1962,9 @@ mod tests {
             required: false,
             default: None,
             description: None,
+            parameter_type: Some(ParameterType::Text),
+            options: vec![],
+            visible_when: None,
         }
     }
 
@@ -2105,6 +2379,415 @@ mod tests {
     }
 
     #[test]
+    fn retains_version_one_text_only_workflows_without_automatic_upgrade() {
+        let mut legacy = workflow();
+        legacy.schema_version = WorkflowSchemaVersion(LEGACY_SCHEMA_VERSION);
+        legacy.parameters[0].parameter_type = None;
+        validate_workflow(&legacy).unwrap();
+
+        let config = AdvancedAudioConfig {
+            enabled: true,
+            workflow: Some(legacy.clone()),
+            values: BTreeMap::from([("model".into(), "16000".into())]),
+            ..Default::default()
+        };
+        let persisted = serde_json::to_value(&config).unwrap();
+        assert_eq!(persisted["values"]["model"], serde_json::json!("16000"));
+        let reloaded: AdvancedAudioConfig = serde_json::from_value(persisted).unwrap();
+        validate_advanced_audio_config(&reloaded).unwrap();
+        assert_eq!(
+            reloaded.workflow.unwrap().schema_version.0,
+            LEGACY_SCHEMA_VERSION
+        );
+
+        legacy.parameters[0].parameter_type = Some(ParameterType::Text);
+        let error = validate_workflow(&legacy).unwrap_err().to_string();
+        assert!(error.contains("is only supported by workflow schema version 2"));
+    }
+
+    #[test]
+    fn validates_version_two_typed_defaults_and_configured_values() {
+        let options = vec![
+            ParameterOption {
+                value: "fast".into(),
+                label: "Fast".into(),
+            },
+            ParameterOption {
+                value: "accurate".into(),
+                label: "Accurate".into(),
+            },
+        ];
+        let mut integer = parameter("sample_rate");
+        integer.parameter_type = Some(ParameterType::Integer);
+        integer.default = Some("16000".into());
+        let mut number = parameter("temperature");
+        number.parameter_type = Some(ParameterType::Number);
+        number.default = Some("0.25".into());
+        let mut boolean = parameter("itn");
+        boolean.parameter_type = Some(ParameterType::Boolean);
+        boolean.default = Some("true".into());
+        let mut select = parameter("mode");
+        select.parameter_type = Some(ParameterType::Select);
+        select.options = options.clone();
+        select.default = Some("fast".into());
+        let mut multi = parameter("languages");
+        multi.parameter_type = Some(ParameterType::MultiSelect);
+        multi.options = options;
+        multi.default = Some(r#"["fast","accurate"]"#.into());
+        let mut vocabulary = parameter("vocabulary");
+        vocabulary.parameter_type = Some(ParameterType::JsonObject);
+        vocabulary.default = Some(r#"{"dictate":"Dictate"}"#.into());
+        let mut language_hints = parameter("language_hints");
+        language_hints.parameter_type = Some(ParameterType::JsonArray);
+        language_hints.default = Some(r#"["zh","en"]"#.into());
+
+        let mut candidate = workflow();
+        candidate.parameters = vec![
+            parameter("model"),
+            integer,
+            number,
+            boolean,
+            select,
+            multi,
+            vocabulary,
+            language_hints,
+        ];
+        validate_workflow(&candidate).unwrap();
+
+        let config = AdvancedAudioConfig {
+            enabled: true,
+            workflow: Some(candidate),
+            values: BTreeMap::from([
+                ("sample_rate".into(), "8000".into()),
+                ("temperature".into(), "0.5".into()),
+                ("itn".into(), "false".into()),
+                ("mode".into(), "accurate".into()),
+                ("languages".into(), r#"["accurate"]"#.into()),
+                ("vocabulary".into(), r#"{"hotword":"Dictate"}"#.into()),
+                (
+                    "language_hints".into(),
+                    r#"["zh",{"language":"en"}]"#.into(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        validate_advanced_audio_config(&config).unwrap();
+
+        let mut invalid = config.clone();
+        invalid
+            .values
+            .insert("sample_rate".into(), "16000.5".into());
+        let error = validate_advanced_audio_config(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ADVANCED_AUDIO_API.values.sample_rate"));
+        assert!(error.contains("must be a JSON integer"));
+
+        let mut invalid_object = config.clone();
+        invalid_object.values.insert(
+            "vocabulary".into(),
+            r#"["value-must-not-appear-in-error"]"#.into(),
+        );
+        let object_error = validate_advanced_audio_config(&invalid_object)
+            .unwrap_err()
+            .to_string();
+        assert!(object_error.contains("ADVANCED_AUDIO_API.values.vocabulary"));
+        assert!(object_error.contains("must be a JSON object"));
+        assert!(!object_error.contains("value-must-not-appear-in-error"));
+
+        let mut invalid_array = config;
+        invalid_array.values.insert(
+            "language_hints".into(),
+            r#"{"value":"value-must-not-appear-in-error"}"#.into(),
+        );
+        let array_error = validate_advanced_audio_config(&invalid_array)
+            .unwrap_err()
+            .to_string();
+        assert!(array_error.contains("ADVANCED_AUDIO_API.values.language_hints"));
+        assert!(array_error.contains("must be a JSON array"));
+        assert!(!array_error.contains("value-must-not-appear-in-error"));
+    }
+
+    #[test]
+    fn json_container_parameters_require_matching_values_but_allow_empty_containers() {
+        let mut vocabulary = parameter("vocabulary");
+        vocabulary.required = true;
+        vocabulary.parameter_type = Some(ParameterType::JsonObject);
+        let mut language_hints = parameter("language_hints");
+        language_hints.required = true;
+        language_hints.parameter_type = Some(ParameterType::JsonArray);
+
+        let mut candidate = workflow();
+        candidate.parameters = vec![parameter("model"), vocabulary, language_hints];
+        validate_workflow(&candidate).unwrap();
+
+        let config = AdvancedAudioConfig {
+            enabled: true,
+            workflow: Some(candidate),
+            values: BTreeMap::from([
+                ("vocabulary".into(), "{}".into()),
+                ("language_hints".into(), "[]".into()),
+            ]),
+            ..Default::default()
+        };
+        validate_advanced_audio_config(&config).unwrap();
+
+        let mut missing = config;
+        missing.values.remove("vocabulary");
+        let error = validate_advanced_audio_config(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ADVANCED_AUDIO_API.values.vocabulary: required value is missing"));
+    }
+
+    #[test]
+    fn rejects_options_for_json_container_parameters() {
+        let option = ParameterOption {
+            value: "unexpected".into(),
+            label: "Unexpected".into(),
+        };
+        let mut vocabulary = parameter("vocabulary");
+        vocabulary.parameter_type = Some(ParameterType::JsonObject);
+        vocabulary.options = vec![option.clone()];
+        let mut language_hints = parameter("language_hints");
+        language_hints.parameter_type = Some(ParameterType::JsonArray);
+        language_hints.options = vec![option];
+
+        let mut candidate = workflow();
+        candidate.parameters = vec![parameter("model"), vocabulary, language_hints];
+        let error = validate_workflow(&candidate).unwrap_err().to_string();
+        assert!(error.contains(
+            "parameters[1].options: is allowed only for select or multi_select parameters"
+        ));
+        assert!(error.contains(
+            "parameters[2].options: is allowed only for select or multi_select parameters"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_version_two_option_and_visibility_definitions() {
+        let mut source = parameter("mode");
+        source.parameter_type = Some(ParameterType::Select);
+        source.default = Some("fast".into());
+        source.options = vec![
+            ParameterOption {
+                value: "fast".into(),
+                label: "Fast".into(),
+            },
+            ParameterOption {
+                value: "fast".into(),
+                label: "Duplicate".into(),
+            },
+        ];
+        let mut dependent = parameter("hint");
+        dependent.visible_when = Some(VisibilityCondition {
+            parameter: "mode".into(),
+            equals: Some("fast".into()),
+            one_of: vec!["accurate".into()],
+        });
+        let mut candidate = workflow();
+        candidate.parameters = vec![parameter("model"), source, dependent];
+
+        let error = validate_workflow(&candidate).unwrap_err().to_string();
+        assert!(error.contains("duplicate option value 'fast'"));
+        assert!(error.contains("exactly one of equals or a nonempty one_of array"));
+    }
+
+    #[test]
+    fn accepts_bounded_visibility_conditions_without_relaxing_required_values() {
+        let mut mode = parameter("mode");
+        mode.parameter_type = Some(ParameterType::Select);
+        mode.default = Some("fast".into());
+        mode.options = vec![
+            ParameterOption {
+                value: "fast".into(),
+                label: "Fast".into(),
+            },
+            ParameterOption {
+                value: "accurate".into(),
+                label: "Accurate".into(),
+            },
+        ];
+        let mut hint = parameter("hint");
+        hint.required = true;
+        hint.visible_when = Some(VisibilityCondition {
+            parameter: "mode".into(),
+            equals: None,
+            one_of: vec!["fast".into(), "accurate".into()],
+        });
+        let mut candidate = workflow();
+        candidate.parameters = vec![parameter("model"), mode, hint];
+        validate_workflow(&candidate).unwrap();
+
+        let config = AdvancedAudioConfig {
+            enabled: true,
+            workflow: Some(candidate),
+            ..Default::default()
+        };
+        let error = validate_advanced_audio_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ADVANCED_AUDIO_API.values.hint: required value is missing"));
+    }
+
+    #[test]
+    fn rejects_visibility_condition_source_without_a_default() {
+        let mut source = parameter("enable_extra");
+        source.parameter_type = Some(ParameterType::Boolean);
+        let mut dependent = parameter("extra_value");
+        dependent.visible_when = Some(VisibilityCondition {
+            parameter: "enable_extra".into(),
+            equals: Some("true".into()),
+            one_of: vec![],
+        });
+
+        let mut candidate = workflow();
+        candidate.parameters = vec![parameter("model"), source, dependent];
+        let error = validate_workflow(&candidate).unwrap_err().to_string();
+        assert!(error.contains("must reference a parameter with a default value"));
+    }
+
+    #[test]
+    fn rejects_non_boolean_or_select_visibility_sources() {
+        let invalid_sources = [
+            (ParameterType::Text, "enabled", vec![]),
+            (ParameterType::Number, "1", vec![]),
+            (ParameterType::JsonObject, r#"{"enabled":true}"#, vec![]),
+            (ParameterType::JsonArray, r#"["enabled"]"#, vec![]),
+            (
+                ParameterType::MultiSelect,
+                r#"[\"zh\"]"#,
+                vec![ParameterOption {
+                    value: "zh".into(),
+                    label: "Chinese".into(),
+                }],
+            ),
+        ];
+
+        for (parameter_type, default, options) in invalid_sources {
+            let mut source = parameter("source");
+            source.parameter_type = Some(parameter_type);
+            source.default = Some(default.into());
+            source.options = options;
+            let mut dependent = parameter("dependent");
+            dependent.visible_when = Some(VisibilityCondition {
+                parameter: "source".into(),
+                equals: Some(default.into()),
+                one_of: vec![],
+            });
+
+            let mut candidate = workflow();
+            candidate.parameters = vec![parameter("model"), source, dependent];
+            let error = validate_workflow(&candidate).unwrap_err().to_string();
+            assert!(
+                error.contains("must reference a boolean or select parameter"),
+                "{parameter_type:?} must not be a visibility source: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_conditional_or_later_visibility_sources() {
+        let mut gate = parameter("gate");
+        gate.parameter_type = Some(ParameterType::Boolean);
+        gate.default = Some("true".into());
+        let mut conditional_source = parameter("conditional_source");
+        conditional_source.parameter_type = Some(ParameterType::Boolean);
+        conditional_source.default = Some("true".into());
+        conditional_source.visible_when = Some(VisibilityCondition {
+            parameter: "gate".into(),
+            equals: Some("true".into()),
+            one_of: vec![],
+        });
+        let mut dependent = parameter("dependent");
+        dependent.visible_when = Some(VisibilityCondition {
+            parameter: "conditional_source".into(),
+            equals: Some("true".into()),
+            one_of: vec![],
+        });
+
+        let mut conditional_candidate = workflow();
+        conditional_candidate.parameters =
+            vec![parameter("model"), gate, conditional_source, dependent];
+        let error = validate_workflow(&conditional_candidate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must reference an unconditional parameter"));
+
+        let mut later = parameter("later");
+        later.parameter_type = Some(ParameterType::Boolean);
+        later.default = Some("true".into());
+        let mut earlier_dependent = parameter("earlier_dependent");
+        earlier_dependent.visible_when = Some(VisibilityCondition {
+            parameter: "later".into(),
+            equals: Some("true".into()),
+            one_of: vec![],
+        });
+
+        let mut later_candidate = workflow();
+        later_candidate.parameters = vec![parameter("model"), earlier_dependent, later];
+        let error = validate_workflow(&later_candidate).unwrap_err().to_string();
+        assert!(
+            error.contains("must reference an earlier unconditional boolean or select parameter")
+        );
+    }
+
+    #[test]
+    fn rejects_visibility_comparisons_outside_the_source_domain() {
+        let mut enabled = parameter("enabled");
+        enabled.parameter_type = Some(ParameterType::Boolean);
+        enabled.default = Some("true".into());
+        let mut boolean_dependent = parameter("boolean_dependent");
+        boolean_dependent.visible_when = Some(VisibilityCondition {
+            parameter: "enabled".into(),
+            equals: Some("enabled".into()),
+            one_of: vec![],
+        });
+
+        let mut boolean_candidate = workflow();
+        boolean_candidate.parameters = vec![parameter("model"), enabled, boolean_dependent];
+        let error = validate_workflow(&boolean_candidate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a declared value of the referenced parameter"));
+
+        let mut mode = parameter("mode");
+        mode.parameter_type = Some(ParameterType::Select);
+        mode.default = Some("fast".into());
+        mode.options = vec![ParameterOption {
+            value: "fast".into(),
+            label: "Fast".into(),
+        }];
+        let mut select_dependent = parameter("select_dependent");
+        select_dependent.visible_when = Some(VisibilityCondition {
+            parameter: "mode".into(),
+            equals: Some("turbo".into()),
+            one_of: vec![],
+        });
+
+        let mut select_candidate = workflow();
+        select_candidate.parameters = vec![parameter("model"), mode, select_dependent];
+        let error = validate_workflow(&select_candidate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a declared value of the referenced parameter"));
+    }
+
+    #[test]
+    fn remote_validation_helper_does_not_need_placeholder_parameter_values() {
+        let mut candidate = workflow();
+        candidate.parameters[0].required = true;
+        validate_remote_audio_config(&candidate, &RemoteAudioConfig::None).unwrap();
+
+        let config = AdvancedAudioConfig {
+            enabled: true,
+            workflow: Some(candidate),
+            ..Default::default()
+        };
+        assert!(validate_advanced_audio_config(&config).is_err());
+    }
+
+    #[test]
     fn realtime_allows_audio_only_for_per_chunk_messages() {
         let mut candidate = realtime_workflow();
         let AdvancedRecognition::RealtimeSession { realtime } = &mut candidate.recognition else {
@@ -2228,5 +2911,23 @@ mod tests {
         );
         assert!(description.contains("automatically treated as sensitive for redaction"));
         assert!(description.contains("Relative paths and other template-only URLs are invalid"));
+    }
+
+    #[test]
+    fn schema_description_explains_typed_parameter_storage_and_rendering() {
+        let description = workflow_schema_description();
+        assert!(description.contains("All parameter defaults and saved values are strings"));
+        assert!(description.contains("json_object|json_array"));
+        assert!(description.contains("A multi_select default or saved value is a string"));
+        assert!(description.contains("never emit an actual JSON array for its default"));
+        assert!(
+            description.contains("json_object and json_array defaults or saved values are strings")
+        );
+        assert!(description.contains("complete value of a JSON leaf, exactly {{var:id}}"));
+        assert!(description.contains(
+            "multi_select, json_object, and json_array may be used only as that complete JSON leaf"
+        ));
+        assert!(description.contains("json_object and json_array have no text serialization"));
+        assert!(description.contains("before network I/O"));
     }
 }
