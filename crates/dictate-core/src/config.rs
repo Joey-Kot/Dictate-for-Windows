@@ -25,6 +25,11 @@ pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
 pub struct Config {
     #[serde(rename = "REWRITE")]
     pub rewrite: crate::rewrite::RewriteConfig,
+    /// Optional declarative protocol used only when explicitly enabled. Keep
+    /// this alongside Legacy Audio API settings so old configuration files
+    /// keep their behavior unchanged.
+    #[serde(rename = "ADVANCED_AUDIO_API")]
+    pub advanced_audio_api: crate::advanced_audio::AdvancedAudioConfig,
     #[serde(rename = "API_ENDPOINT")]
     pub api_endpoint: String,
     #[serde(rename = "TOKEN")]
@@ -111,6 +116,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rewrite: crate::rewrite::RewriteConfig::default(),
+            advanced_audio_api: crate::advanced_audio::AdvancedAudioConfig::default(),
             api_endpoint: String::new(),
             token: String::new(),
             model: String::new(),
@@ -223,11 +229,18 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.rewrite.validate().map_err(ConfigError::Invalid)?;
-        crate::additional_parameters::parse(&self.extra_config)
-            .map_err(|error| ConfigError::Invalid(format!("Extra config: {error}")))?;
+        crate::advanced_audio::validate_advanced_audio_config(&self.advanced_audio_api)
+            .map_err(|error| ConfigError::Invalid(format!("Advanced Audio API: {error}")))?;
+        // Advanced execution does not read any Legacy Audio API field.  Keep
+        // old values intact for a later switch back to Legacy, but do not let
+        // stale Legacy JSON or JSONPath syntax block an enabled workflow.
+        if !self.advanced_audio_api.enabled {
+            crate::additional_parameters::parse(&self.extra_config)
+                .map_err(|error| ConfigError::Invalid(format!("Extra config: {error}")))?;
+            crate::jsonpath::parse_text_path(&self.text_path)
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        }
         validate_vad_start_threshold(self.vad_start_threshold)?;
-        crate::jsonpath::parse_text_path(&self.text_path)
-            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         if self.vad_padding_ms > 1000 {
             return Err(ConfigError::Invalid(
                 "invalid VAD_PADDING_MS (allowed 0..=1000 ms)".into(),
@@ -468,6 +481,8 @@ mod tests {
         );
         assert_eq!(cfg.opacity, 1.0);
         assert_eq!(cfg.window_scale, 1.0);
+        assert!(!cfg.advanced_audio_api.enabled);
+        assert!(cfg.advanced_audio_api.workflow.is_none());
     }
 
     #[test]
@@ -558,6 +573,77 @@ mod tests {
         assert!(raw.contains_key("CANCEL_OR_RETRY_KEY"));
         assert_eq!(raw.get("OPACITY"), Some(&serde_json::json!(1.0)));
         assert_eq!(raw.get("WINDOW_SCALE"), Some(&serde_json::json!(1.0)));
+        assert_eq!(
+            raw.get("ADVANCED_AUDIO_API")
+                .and_then(|value| value.get("enabled")),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
+    fn advanced_audio_config_is_backward_compatible_and_unknown_schema_is_rejected_when_enabled() {
+        let old: Config =
+            serde_json::from_str(r#"{"API_ENDPOINT":"https://legacy.example"}"#).unwrap();
+        assert!(!old.advanced_audio_api.enabled);
+        old.validate().unwrap();
+
+        let mut config = Config::default();
+        config.advanced_audio_api.enabled = true;
+        config.advanced_audio_api.workflow = Some(crate::advanced_audio::AdvancedAudioWorkflow {
+            schema_version: crate::advanced_audio::WorkflowSchemaVersion(99),
+            name: "future".into(),
+            parameters: vec![],
+            secrets: vec![],
+            audio: crate::advanced_audio::schema::AudioSpec {
+                delivery: crate::advanced_audio::AudioDelivery::Base64,
+                mime: None,
+            },
+            recognition: crate::advanced_audio::AdvancedRecognition::Request {
+                request: Box::new(crate::advanced_audio::HttpStage {
+                    method: crate::advanced_audio::HttpMethod::Post,
+                    url: "https://asr.example/v1".into(),
+                    query: Default::default(),
+                    headers: Default::default(),
+                    body: crate::advanced_audio::HttpBody::Json {
+                        value: serde_json::json!({"audio": "{{audio:base64}}"}),
+                    },
+                    accepted_statuses: vec![200],
+                    signer: crate::advanced_audio::schema::SignerConfig::None,
+                    captures: vec![],
+                }),
+                final_text: crate::advanced_audio::schema::ResponseExtractor::JsonPath {
+                    path: "$.text".into(),
+                },
+            },
+        });
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported Workflow Schema Version")
+        );
+
+        config
+            .advanced_audio_api
+            .workflow
+            .as_mut()
+            .unwrap()
+            .schema_version = crate::advanced_audio::WorkflowSchemaVersion::default();
+        config.extra_config = "not JSON".into();
+        config.text_path = "$[not-valid".into();
+        config.validate().unwrap();
+
+        config.advanced_audio_api.enabled = false;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Extra config")
+        );
+        config.extra_config = String::new();
+        assert!(config.validate().is_err());
     }
 
     #[test]

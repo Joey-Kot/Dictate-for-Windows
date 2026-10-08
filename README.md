@@ -2,7 +2,7 @@
 
 # Dictate for Windows
 
-Dictate for Windows is a local speech-to-text client for Windows x86_64. It records microphone audio through global hotkeys or a native floating window, sends the complete audio file to a compatible ASR HTTP endpoint, extracts the recognized text, and automatically inserts it at the current input position. Prompt hotkeys can also rewrite selected text; successful results use the same clipboard or SendInput output method as transcription.
+Dictate for Windows is a local speech-to-text client for Windows x86_64. It records microphone audio through global hotkeys or a native floating window, uses either the existing Legacy Audio API or an enabled Advanced Audio API workflow to obtain a final transcript, and automatically inserts it at the current input position. Prompt hotkeys can also rewrite selected text; successful results use the same clipboard or SendInput output method as transcription.
 
 The project includes two Rust programs:
 
@@ -15,7 +15,8 @@ The current implementation uses Rust, Win32, Direct2D, and DirectWrite.
 
 - **Recording and transcription**: record through the floating window or global hotkeys, with support for pausing, cancellation, and retranscribing the most recent recording.
 - **Text rewriting**: assign hotkeys to prompts and use text models from different providers to rewrite selected text.
-- **Custom APIs**: configure ASR and Rewrite endpoints, models, prompts, and extra request parameters.
+- **Custom APIs**: configure Legacy Audio API and Rewrite endpoints, models, prompts, and extra request parameters.
+- **Advanced Audio API**: opt into a validated, declarative workflow for request, streaming-response, asynchronous polling, or WebSocket realtime transcription.
 - **Automatic text insertion**: transcription and Rewrite results share clipboard paste or SendInput output to the current application.
 - **Audio processing**: choose a microphone and output format, with optional voice detection and trimming; embedded FFmpeg requires no separate installation.
 - **GUI and CLI**: a multilingual native floating window and a command-line program support everyday recording, scripting, and transcription of existing audio files.
@@ -38,7 +39,7 @@ The current implementation uses Rust, Win32, Direct2D, and DirectWrite.
 
 ## Architecture
 
-The GUI and CLI hotkey mode share the interactive runtime in `dictate-core`, which handles recording, rewriting, and hotkeys, and ensures that tasks run one at a time and can be canceled. CLI file mode calls the core audio processing and ASR flow directly, without registering hotkeys or automatically inserting text into the current application.
+The GUI and CLI hotkey mode share the interactive runtime in `dictate-core`, which handles recording, recognition, rewriting, and hotkeys, and ensures that tasks run one at a time and can be canceled. CLI file mode calls the core audio processing and selected Audio API path directly, without registering hotkeys or automatically inserting text into the current application.
 
 ```mermaid
 flowchart LR
@@ -53,7 +54,7 @@ flowchart LR
         Recorder["WASAPI recording<br/>Retry the most recent recording"]
         Selection["Read text with Ctrl+C<br/>Back up and restore the clipboard"]
         Prepare["Embedded libav audio conversion<br/>Optional VAD detection and trimming"]
-        ASR["Audio API<br/>Extract text with JSONPath"]
+        ASR["Legacy Audio API / Advanced workflow<br/>Produce final transcript"]
         Rewrite["Rewrite API<br/>Prompts and Provider"]
         Output["Shared text output<br/>Clipboard Ctrl+V / SendInput"]
     end
@@ -62,6 +63,7 @@ flowchart LR
     CLI --> Runtime
     Runtime -->|Record| Recorder
     Recorder --> Prepare
+    Recorder -->|Live realtime chunks| ASR
     FileMode --> Prepare
     Prepare --> ASR
     Runtime -->|Prompt hotkey| Selection
@@ -72,7 +74,7 @@ flowchart LR
     ASR -->|File mode| TextFile["Text file"]
 ```
 
-Audio and Rewrite use separate API configurations and share network settings and text output methods. Each Rewrite prompt can use the main Rewrite API or its own Provider, Base URL, API Key, and Model. Rewrite always reads input through the clipboard, regardless of `USE_SENDINPUT`.
+Audio and Rewrite use separate API configurations and share network settings and text output methods. The Audio API path is Legacy by default and switches to Advanced only when `ADVANCED_AUDIO_API.enabled=true`. Each Rewrite prompt can use the main Rewrite API or its own Provider, Base URL, API Key, and Model. Rewrite always reads input through the clipboard, regardless of `USE_SENDINPUT`.
 
 ## Transcription and Rewrite flow
 
@@ -95,13 +97,13 @@ sequenceDiagram
             Core->>Audio: Pause / Resume capture
         end
         User->>Core: Stop recording
-        Core->>Audio: Finalize WAV and prepare audio for upload according to configuration
+        Core->>Audio: Finalize WAV and prepare audio for the selected delivery
         Note over Core,Audio: Optional VAD detection and trimming, format conversion with embedded libav
         Audio-->>Core: Audio preparation result
         break VAD detects no speech
             Core-->>User: Clear the retry buffer and finish without an ASR request
         end
-        Core->>API: Upload the complete audio through the Audio API
+        Core->>API: Deliver audio through the selected Legacy or Advanced Audio API
     else Rewrite selected text
         User->>Core: Trigger a prompt hotkey
         Core->>Clipboard: Back up and clear
@@ -118,7 +120,7 @@ sequenceDiagram
     end
 
     API-->>Core: Return response
-    Core->>Core: Extract and validate the result using Audio JSONPath or Rewrite Provider
+    Core->>Core: Extract and validate the result using the selected Audio extractor or Rewrite Provider
     opt Text is available for insertion and the task has not been canceled
         alt USE_SENDINPUT=true
             Core->>App: Insert Unicode text with SendInput
@@ -133,7 +135,7 @@ sequenceDiagram
     Core-->>User: Finish and update the state
 ```
 
-- Conversion and upload of the complete audio begin only after recording stops; recognition is not streamed in real time. Rewrite also delivers text only after receiving a complete, valid result.
+- The stop/finalize path in this diagram describes complete-file delivery. The Legacy Audio API converts and uploads complete audio only after recording stops; it does not provide realtime recognition. An Advanced `realtime_session` can send microphone chunks while recording, finalizes the current session on pause, and opens a new session on resume. Every Advanced mode waits for one complete final transcript and never inserts partial text into the foreground application.
 - Rewrite input reading and clipboard output share **Paste delay** and **Restore delay**. Both settings still apply to Rewrite input reading when SendInput is enabled.
 - Failed requests, empty results, and Rewrite results received after cancellation do not proceed to text output. Text output that has already begun cannot be undone; see “Clipboard and automatic paste” for details.
 
@@ -177,7 +179,7 @@ stateDiagram-v2
 ```
 
 - Recording (including pauses), transcription, Rewrite, and connectivity tests run one at a time. New tasks are discarded while busy, without queuing; cancellation can stop the current task, but new tasks are not accepted until cleanup and clipboard restoration finish.
-- Connectivity tests use the current settings draft and make a single request. They do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
+- Legacy Audio API and Rewrite connectivity tests use the current settings draft and make a single request. Advanced **Test workflow** executes the declared workflow after confirmation, so it can include remote upload, polling, result fetches, or recorded realtime replay. Tests do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
 - Retry retranscribes only the most recent completed audio recording and does not trigger Rewrite. The retry buffer is held only in memory, up to 100,000,000 bytes. It is replaced when a new recording finishes, retained after cancellation during recording, request cancellation, or completion of a retry, and cleared when VAD detects no speech.
 
 ## Scope and limitations
@@ -185,16 +187,18 @@ stateDiagram-v2
 - Current releases provide Windows x86_64 builds only.
 - The GUI is a native Windows-only program. The CLI source can be compiled on other systems, but global Windows hotkeys are available only on Windows.
 - Microphone capture and device enumeration are supported only on Windows. Both the GUI and CLI can use a specified recording input device or follow the system default, resolving the device again each time recording starts.
-- The complete audio is uploaded after recording; real-time streaming recognition is not supported.
-- ASR endpoints must accept `multipart/form-data` and return JSON.
-- The Audio API treats only HTTP 200 as success; Rewrite accepts successful status codes and requires a parseable, nonempty text result.
+- The Legacy Audio API uploads complete audio after recording and does not support realtime streaming recognition.
+- Legacy ASR endpoints must accept `multipart/form-data` and return JSON.
+- The Legacy Audio API treats only HTTP 200 as success; Rewrite accepts successful status codes and requires a parseable, nonempty text result.
+- The optional Advanced Audio API supports bounded request, streaming-response, asynchronous polling, and WebSocket realtime workflows. It may use HTTP, HTTPS, WebSocket, or secure WebSocket endpoints; localhost and LAN targets are allowed.
+- Advanced Audio API version 1 does not support gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflows, branches, loops, user scripts, custom signer code, provider-specific realtime resume, or foreground insertion of live partial text.
 - The HTTP client does not use the system proxy, automatically follow redirects, or enable automatic response compression.
 - Embedded libav runs on a blocking worker thread, with cancellation callbacks integrated into decoding, interval processing, and file I/O. Cleanup waits for the worker thread to close its output.
 - Transcription and Rewrite share the existing text output flow, which uses the focus and selection at the time of insertion. Changing focus while waiting changes the final output target; the program does not restore the window or selection from when the task was triggered.
 - Rewrite reads input through the target application's `Ctrl+C` command, temporarily changing and then restoring the clipboard. Compatibility depends on the application's copy behavior, focus, and Windows permission restrictions.
 - The GUI does not provide Windows Toast, tray balloon, or other system notifications.
 - `NOTIFICATION` in older configurations is ignored and is not written back when saving.
-- `REQUEST_FAILED_NOTIFICATION` is not a system notification switch. It only controls whether `[request failed]` is inserted after audio request retries are exhausted, and does not apply to Rewrite.
+- `REQUEST_FAILED_NOTIFICATION` is not a system notification switch. It only controls whether `[request failed]` is inserted after Legacy Audio API retries are exhausted, and does not apply to Advanced Audio API or Rewrite.
 
 ## Requirements
 
@@ -202,7 +206,7 @@ stateDiagram-v2
 
 - Windows 10 or Windows 11 x86_64.
 - An available microphone input device for recording.
-- A compatible ASR HTTP endpoint for transcription; a supported text service for Rewrite.
+- A compatible Legacy ASR HTTP endpoint or a validated, enabled Advanced Audio API workflow for transcription; a supported text service for Rewrite.
 - No installation of FFmpeg, PortAudio, WebView2, or the Visual C++ Redistributable is required.
 
 ### CLI
@@ -210,7 +214,7 @@ stateDiagram-v2
 - Windows x86_64.
 - A microphone for hotkey recording mode.
 - No system FFmpeg installation is required.
-- A compatible ASR HTTP endpoint for transcription; a supported text service for Rewrite.
+- A compatible Legacy ASR HTTP endpoint or a validated, enabled Advanced Audio API workflow for transcription; a supported text service for Rewrite.
 
 ### Developing from source
 
@@ -232,7 +236,7 @@ stateDiagram-v2
 ```
 
 4. Open Settings using the gear button on the floating window or the tray menu.
-5. Fill in at least `API_ENDPOINT`, and set `TOKEN`, `MODEL`, and `TEXT_PATH` as required by the service.
+5. For the default Legacy Audio API, fill in at least `API_ENDPOINT`, and set `TOKEN`, `MODEL`, and `TEXT_PATH` as required by the service. To use Advanced Audio API instead, enable it and prepare a validated workflow on its settings page.
 6. Save the settings, then start recording with the floating window button or the default hotkey.
 
 The interface language is stored separately at:
@@ -241,7 +245,7 @@ The interface language is stored separately at:
 %APPDATA%\dictate\ui-language.txt
 ```
 
-The language setting is not written to the ASR configuration file and does not change the `LANGUAGE` field in requests.
+The language setting is not written to the Legacy ASR configuration fields and does not change the Legacy `LANGUAGE` request field.
 
 ### Floating window controls
 
@@ -262,12 +266,13 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 | Page | Contents |
 |---|---|
 | Display | Interface language, configuration file location, floating window opacity, and floating window scale |
-| Audio API | Endpoint, Token, model, language, prompt, text path, and extra fields |
+| Audio API | Legacy endpoint, Token, model, language, prompt, text path, and extra fields |
+| Advanced Audio API | Enable switch, workflow generation and validation, declared Values and Secrets, raw Workflow JSON, Remote hosting, and Test workflow |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
 | Rewrite API | Provider, Base URL, API Key, Model, prompt list, ADD PROMPT, and connectivity test |
-| Network | Timeout, retries, HTTP/2, and TLS verification shared by the Audio API and Rewrite API |
+| Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API |
 | Audio Hotkeys | Three hotkeys, a low-level keyboard hook switch, two clipboard delays, and a SendInput switch |
-| Cache | Cache directory, cache retention, and request failure placeholder text |
+| Cache | Cache directory, cache retention, and Legacy request-failure placeholder text |
 | Debug | FFmpeg, recording, hotkey, and upload debug switches, plus a live read-only output box with Copy all and Clear controls |
 | About | Project, author, license, and repository information |
 
@@ -310,7 +315,7 @@ A successful Rewrite reuses the transcription output flow directly: `USE_SENDINP
 
 **Test connectivity** tests the current API draft. Selecting a separate Provider in the prompt window also reveals a test button at the bottom, using that prompt's API fields and the current **Network** draft from the main settings window. Rewrite tests send fixed content without using the actual Title, Prompt Content, Extra config, or Hotkey, so those fields need not be filled in to test the API. Tests do not read the selection, insert text, or save the draft.
 
-Audio and Rewrite connectivity tests make only one request and share the task lock and cancel action with recording, transcription, and rewriting. Closing the window containing the test cancels it; switching Provider or editing API fields in the prompt window also cancels an ongoing test and clears the old result. The prompt window temporarily disables Save and repeated testing while a test is running; Cancel remains available. Normal Rewrite requests use **Network** for all timeout, HTTP/2, TLS verification, total attempt count, and backoff settings; no separate Retry configuration is needed.
+Legacy Audio API and Rewrite connectivity tests make only one request and share the task lock and cancel action with recording, transcription, and rewriting. Closing the window containing the test cancels it; switching Provider or editing API fields in the prompt window also cancels an ongoing test and clears the old result. The prompt window temporarily disables Save and repeated testing while a test is running; Cancel remains available. Normal Rewrite requests use **Network** for all timeout, HTTP/2, TLS verification, total attempt count, and backoff settings; no separate Retry configuration is needed.
 
 ### Debug output
 
@@ -319,7 +324,7 @@ The **Debug** page provides a read-only monospace log box below its four switche
 - Debug switches take effect after clicking “Save,” including for API connectivity tests. They control logs generated afterward; turning off a category does not delete records already collected.
 - The log box refreshes every 200 ms and follows new output automatically when scrolled to the bottom with no text selected. Scrolling up or selecting text preserves the viewing position, and refreshes do not interrupt mouse selection or scrollbar dragging.
 - Logs are kept only in memory for the current GUI session and remain available after Settings is closed. Up to **2000 lines or 1 MiB** are retained; the oldest lines are removed beyond that limit, and individual overlong entries are truncated. Logs are cleared when the program exits and are not written to disk.
-- **Upload debug** covers Audio, Rewrite, and all connectivity tests, recording request targets, attempt counts, HTTP status, duration, retries, and errors. Configured API keys and URL usernames, passwords, and query parameter values are hidden, including original percent-encoded and mixed-case escape forms preserved in network errors. Normal prompt, input, and result bodies are not explicitly logged; failure response summaries may contain details returned by the server.
+- **Upload debug** for the Legacy Audio API, Rewrite, and their connectivity tests records request targets, attempt counts, HTTP status, duration, retries, and errors. Configured API keys and URL usernames, passwords, and query parameter values are hidden, including original percent-encoded and mixed-case escape forms preserved in network errors. Normal prompt, input, and result bodies are not explicitly logged; failure response summaries may contain details returned by the server. Advanced Audio API uses the stricter redacted phase-only diagnostics described below.
 
 Core passes diagnostics to the GUI through an optional receiver interface; the log box and session buffer belong to the GUI. CLI debug information continues to go to stderr.
 
@@ -328,6 +333,46 @@ Core passes diagnostics to the GUI through an optional receiver interface; the l
 - When focus is in a hotkey input field, `Esc` records the hotkey instead of closing the window. In a Provider, microphone, or audio output list, `Esc` first collapses the list; in an audio custom input field, it exits custom editing. In other cases, it first closes Settings, or begins exiting if Settings is not open.
 - Exiting during recording, pause, upload, or Rewrite shows a confirmation dialog.
 - Exiting cancels recording and the current request, waits for any ongoing Rewrite input reading to restore the clipboard, removes the tray icon, and stops the hotkey thread.
+
+## Advanced Audio API
+
+Advanced Audio API is a bounded, declarative ASR protocol workflow. It is disabled by default: an absent `ADVANCED_AUDIO_API` key, or `ADVANCED_AUDIO_API.enabled=false`, preserves the existing Legacy Audio API without migration. When Advanced Audio API is enabled, its validated workflow takes precedence for transcription. `API_ENDPOINT`, `TOKEN`, `MODEL`, `LANGUAGE`, `PROMPT`, `TEXT_PATH`, and `ExtraConfig` remain stored and editable as Legacy settings but do not participate in Advanced transcription.
+
+`dictate-core` owns the serializable schema, validation, transports, remote-audio handling, signing, cancellation, and execution. GUI and CLI use that same Core engine. The GUI can generate a workflow from vendor documentation or request/response examples through the configured Rewrite API; CLI has no workflow generator and does not require an LLM to execute a saved workflow.
+
+### Workflow and settings
+
+The GUI's **Advanced Audio API** page lets you paste vendor material, generate a workflow, inspect its summary and warnings, validate it, edit its raw Workflow JSON, and configure Remote hosting. Generated output must pass the Core validator; a failed generated workflow receives at most one repair attempt. Vendor material is best-effort redacted locally before generation.
+
+When Advanced Audio API is enabled, the Legacy Audio API page remains editable and displays that its settings are not used for transcription.
+
+The workflow declares its own **Values** and **Secrets**. The GUI creates controls from those declarations, stores their values separately from the workflow, and masks secret input. Core validation checks schema version, template references, declaration IDs, stage ordering, delivery compatibility, and remote-hosting requirements before any network request. Workflows cannot run arbitrary code, scripts, shells, branches, loops, or arbitrary local-file paths.
+
+The configuration stores the enabled state, workflow, Values, Secrets, and Remote hosting under `ADVANCED_AUDIO_API`. Do not hand-write a workflow from an informal example; use the schema and contract below as the source of truth.
+
+- [Advanced Audio API contract](docs/advanced-audio-api-contract.md)
+- [Advanced Audio API protocol matrix](docs/advanced-audio-protocol-matrix.md)
+
+### Recognition modes, delivery, and authentication
+
+- `request` sends one HTTP request and extracts a final response.
+- `request_stream` sends one HTTP request and consumes SSE, NDJSON, or JSON chunks until an explicit completion event.
+- `async_poll` can prepare/provider-upload, submits exactly once, polls with GET or POST until a terminal condition, and can perform up to two read-only result requests.
+- `realtime_session` uses WebSocket with microphone chunks or a recorded-file replay.
+
+Declared audio delivery can be typed multipart or raw audio, Base64, Data URI, public HTTPS URL, cloud URI, provider upload, or realtime chunks. Each Advanced HTTP stage declares its accepted statuses; the Legacy HTTP-200-only rule does not apply. Bearer, Basic, API-key, and static header/query authentication can use Secret templates. Remote hosting supports WebDAV, S3-compatible storage, and Aliyun OSS. WebDAV supplies only a public HTTPS URL; S3-compatible storage and OSS can supply a public HTTPS URL or their cloud URI. Those representations are distinct and are never converted implicitly. Built-in dynamic signers are AWS SigV4 and Tencent TC3; workflow-provided signer code is not allowed, and dynamic signing cannot be used with streamed multipart or raw-audio uploads.
+
+### Cancellation, retries, and realtime
+
+Cancellation covers uploads, HTTP request and response work, poll waits, result fetches, WebSocket work, replay pacing, finalization, and best-effort remote cleanup. Eligible `request` and `request_stream` attempts use the configured retry policy. Submit is never automatically retried because it may have created a remote task. Poll and read-only result requests can retry without resubmitting. After successful recognition, **Delete after recognition** controls normal deletion of a published remote object. Once an upload has been issued, upload failures, recognition failures, and cancellation still force a best-effort delete; a cleanup failure never replaces the original outcome.
+
+For a realtime workflow, Dictate streams paced `pcm_s16le` microphone audio while retaining the complete local WAV. `unbounded` pacing and `keep_session` pause behavior are rejected. Pausing finalizes the current session and resuming starts a new one. A live network failure, or cancellation during live finalization, discards partial/committed live transcript state, finishes recording, then replays the complete WAV from byte zero in a fresh session. Retrying likewise starts a fresh replay session from zero. Partial text is never sent to the foreground application; only one final transcript uses the normal clipboard or SendInput output. CLI `--file` can run a realtime workflow as recorded replay.
+
+### Testing, diagnostics, and version-1 boundary
+
+**Test workflow** shows the target hosts, remote-upload requirement, recognition mode, and whether the test is recorded realtime replay before the user confirms network access. After confirmation, it uses fixed short audio through the same Core workflow. `UPLOAD_DEBUG` records only fixed Advanced phase labels: it does not log rendered URLs, query strings, headers, request or response bodies, audio, captures, transcripts, Secrets, storage credentials, signatures, or presigned URLs.
+
+Version 1 intentionally excludes gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflow stages/branches/loops, user scripts, custom signer code, provider-specific realtime resume, and foreground insertion of live partial text.
 
 ## Command-line interface
 
@@ -429,7 +474,7 @@ The device list marks the current system default device. A successful query (inc
   --output .\sample.txt
 ```
 
-If `--output` is omitted, output defaults to `<input filename>.txt` in the current directory. File mode first converts the input file according to the audio configuration, then uploads it for transcription. It does not register global hotkeys or paste automatically.
+If `--output` is omitted, output defaults to `<input filename>.txt` in the current directory. File mode first converts the input file according to the audio configuration, then uses the selected Audio API path for transcription. With an enabled realtime workflow, it replays the prepared file through a fresh WebSocket session rather than using a microphone. It does not register global hotkeys or paste automatically.
 
 ### CLI options
 
@@ -443,31 +488,35 @@ If `--output` is omitted, output defaults to `<input filename>.txt` in the curre
 | `--file <PATH>` | Enter file mode and specify an existing audio file |
 | `--output <PATH>` | Set the text output path for file mode |
 
-#### Audio API
+#### Legacy Audio API
 
 | Option | Purpose |
 |---|---|
-| `--api-endpoint <URL>` | Override the ASR endpoint |
-| `--token <TOKEN>` | Override the Bearer Token |
-| `--model <MODEL>` | Override the model field |
-| `--language <LANGUAGE>` | Override the request language field |
-| `--prompt <TEXT>` | Override the prompt |
-| `--text-path <PATH>` | Override the JSONPath used to select a single response value; defaults to `$.text` |
-| `--extra-config <JSON>` | Override the stringified extra JSON object |
+| `--api-endpoint <URL>` | Override the Legacy ASR endpoint |
+| `--token <TOKEN>` | Override the Legacy Bearer Token |
+| `--model <MODEL>` | Override the Legacy model field |
+| `--language <LANGUAGE>` | Override the Legacy request language field |
+| `--prompt <TEXT>` | Override the Legacy prompt |
+| `--text-path <PATH>` | Override the Legacy JSONPath used to select a single response value; defaults to `$.text` |
+| `--extra-config <JSON>` | Override the Legacy stringified extra JSON object |
+
+These overrides apply only to the Legacy Audio API. CLI loads and executes an enabled Advanced workflow from its JSON configuration, including in `--file` mode, but provides no `--generate-workflow` option and no Advanced workflow override flags.
 
 #### Audio Record
 
+These options prepare non-realtime audio. An enabled realtime workflow uses its declared PCM shape for both live chunks and file replay.
+
 | Option | Purpose |
 |---|---|
-| `--codecs <CODEC>` | Override the audio encoder |
+| `--codecs <CODEC>` | Override the encoder for non-realtime prepared audio |
 | `--list-input-devices` | List available microphones, their stable identifiers, and the system default device, then exit |
 | `--input-device <ID>` | Specify the microphone for this run; pass `default` to follow the system default |
-| `--container <FORMAT>` | Override the audio container |
-| `--channels <N>` | Override the number of channels in the final uploaded audio |
-| `--sampling-rate <HZ>` | Override the final upload sample rate; `--rate` is a compatibility alias |
-| `--sampling-rate-depth <BITS>` | Override the sample bit depth used for conversion |
-| `--bit-rate <KBPS>` | Override the audio bitrate |
-| `--enable-vad <BOOL>` | Enable or explicitly disable speech trimming; defaults to false |
+| `--container <FORMAT>` | Override the container for non-realtime prepared audio |
+| `--channels <N>` | Override the number of channels in non-realtime prepared audio |
+| `--sampling-rate <HZ>` | Override the non-realtime preparation sample rate; `--rate` is a compatibility alias |
+| `--sampling-rate-depth <BITS>` | Override the sample bit depth used for non-realtime conversion |
+| `--bit-rate <KBPS>` | Override the bitrate for non-realtime prepared audio |
+| `--enable-vad <BOOL>` | Enable or explicitly disable complete-file speech trimming; defaults to false |
 | `--vad-padding-ms <0-1000>` | Set boundary padding in milliseconds; defaults to 100 |
 | `--vad-start-threshold <0.5-1.0>` | Set the speech onset threshold; defaults to 0.6 |
 
@@ -476,7 +525,7 @@ If `--output` is omitted, output defaults to `<input filename>.txt` in the curre
 | Option | Purpose |
 |---|---|
 | `--request-timeout <SECONDS>` | Override the timeout for each client request |
-| `--max-retry <N>` | Override the maximum number of requests |
+| `--max-retry <N>` | Override Legacy request attempts, or attempts per retryable Advanced stage/session |
 | `--retry-base-delay <SECONDS>` | Override the initial delay for exponential backoff |
 | `--enable-http2 <BOOL>` | Enable or disable HTTP/2 |
 | `--verify-ssl <BOOL>` | Enable or disable TLS certificate verification |
@@ -499,7 +548,7 @@ If `--output` is omitted, output defaults to `<input filename>.txt` in the curre
 |---|---|
 | `--cache-dir <PATH>` | Override the cache directory |
 | `--keep-cache <BOOL>` | Control whether the cache is retained |
-| `--request-failed-notification <BOOL>` | Control whether `[request failed]` is inserted after audio retries are exhausted |
+| `--request-failed-notification <BOOL>` | Control whether `[request failed]` is inserted after Legacy Audio API retries are exhausted |
 
 #### Debug
 
@@ -508,7 +557,7 @@ If `--output` is omitted, output defaults to `<input filename>.txt` in the curre
 | `--ffmpeg-debug <BOOL>` | FFmpeg debug output |
 | `--record-debug <BOOL>` | Recording debug output |
 | `--hotkey-debug <BOOL>` | Hotkey debug output |
-| `--upload-debug <BOOL>` | Audio and Rewrite request debug output |
+| `--upload-debug <BOOL>` | Legacy Audio API and Rewrite request diagnostics; Advanced Audio API emits only redacted phase labels |
 
 `--help` displays the full help, and `--version` displays the version.
 
@@ -517,9 +566,9 @@ Clap returns exit code `2` for argument parsing failures. Runtime, request, conv
 
 The GUI and CLI use the same JSON structure. Missing fields use their default values, and unknown fields are ignored.
 
-### Complete OpenAI configuration example
+### Complete Legacy OpenAI configuration example
 
-Copy the [complete example file](examples/example_provider_openai.json) and replace `TOKEN`, `REWRITE.api_key`, and the second prompt's `api_key` with your API keys. Audio uses `gpt-4o-mini-transcribe`; Rewrite uses the Responses API with `gpt-5.6-terra`. Press `ctrl+alt+w` to polish text in its original language using the main Rewrite API, or `ctrl+alt+e` to translate it into English using a separate API configuration. The second example uses the same Provider but still requires its own URL, API key, and model.
+Copy the [complete example file](examples/example_provider_openai.json) and replace `TOKEN`, `REWRITE.api_key`, and the second prompt's `api_key` with your API keys. Its Audio configuration uses the Legacy API with `gpt-4o-mini-transcribe`; Rewrite uses the Responses API with `gpt-5.6-terra`. Press `ctrl+alt+w` to polish text in its original language using the main Rewrite API, or `ctrl+alt+e` to translate it into English using a separate API configuration. The second example uses the same Provider but still requires its own URL, API key, and model.
 
 ```json
 {
@@ -595,7 +644,7 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
 }
 ```
 
-See ExtraConfig below for expanded parameters and merge behavior. When switching services, use the model names, fields, and audio formats supported by that service. Keep `VERIFY_SSL=true` for normal public internet services.
+This is a Legacy Audio API example. See ExtraConfig below for expanded Legacy parameters and merge behavior. When switching services, use the model names, fields, and audio formats supported by that service. Keep `VERIFY_SSL=true` for normal public internet services. Advanced configuration is described in [Advanced Audio API](#advanced-audio-api) and its contract; this README intentionally does not provide a hand-written workflow JSON example.
 
 ### Display fields
 
@@ -604,11 +653,11 @@ See ExtraConfig below for expanded parameters and merge behavior. When switching
 | `OPACITY` | `1.0` | GUI floating window opacity. Accepts `0.10`–`1.00` in steps of `0.01`; `1.0` is fully opaque. Full and minimal modes share this setting. |
 | `WINDOW_SCALE` | `1.0` | GUI floating window scale. Accepts `0.3`–`2.0` in steps of `0.1`; saving immediately updates the window, rendered content, and mouse hit areas in both full and minimal modes. |
 
-### Audio API and response fields
+### Legacy Audio API and response fields
 
 | Field | Default | Behavior |
 |---|---:|---|
-| `API_ENDPOINT` | `""` | ASR POST URL; must not be empty when uploading |
+| `API_ENDPOINT` | `""` | Legacy ASR POST URL; must not be empty when uploading |
 | `TOKEN` | `""` | Sends `Authorization: Bearer <token>` when nonempty |
 | `MODEL` | `""` | Sends the multipart field `model` when nonempty |
 | `LANGUAGE` | `""` | Sends the multipart field `language` when nonempty |
@@ -652,7 +701,7 @@ Selecting a separate Provider does not inherit individual fields from the main c
 
 If Base URL already contains a path, that prefix is preserved and the corresponding endpoint path is completed without duplicating an existing endpoint suffix. Google constructs the URL using the model from the merged configuration and removes `model` from the request body. OpenAI Completions follows Dictate's naming convention and actually uses the Chat Completions API.
 
-Extra parameters are merged recursively after the request is constructed and can override the model and other request fields; see ExtraConfig below for the rules. Rewrite extracts results according to the provider and does not use the audio `TEXT_PATH`. It supports JSON and SSE returned by the service, ignores reasoning content, and writes the complete result once the stream finishes; partial stream results are never output. Responses are limited to 2 MiB. Network errors, HTTP 408/429/5xx responses, and corresponding service errors can be retried automatically; other HTTP errors, configuration errors, and invalid or empty results fail immediately. Known nonfinal termination reasons such as `length`, `max_tokens`, and `MAX_TOKENS` in JSON or SSE also fail immediately, without automatic retries or writing text back. Missing or unknown termination reasons remain accepted for compatibility with custom services.
+Extra parameters are merged recursively after the request is constructed and can override the model and other request fields; see ExtraConfig below for the rules. Rewrite extracts results according to the provider and does not use the Legacy audio `TEXT_PATH`. It supports JSON and SSE returned by the service, ignores reasoning content, and writes the complete result once the stream finishes; partial stream results are never output. Responses are limited to 2 MiB. Network errors, HTTP 408/429/5xx responses, and corresponding service errors can be retried automatically; other HTTP errors, configuration errors, and invalid or empty results fail immediately. Known nonfinal termination reasons such as `length`, `max_tokens`, and `MAX_TOKENS` in JSON or SSE also fail immediately, without automatic retries or writing text back. Missing or unknown termination reasons remain accepted for compatibility with custom services.
 
 ### Audio fields
 
@@ -660,8 +709,8 @@ Extra parameters are merged recursively after the request is constructed and can
 |---|---:|---|
 | `INPUT_DEVICE` | `""` | Stable identifier for the Windows recording input device; when empty or missing, uses the current system default device each time recording starts |
 | `INPUT_DEVICE_NAME` | `""` | Cached device display name for display while the device is offline; not used to identify the device |
-| `CHANNELS` | `1` | Accepts 1–8; controls only the channel count of the final uploaded audio |
-| `SAMPLING_RATE` | `16000` | Sample rate of the final uploaded audio in Hz; must be greater than 0 |
+| `CHANNELS` | `1` | Accepts 1–8; controls the channel count of non-realtime prepared audio |
+| `SAMPLING_RATE` | `16000` | Sample rate of non-realtime prepared audio in Hz; must be greater than 0 |
 | `SAMPLING_RATE_DEPTH` | `16` | Accepts 8, 16, 24, or 32; preferred output bit depth, subject to encoder support and independent of the capture format |
 | `BIT_RATE` | `128` | Must be greater than 0, in kbps |
 | `CODECS` | `"opus"` | Encoder name or compatible alias; case-insensitive |
@@ -675,13 +724,13 @@ The specific PCM encoder name determines the output bit depth. For example, `pcm
 
 The core opens the selected device in WASAPI shared mode, preferring the device's default format configured in Windows. If that format cannot be queried or is unsupported in shared mode, it uses the same device's audio engine mix format. If the selected device cannot be opened, it reports an explicit error without switching devices. The audio engine may use floating-point samples even when the physical microphone uses integer samples.
 
-The capture sample rate, channel count, and precision are independent of `SAMPLING_RATE`, `CHANNELS`, and `SAMPLING_RATE_DEPTH`. The temporary WAV preserves the actual sample rate, channel layout, and valid precision. Whole-byte padding in integer samples can be removed losslessly; for example, samples with 32-bit storage and 24 valid bits are saved as compact 24-bit PCM. `RECORD_DEBUG` logs the device, actual capture format, and whether capture fell back to the audio engine format. Output settings are applied when generating the audio for upload.
+The capture sample rate, channel count, and precision are independent of `SAMPLING_RATE`, `CHANNELS`, and `SAMPLING_RATE_DEPTH`. The temporary WAV preserves the actual sample rate, channel layout, and valid precision. Whole-byte padding in integer samples can be removed losslessly; for example, samples with 32-bit storage and 24 valid bits are saved as compact 24-bit PCM. `RECORD_DEBUG` logs the device, actual capture format, and whether capture fell back to the audio engine format. Output settings apply when generating non-realtime prepared audio; a live Advanced `realtime_session` uses the workflow's declared PCM shape.
 
 When “Follow system default” is selected, changes to the Windows default device take effect at the next recording. An explicitly selected device remains selected until the user changes it; disconnecting that device produces an error, and recording can be retried after it reconnects. An ongoing recording never switches devices. Pausing stops capture, and resuming discards any buffered samples left over from before the pause.
 
 | Field | Default | Behavior |
 |---|---:|---|
-| `ENABLE_VAD` | `false` | Applies to GUI recording, CLI recording, and CLI `--file` |
+| `ENABLE_VAD` | `false` | Applies to complete-file preparation in GUI recording, CLI recording, and CLI `--file`; live realtime does not post-trim chunks |
 | `VAD_PADDING_MS` | `100` | Integer from 0 to 1000 ms; preserved and validated even when VAD is disabled |
 | `VAD_START_THRESHOLD` | `0.6` | Range 0.5–1.0, inclusive; preserved and validated even when VAD is disabled |
 
@@ -691,18 +740,18 @@ Speech onset is confirmed after 3 consecutive frames reach `VAD_START_THRESHOLD`
 
 Up to the full padding duration is retained before the first speech segment and after the last. At internal joins, floor(padding/2) milliseconds are retained after the preceding segment, and the remainder before the following segment, for one padding duration in total. If the original gap is no longer than the padding duration, it is preserved in full and the segments are merged. With padding set to 0, speech boundaries are joined directly.
 
-If no speech is detected, no ASR request is sent and no text file is generated. GUI/hotkey mode returns to Idle, displays “No speech detected,” and clears the retry task; CLI file mode prints the result and exits normally. Temporary files are cleaned up. When speech is detected, the retry buffer still retains the original high-quality WAV. Manual retries, and automatic HTTP retries with VAD enabled, rerun detection, trimming, and transcoding. Disabling VAD preserves the existing HTTP retry behavior. `KEEP_CACHE` saves the original audio, final converted audio, and successful response according to the existing rules.
+When VAD runs on a complete-file preparation path and detects no speech, no ASR request is sent and no text file is generated. GUI/hotkey mode returns to Idle, displays “No speech detected,” and clears the retry task; CLI file mode prints the result and exits normally. Temporary files are cleaned up. When speech is detected, the retry buffer still retains the original high-quality WAV. Manual retries, and Legacy automatic HTTP retries with VAD enabled, rerun detection, trimming, and transcoding. Disabling VAD preserves the existing Legacy HTTP retry behavior. CLI `--file` realtime replay still follows its file-preparation path and can use VAD; live realtime does not post-trim chunks. `KEEP_CACHE` controls the local audio archive for completed attempts, including Advanced runtime and file-mode attempts; successful Legacy responses follow the existing response-cache rule. Advanced retry behavior is stage-specific and described in [Advanced Audio API](#advanced-audio-api).
 
 The embedded build supports WAV/PCM, MP3, FLAC, Ogg/Opus, Ogg/Vorbis, M4A/MP4/AAC, M4A/ALAC, WebM/Matroska audio, WavPack, and AC3/EAC3. Streams that cannot be decoded produce an explicit error, with no fallback to an external program.
 
 ### Network fields
 
-The following fields are shared by the Audio API and Rewrite API. `MAX_RETRY=3` means at most three requests, including the first; connection tests always make only one attempt.
+The following fields are shared by the Legacy Audio API, Advanced Audio API, and Rewrite API. For the Legacy Audio API, `MAX_RETRY=3` means at most three requests, including the first; its connection tests always make only one attempt. Advanced applies the same retry settings only to the stages that permit retries; submit has the separate no-retry rule described above.
 
 | Field | Default | Behavior |
 |---|---:|---|
 | `REQUEST_TIMEOUT` | `60` | When greater than 0, sets the reqwest client timeout in seconds; a nonpositive value leaves it unset |
-| `MAX_RETRY` | `3` | Maximum number of requests, including the first |
+| `MAX_RETRY` | `3` | Legacy maximum request count, including the first; for Advanced, maximum attempts per retryable stage or replay session |
 | `RETRY_BASE_DELAY` | `0.5` | Delay in seconds before the first retry, doubling with each subsequent retry |
 | `ENABLE_HTTP2` | `true` | Forces HTTP/1 when `false` |
 | `VERIFY_SSL` | `true` | Accepts invalid TLS certificates when `false`; not recommended for the public internet |
@@ -720,17 +769,17 @@ The following fields are shared by the Audio API and Rewrite API. `MAX_RETRY=3` 
 | `USE_SENDINPUT` | `false` | Uses the core's direct Unicode input channel in GUI and CLI hotkey modes; Rewrite always reads through the clipboard |
 | `CACHE_DIR` | `""` | When nonempty, attempts to create the directory and convert it to an absolute path; on failure, falls back to the current directory and clears the setting |
 | `KEEP_CACHE` | `false` | Retains cached files only when `CACHE_DIR` is nonempty and usable |
-| `REQUEST_FAILED_NOTIFICATION` | `false` | Writes `[request failed]` after audio retries are exhausted; Rewrite never outputs placeholder text |
+| `REQUEST_FAILED_NOTIFICATION` | `false` | Writes `[request failed]` after Legacy Audio API retries are exhausted; Advanced Audio API and Rewrite never output this placeholder text |
 | `FFMPEG_DEBUG` | `false` | Logs conversion, VAD, and native libav diagnostics |
 | `RECORD_DEBUG` | `false` | Logs the capture device, format, and recording errors |
 | `HOTKEY_DEBUG` | `true` | Logs hotkey events and information about actions attempted while busy |
-| `UPLOAD_DEBUG` | `false` | Logs destinations, attempt counts, status, elapsed time, and failed-response summaries for Audio/Rewrite requests and connection tests |
+| `UPLOAD_DEBUG` | `false` | For Legacy Audio API and Rewrite, logs destinations, attempt counts, status, elapsed time, and failed-response summaries. For Advanced Audio API, logs only fixed redacted phase labels. |
 
 These diagnostics appear in the GUI's Debug log box or the CLI's stderr. Changes to the toggles in the GUI must be saved and affect subsequent logging.
 
-## ASR API compatibility
+## Legacy Audio API compatibility
 
-The program sends an HTTP POST request:
+When Advanced Audio API is disabled, the program sends a Legacy HTTP POST request:
 
 ```http
 POST <API_ENDPOINT>
@@ -754,17 +803,17 @@ Each retry reopens the audio file and rebuilds the multipart request body. Syste
 
 ### ExtraConfig
 
-In the configuration file, audio `ExtraConfig` and prompt `extra_config` are strings containing JSON objects, as shown in the complete example above. In the GUI **Extra config** fields, paste the expanded objects below directly, without surrounding quotes or escaped double quotes. When a field loses focus, valid JSON is formatted with two-space indentation; blank or invalid input is left unchanged. Formatting does not automatically save the configuration or replace validation when saving.
+In the configuration file, Legacy audio `ExtraConfig` and prompt `extra_config` are strings containing JSON objects, as shown in the complete example above. In the GUI **Extra config** fields, paste the expanded objects below directly, without surrounding quotes or escaped double quotes. When a field loses focus, valid JSON is formatted with two-space indentation; blank or invalid input is left unchanged. Formatting does not automatically save the configuration or replace validation when saving.
 
 Merge rules:
 
-- Audio API `ExtraConfig` and each Rewrite prompt's `extra_config` share the same recursive rules. Empty or whitespace-only input means no extra parameters; all other input must be a JSON object.
+- Legacy Audio API `ExtraConfig` and each Rewrite prompt's `extra_config` share the same recursive rules. Empty or whitespace-only input means no extra parameters; all other input must be a JSON object.
 - Objects are merged recursively, preserving sibling fields that are not overridden. Arrays are replaced as a whole, not merged by index. Other values are replaced directly, and their types may change.
 - Object members whose values are `null` are removed, including members of newly created nested objects and objects within arrays. `null` elements in arrays are preserved.
-- After the Audio merge, strings, numbers, and booleans are converted to form text, while objects and arrays are converted to compact JSON strings. The binary `file` field is reserved for audio uploads and cannot be overridden or removed through ExtraConfig.
+- After the Legacy Audio merge, strings, numbers, and booleans are converted to form text, while objects and arrays are converted to compact JSON strings. The binary `file` field is reserved for Legacy audio uploads and cannot be overridden or removed through ExtraConfig.
 - Rewrite sends the merged structure directly as the JSON request body, preserving object, array, number, and boolean types.
 
-Expanded Audio API parameters:
+Expanded Legacy Audio API parameters:
 
 ```json
 {
@@ -814,7 +863,7 @@ For example, merging the base object `{"options":{"keep":1,"drop":2},"items":[1,
 {"options":{"keep":1,"add":3},"items":[null,{"text":"x"}]}
 ```
 
-### TEXT_PATH
+### Legacy `TEXT_PATH`
 
 `TEXT_PATH` uses standard JSONPath through [`serde_json_path`](https://docs.rs/serde_json_path/0.7.2/serde_json_path/). The default value, `$.text`, selects the top-level `text` field. Paths begin with `$`, which represents the root of the response.
 
@@ -862,15 +911,15 @@ In a JSON configuration, you can write `"TEXT_PATH": "$.segments[?@.id == 42].te
 - Extraction errors do not trigger automatic upload retries or paste `[request failed]`. GUI and CLI hotkey modes display the error and retain the recording if one is available for retry; CLI file mode exits with code `1` without writing a transcript file.
 - Matching an empty string counts as successful extraction. GUI and CLI hotkey modes return to `Idle` without pasting anything; file mode writes an empty text file.
 
-### Retries and cancellation
+### Legacy retries and cancellation
 
-- Request errors and non-200 responses trigger the retry process.
+- Legacy request errors and non-200 responses trigger the retry process.
 - JSONPath syntax errors and response extraction errors do not trigger automatic retries.
 - `MAX_RETRY` includes the first request.
 - The delay starts at `RETRY_BASE_DELAY` and doubles after each failure.
 - Manual cancellation aborts any ongoing request transmission, response read, or retry wait.
 - Cancellation is not an error: GUI and CLI hotkey modes return to `Idle` and display “Request canceled”.
-- The program attempts to paste `[request failed]` only when audio request retries are exhausted and `REQUEST_FAILED_NOTIFICATION=true`.
+- The program attempts to paste `[request failed]` only when Legacy Audio API retries are exhausted and `REQUEST_FAILED_NOTIFICATION=true`.
 - GUI and CLI hotkey modes keep the most recently completed recording in memory as a WAV available for retry, provided it does not exceed 100,000,000 bytes. This WAV is retained after manual request cancellation and after a retry succeeds or fails.
 - Canceling a recording does not replace the previous WAV available for retry. Completing a new recording replaces it; if the new recording exceeds the size limit, no WAV is retained for retry.
 ## Default hotkeys and syntax
@@ -935,7 +984,7 @@ Both delays are shared with Rewrite reads and correspond to **Paste delay** and 
 
 If the paste shortcut has been sent but restoring the original clipboard fails, the application reports this separately from a failure before pasting.
 
-Enable “Use SendInput” below the restore delay field on the Audio Hotkeys page, set `USE_SENDINPUT=true`, or pass `--use-sendinput true` to enter Unicode text directly. It defaults to off when the field is missing from an older configuration. Recognition results, audio retry results, successful Rewrite results, and audio `[request failed]` messages all follow this setting; standard output and file output are unaffected. With SendInput enabled, the two clipboard delay fields remain editable because Rewrite reads still use them; they are disabled only temporarily while saving.
+Enable “Use SendInput” below the restore delay field on the Audio Hotkeys page, set `USE_SENDINPUT=true`, or pass `--use-sendinput true` to enter Unicode text directly. It defaults to off when the field is missing from an older configuration. Recognition results, audio retry results, successful Rewrite results, and Legacy Audio API `[request failed]` messages all follow this setting; standard output and file output are unaffected. With SendInput enabled, the two clipboard delay fields remain editable because Rewrite reads still use them; they are disabled only temporarily while saving.
 
 `USE_SENDINPUT` controls writing only. The SendInput output path does not read or write the clipboard and does not automatically fall back or resend; Rewrite reads always follow the backup, `Ctrl+C`, read, and restore procedure described above. Text is sent in UTF-16 batches without splitting surrogate pairs. CRLF and LF are normalized to CR; newlines and Tabs are sent as Unicode character events, without simulating physical Enter/Tab keypresses, so the actual behavior still depends on the target control. If modifiers have not been released, the application waits up to two seconds. Cancellation stops subsequent batches but cannot undo text already entered. A partial send explicitly warns that some text may already have been entered. API success means that events have been injected, not that the target control has received them; input focus, control compatibility, and Windows permission restrictions still apply.
 
@@ -957,9 +1006,9 @@ When `KEEP_CACHE=false` or `CACHE_DIR` is empty, temporary audio is deleted afte
 audio-YYYY-MM-DD-HH.MM.SS.<ext>
 ```
 
-Only HTTP 200 responses are written to the corresponding `.json` file, including the raw response when JSON parsing or text extraction fails; the file contents are not necessarily valid JSON. No response file is generated if the request fails or is canceled before a successful HTTP response is received.
+For the Legacy Audio API, only HTTP 200 responses are written to the corresponding `.json` file, including the raw response when JSON parsing or text extraction fails; the file contents are not necessarily valid JSON. No response file is generated if the request fails or is canceled before a successful HTTP response is received. Advanced workflows use their own accepted statuses and do not use this Legacy response-cache rule.
 
-The retry buffer in the GUI and CLI hotkey mode is independent of this optional disk cache: it keeps only the most recently finished WAV in memory, up to 100,000,000 bytes, and is released when the process exits (including normal shutdown, sign-out, or power loss). A retry temporarily recreates a `RecordTemp_` WAV for conversion and deletes it after that attempt; no persistent retry cache is created. `KEEP_CACHE` continues to control only the existing optional audio archive for ordinary recording requests.
+The retry buffer in the GUI and CLI hotkey mode is independent of this optional disk cache: it keeps only the most recently finished WAV in memory, up to 100,000,000 bytes, and is released when the process exits (including normal shutdown, sign-out, or power loss). A retry temporarily recreates a `RecordTemp_` WAV for conversion and deletes it after that attempt; no persistent retry cache is created. `KEEP_CACHE` controls the optional local audio archive, including Advanced runtime and file-mode attempts.
 
 Rewrite does not create an audio cache or a persistent request/response cache, and does not alter the audio retry buffer.
 
@@ -1088,8 +1137,8 @@ FFmpeg 8.1 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoder
 
 ## Security and privacy
 
-- Recording and transcoding take place locally; converted audio is sent to `API_ENDPOINT`. When Rewrite is triggered, text copied from the target application, the prompt, and extra parameters are sent to the configured Rewrite service; reading temporarily changes the clipboard, and its backup is restored before the request is sent.
-- `TOKEN`, `REWRITE.api_key`, and each prompt's `api_key` are stored in plain text in the JSON configuration. The GUI's password fields only mask their display and provide no encryption on disk.
+- Recording and transcoding take place locally. Legacy converted audio is sent to `API_ENDPOINT`; Advanced audio or its declared remote reference is sent to the workflow's configured targets. When Rewrite is triggered, text copied from the target application, the prompt, and extra parameters are sent to the configured Rewrite service; reading temporarily changes the clipboard, and its backup is restored before the request is sent.
+- `TOKEN`, `REWRITE.api_key`, each prompt's `api_key`, Advanced Secrets, and remote-storage credentials are stored in plain text in the JSON configuration. The GUI's password fields only mask their display and provide no encryption on disk.
 - Keep `VERIFY_SSL=true` for public services.
 - `VERIFY_SSL=false` accepts invalid certificates, potentially exposing connections to man-in-the-middle attacks.
 - The HTTP client does not read system proxy settings. If a proxy is needed, handle it at a trusted gateway or API endpoint.
@@ -1117,7 +1166,7 @@ For automated format/VAD tests for this capture update, user-reported manual Win
 
 | Component | Path | Purpose / output |
 |---|---|---|
-| Core library | `crates/dictate-core/` | Configuration, ASR, Rewrite, selection reading, recursive parameters, recording, shared text output, and state machine |
+| Core library | `crates/dictate-core/` | Configuration, Legacy and Advanced Audio API execution, Rewrite, selection reading, recursive parameters, recording, remote audio, shared text output, and state machine |
 | CLI | `crates/dictate-cli/` | `dictate-cli.exe` |
 | Native GUI | `crates/dictate-gui/` | `Dictate.exe` |
 | libav bridge | `native/` | C ABI shared by the GUI and CLI |

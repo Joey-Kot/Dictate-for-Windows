@@ -15,18 +15,24 @@ static-libav = []
 [dependencies]
 earshot = "=1.2.2"
 async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 hound.workspace = true
+hmac.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_path.workspace = true
+sha2.workspace = true
+sha1.workspace = true
 tempfile = "3.21.0"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-tungstenite.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -37,4 +43,3 @@ cc = "1.2.33"
 pkg-config = "0.3.32"
 
 [dev-dependencies]
-base64.workspace = true

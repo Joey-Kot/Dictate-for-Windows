@@ -1,0 +1,3 @@
+event: delta
+data: {"text":"never return this partial"}
+

@@ -117,7 +117,19 @@ pub(crate) fn safe_url(input: &str) -> String {
 /// Remove credentials before any caller truncates the message. Also cover JSON
 /// escaping and URL encoding when a service echoes credentials in an error.
 pub(crate) fn request_message(message: &str, config: &crate::Config) -> String {
-    redact_request(message, config, None)
+    redact_request(message, config, None, &[])
+}
+
+/// Like [`request_message`], but also removes values captured by a running
+/// Advanced Audio workflow when that capture was classified as sensitive.
+/// Those values are intentionally execution-local and never written into
+/// `Config`, so callers must supply them at the display/log boundary.
+pub(crate) fn request_message_with_sensitive_captures(
+    message: &str,
+    config: &crate::Config,
+    sensitive_captures: &[String],
+) -> String {
+    redact_request(message, config, None, sensitive_captures)
 }
 
 /// Include an in-flight prompt draft without replacing the saved credentials.
@@ -126,24 +138,58 @@ pub(crate) fn request_message_for_prompt(
     config: &crate::Config,
     prompt: &crate::rewrite::RewritePrompt,
 ) -> String {
-    redact_request(message, config, Some(prompt))
+    redact_request(message, config, Some(prompt), &[])
 }
 
 fn redact_request(
     message: &str,
     config: &crate::Config,
     prompt: Option<&crate::rewrite::RewritePrompt>,
+    sensitive_captures: &[String],
 ) -> String {
     let prompts = || config.rewrite.prompts.iter().chain(prompt);
-    let keys = [&config.token, &config.rewrite.api_key]
-        .into_iter()
-        .chain(prompts().map(|prompt| &prompt.api_key));
+    let mut keys: Vec<&str> = vec![&config.token, &config.rewrite.api_key];
+    keys.extend(prompts().map(|prompt| prompt.api_key.as_str()));
+    keys.extend(
+        config
+            .advanced_audio_api
+            .secrets
+            .values()
+            .map(String::as_str),
+    );
+    keys.extend(sensitive_captures.iter().map(String::as_str));
+    let mut urls: Vec<&str> = vec![&config.api_endpoint, &config.rewrite.base_url];
+    urls.extend(prompts().map(|prompt| prompt.base_url.as_str()));
+    match &config.advanced_audio_api.remote_audio {
+        crate::advanced_audio::schema::RemoteAudioConfig::None => {}
+        crate::advanced_audio::schema::RemoteAudioConfig::Webdav(remote) => {
+            keys.extend([remote.username.as_str(), remote.password.as_str()]);
+            urls.extend([
+                remote.upload_base_url.as_str(),
+                remote.public_download_base_url.as_str(),
+            ]);
+        }
+        crate::advanced_audio::schema::RemoteAudioConfig::S3Compatible(remote) => {
+            keys.extend([remote.access_key.as_str(), remote.secret_key.as_str()]);
+            urls.extend(
+                [remote.endpoint.as_str()]
+                    .into_iter()
+                    .chain(remote.public_url_base.as_deref()),
+            );
+        }
+        crate::advanced_audio::schema::RemoteAudioConfig::AliyunOss(remote) => {
+            keys.extend([remote.access_key.as_str(), remote.secret_key.as_str()]);
+            urls.extend(
+                [remote.endpoint.as_str()]
+                    .into_iter()
+                    .chain(remote.public_url_base.as_deref()),
+            );
+        }
+    }
     let mut secrets: Vec<_> = keys
-        .flat_map(|key| [key.clone(), key.trim().to_owned()])
-        .collect();
-    let urls = [&config.api_endpoint, &config.rewrite.base_url]
         .into_iter()
-        .chain(prompts().map(|prompt| &prompt.base_url));
+        .flat_map(|key| [key.to_owned(), key.trim().to_owned()])
+        .collect();
     for input in urls {
         if let Ok(url) = reqwest::Url::parse(input) {
             for secret in std::iter::once(url.username()).chain(url.password()) {
@@ -186,11 +232,78 @@ fn redact_request(
     variants
         .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     variants.dedup();
-    variants
+    let redacted = variants
         .into_iter()
         .fold(message.to_owned(), |text, secret| {
             redact_variant(&text, &secret)
-        })
+        });
+    redact_protocol_credentials(&redacted)
+}
+
+/// Credentials in a signed request can contain derived signatures that are
+/// not present in config. Redact their labelled forms as a second line of
+/// defence, as well as common auth/cookie fields that may be pasted into a
+/// vendor response. This is intentionally a conservative text scrubber rather
+/// than a parser: logs can contain HTTP, JSON, curl-like, and URL text.
+fn redact_protocol_credentials(message: &str) -> String {
+    let mut output = message.to_owned();
+    for marker in [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+        "x-api-key:",
+        "api-key:",
+    ] {
+        output = redact_until_delimiter(&output, marker, true);
+    }
+    for marker in [
+        "signature=",
+        "credential=",
+        "x-amz-signature=",
+        "x-amz-credential=",
+        "x-tc-signature=",
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "token=",
+        "password=",
+        "secret=",
+        "secret_key=",
+    ] {
+        output = redact_until_delimiter(&output, marker, false);
+    }
+    output
+}
+
+fn redact_until_delimiter(input: &str, marker: &str, line_value: bool) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let marker = marker.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative) = lowercase[cursor..].find(&marker) {
+        let start = cursor + relative;
+        let value_start = start + marker.len();
+        output.push_str(&input[cursor..value_start]);
+        let rest = &input[value_start..];
+        let offset = rest
+            .char_indices()
+            .find_map(|(index, character)| {
+                let end = if line_value {
+                    matches!(character, '\r' | '\n')
+                } else {
+                    matches!(character, '&' | ' ' | '\t' | '\r' | '\n' | '"' | '\'')
+                };
+                end.then_some(index)
+            })
+            .unwrap_or(rest.len());
+        if offset > 0 {
+            output.push_str("[redacted]");
+        }
+        cursor = value_start + offset;
+    }
+    output.push_str(&input[cursor..]);
+    output
 }
 
 // Userinfo uses percent encoding, not form encoding: '+' stays a literal plus.
@@ -526,5 +639,17 @@ mod tests {
         }
         assert_eq!(request_message("draft\"key", &config), "draft\"key");
         assert_eq!(config.rewrite.prompts[0].api_key, "original-key");
+    }
+
+    #[test]
+    fn execution_local_sensitive_captures_are_redacted_with_encoded_variants() {
+        let config = crate::Config::default();
+        let capture = "capture/value with space".to_owned();
+        let cleaned = request_message_with_sensitive_captures(
+            "url=capture%2Fvalue+with+space raw=capture/value with space",
+            &config,
+            &[capture],
+        );
+        assert_eq!(cleaned, "url=[redacted] raw=[redacted]");
     }
 }

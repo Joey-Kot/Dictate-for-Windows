@@ -2,7 +2,7 @@
 
 # Dictate for Windows
 
-Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客户端。它通过全局快捷键或原生浮窗录制麦克风音频，将完整音频文件发送到兼容的 ASR HTTP 接口，提取识别文本后自动写入当前输入位置。还可以通过提示词快捷键改写选中的文本；成功结果与转录共用剪贴板或 SendInput 写入方式。
+Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客户端。它通过全局快捷键或原生浮窗录制麦克风音频，使用现有的 Legacy Audio API（旧音频 API）或已启用的高级 Audio API 工作流取得完整转写，再自动写入当前输入位置。还可以通过提示词快捷键改写选中的文本；成功结果与转录共用剪贴板或 SendInput 写入方式。
 
 项目包含两个 Rust 程序：
 
@@ -15,7 +15,8 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 - **录音转写**：通过浮窗或全局快捷键录音，支持暂停、取消和重新转录最近一次录音。
 - **文本改写**：为提示词配置快捷键，调用不同服务商的文本模型改写选中文本。
-- **自定义 API**：配置 ASR 与 Rewrite 接口、模型、提示词和额外请求参数。
+- **自定义 API**：配置旧音频 API 与 Rewrite 接口、模型、提示词和额外请求参数。
+- **高级 Audio API**：可选择启用经过校验的声明式工作流，支持单请求、流式响应、异步轮询和 WebSocket 实时转写。
 - **自动写入**：转写与改写结果共用剪贴板粘贴或 SendInput，写入当前应用。
 - **音频处理**：选择麦克风和输出格式，可选语音检测与裁剪；内嵌 FFmpeg，无需另行安装。
 - **GUI 与 CLI**：提供多语言原生浮窗和命令行程序，支持日常录音、脚本调用及已有音频文件转写。
@@ -38,7 +39,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 ## 架构
 
-GUI 与 CLI 快捷键模式共用 `dictate-core` 的交互式运行时，统一处理录音、改写、快捷键、任务互斥和取消。CLI 文件模式直接调用核心音频处理与 ASR 流程，不注册快捷键，也不自动写入当前应用。
+GUI 与 CLI 快捷键模式共用 `dictate-core` 的交互式运行时，统一处理录音、识别、改写、快捷键、任务互斥和取消。CLI 文件模式直接调用核心音频处理与所选 Audio API 路径，不注册快捷键，也不自动写入当前应用。
 
 ```mermaid
 flowchart LR
@@ -53,7 +54,7 @@ flowchart LR
         Recorder["WASAPI 录音<br/>最近一次录音重试"]
         Selection["Ctrl+C 读取文本<br/>备份与恢复剪贴板"]
         Prepare["内嵌 libav 音频转换<br/>可选 VAD 检测与裁剪"]
-        ASR["Audio API<br/>JSONPath 提取文本"]
+        ASR["旧音频 API / 高级工作流<br/>产出完整转写"]
         Rewrite["Rewrite API<br/>提示词与 Provider"]
         Output["共享文本写入<br/>剪贴板 Ctrl+V / SendInput"]
     end
@@ -62,6 +63,7 @@ flowchart LR
     CLI --> Runtime
     Runtime -->|录音| Recorder
     Recorder --> Prepare
+    Recorder -->|实时麦克风分块| ASR
     FileMode --> Prepare
     Prepare --> ASR
     Runtime -->|提示词快捷键| Selection
@@ -72,7 +74,7 @@ flowchart LR
     ASR -->|文件模式| TextFile["文本文件"]
 ```
 
-Audio 与 Rewrite 使用各自的 API 配置，共用网络设置和文本写入方式。每条 Rewrite 提示词可以沿用主 Rewrite API，也可以配置独立的 Provider、Base URL、API Key 和 Model。Rewrite 读取始终使用剪贴板，不受 `USE_SENDINPUT` 影响。
+Audio 与 Rewrite 使用各自的 API 配置，共用网络设置和文本写入方式。默认使用旧音频 API，只有 `ADVANCED_AUDIO_API.enabled=true` 时才切换为高级 Audio API。每条 Rewrite 提示词可以沿用主 Rewrite API，也可以配置独立的 Provider、Base URL、API Key 和 Model。Rewrite 读取始终使用剪贴板，不受 `USE_SENDINPUT` 影响。
 
 ## 录音与改写流程
 
@@ -95,13 +97,13 @@ sequenceDiagram
             Core->>Audio: 暂停 / 恢复采集
         end
         User->>Core: 停止录音
-        Core->>Audio: 完成 WAV，按配置准备上传音频
+        Core->>Audio: 完成 WAV，按所选投递方式准备音频
         Note over Core,Audio: 可选 VAD 检测与裁剪；内嵌 libav 转换格式
         Audio-->>Core: 音频准备结果
         break VAD 未检测到语音
             Core-->>User: 清除重试缓冲并结束，不请求 ASR
         end
-        Core->>API: Audio API 上传完整音频
+        Core->>API: 通过所选旧音频 API 或高级 Audio API 投递音频
     else 选中文本改写
         User->>Core: 触发提示词快捷键
         Core->>Clipboard: 备份并清空
@@ -118,7 +120,7 @@ sequenceDiagram
     end
 
     API-->>Core: 返回响应
-    Core->>Core: 按 Audio JSONPath 或 Rewrite Provider 提取并验证结果
+    Core->>Core: 按所选 Audio 提取器或 Rewrite Provider 提取并验证结果
     opt 有可写入文本且未取消
         alt USE_SENDINPUT=true
             Core->>App: SendInput 写入 Unicode 文本
@@ -133,7 +135,7 @@ sequenceDiagram
     Core-->>User: 完成并更新状态
 ```
 
-- 录音停止后才转换并上传完整音频，不进行实时流式识别。Rewrite 也只在取得完整有效结果后一次性写入。
+- 图中的停止录音与完成 WAV 路径描述完整文件投递。旧音频 API 只会在停止录音后转换并上传完整音频，不提供实时识别。高级 `realtime_session` 可以在录音过程中发送麦克风分块；暂停会结束当前会话，恢复时新建会话。所有高级模式都等待一份完整最终转写，绝不将部分文本写入前台应用。
 - Rewrite 读取与剪贴板写入共用 **Paste delay** 和 **Restore delay**。即使开启 SendInput，这两个设置仍用于 Rewrite 读取。
 - 请求失败、空结果或取消后的 Rewrite 结果不进入写入。已经开始的文本写入无法撤回，具体行为见“剪贴板与自动粘贴”。
 
@@ -177,7 +179,7 @@ stateDiagram-v2
 ```
 
 - 录音（含暂停）、转写、Rewrite 和连接测试串行运行。忙碌时的新任务直接丢弃，不排队；取消可以中止当前任务，清理与剪贴板恢复结束前不接受新任务。
-- 连接测试使用当前设置草稿，只请求一次，不读取选区、不写入文本；成功、失败或取消后均回到 `Idle`。
+- 旧音频 API 和 Rewrite 的连接测试使用当前设置草稿，只请求一次。高级 **测试工作流** 经确认后执行声明的工作流，因此可能包含远程上传、轮询、结果获取或录制音频实时回放。测试不读取选区、不写入文本；成功、失败或取消后均回到 `Idle`。
 - Retry 只重新转录最近一条已结束的音频，不触发 Rewrite。重试缓冲仅保存在内存中，上限为 100,000,000 字节；新录音完成后替换，录制中取消、请求取消或重试结束后保留，VAD 未检测到语音时清除。
 
 ## 功能范围与当前限制
@@ -185,16 +187,18 @@ stateDiagram-v2
 - 当前 Release 只提供 Windows x86_64 构建。
 - GUI 是 Windows 专用原生程序；CLI 源码可在其他系统编译，但全局 Windows 快捷键功能只在 Windows 可用。
 - 麦克风采集和设备枚举仅支持 Windows。GUI 和 CLI 均可指定录音输入设备或跟随系统默认，每次开始录音时重新解析设备。
-- 录音后一次性上传完整音频，不支持实时流式识别。
-- ASR 接口必须接受 `multipart/form-data` 并返回 JSON。
-- Audio API 只有 HTTP 200 被视为成功；Rewrite 接受成功状态码，并要求可解析的非空文本结果。
+- 旧音频 API 在录音后上传完整音频，不支持实时流式识别。
+- 旧 ASR 接口必须接受 `multipart/form-data` 并返回 JSON。
+- 旧音频 API 只有 HTTP 200 被视为成功；Rewrite 接受成功状态码，并要求可解析的非空文本结果。
+- 可选的高级 Audio API 支持有限的单请求、流式响应、异步轮询和 WebSocket 实时工作流，可使用 HTTP、HTTPS、WebSocket 或安全 WebSocket 端点，并允许 localhost 和局域网目标。
+- 高级 Audio API 第一版不支持 gRPC、自定义 HTTP/2 事件流、仅回调或仅 Webhook 的完成方式、任意工作流、分支、循环、用户脚本、自定义签名器代码、服务商专用的实时恢复，或将实时部分文本写入前台应用。
 - HTTP 客户端不使用系统代理、不自动跟随重定向，也不启用自动响应压缩。
 - 内嵌 libav 在阻塞工作线程运行，解码、区间处理和文件 I/O 均接入取消回调；清理会等待工作线程关闭输出。
 - 转录与 Rewrite 共用现有文本写入流程，按写入时的焦点和选区处理。等待期间切换焦点会改变最终写入目标；程序不会恢复触发时的窗口或选区。
 - Rewrite 通过目标应用的 `Ctrl+C` 命令读取输入，期间会临时改变并恢复剪贴板；兼容性取决于应用的复制行为、焦点和 Windows 权限限制。
 - GUI 不提供 Windows Toast、托盘气泡或其他系统通知。
 - 旧配置中的 `NOTIFICATION` 会被忽略，保存时不会重新写入。
-- `REQUEST_FAILED_NOTIFICATION` 不是系统通知开关；它只控制音频请求重试耗尽后是否写入 `[request failed]`，不用于 Rewrite。
+- `REQUEST_FAILED_NOTIFICATION` 不是系统通知开关；它只控制旧音频 API 重试耗尽后是否写入 `[request failed]`，不用于高级 Audio API 或 Rewrite。
 
 ## 运行要求
 
@@ -202,7 +206,7 @@ stateDiagram-v2
 
 - Windows 10 或 Windows 11 x86_64。
 - 录音功能需要可用的麦克风输入设备。
-- 转写需要兼容的 ASR HTTP 接口；Rewrite 需要受支持的文本服务。
+- 转写需要兼容的旧 ASR HTTP 接口，或已启用且通过校验的高级 Audio API 工作流；Rewrite 需要受支持的文本服务。
 - 无需安装 FFmpeg、PortAudio、WebView2 或 Visual C++ Redistributable。
 
 ### CLI
@@ -210,7 +214,7 @@ stateDiagram-v2
 - Windows x86_64。
 - 快捷键录音模式需要麦克风。
 - 无需安装系统 FFmpeg。
-- 转写需要兼容的 ASR HTTP 接口；Rewrite 需要受支持的文本服务。
+- 转写需要兼容的旧 ASR HTTP 接口，或已启用且通过校验的高级 Audio API 工作流；Rewrite 需要受支持的文本服务。
 
 ### 从源码开发
 
@@ -232,7 +236,7 @@ stateDiagram-v2
 ```
 
 4. 通过浮窗齿轮按钮或托盘菜单打开设置。
-5. 至少填写 `API_ENDPOINT`，并按服务要求填写 `TOKEN`、`MODEL` 和 `TEXT_PATH`。
+5. 默认旧音频 API 至少需要填写 `API_ENDPOINT`，并按服务要求填写 `TOKEN`、`MODEL` 和 `TEXT_PATH`。如需使用高级 Audio API，请在其设置页启用并准备通过校验的工作流。
 6. 保存设置后使用浮窗按钮或默认快捷键开始录音。
 
 界面语言单独保存在：
@@ -241,7 +245,7 @@ stateDiagram-v2
 %APPDATA%\dictate\ui-language.txt
 ```
 
-语言设置不会写入 ASR 配置文件，也不会改变请求中的 `LANGUAGE` 字段。
+语言设置不会写入旧 ASR 配置字段，也不会改变旧 API 请求中的 `LANGUAGE` 字段。
 
 ### 浮窗操作
 
@@ -262,12 +266,13 @@ stateDiagram-v2
 | 页面 | 内容 |
 |---|---|
 | Display | 界面语言、配置文件位置、浮窗透明度和浮窗缩放 |
-| Audio API | 地址、Token、模型、语言、提示词、文本路径和额外字段 |
+| Audio API | 旧接口的地址、Token、模型、语言、提示词、文本路径和额外字段 |
+| 高级 Audio API | 启用开关、工作流生成与校验、声明的参数值和密钥、原始工作流 JSON、远程托管和测试工作流 |
 | Audio Record | 麦克风（第一项）、输出声道数、输出采样率、输出位深、比特率、编码器、容器、VAD 和边界填充 |
 | Rewrite API | Provider、Base URL、API Key、Model、提示词列表、ADD PROMPT 和连接测试 |
-| Network | Audio API 与 Rewrite API 共用的超时、重试、HTTP/2 和 TLS 校验 |
+| Network | 旧音频 API、高级 Audio API 与 Rewrite API 共用的超时、重试、HTTP/2 和 TLS 校验 |
 | Audio Hotkeys | 三个快捷键、低级键盘钩子开关、两个剪贴板等待时间和使用 SendInput 开关 |
-| Cache | 缓存目录、缓存保留和请求失败占位文本 |
+| Cache | 缓存目录、缓存保留和旧请求失败占位文本 |
 | Debug | FFmpeg、录音、快捷键和上传调试开关，以及带复制全部、清空功能的实时只读输出框 |
 | About | 项目、作者、许可证和仓库信息 |
 
@@ -310,7 +315,7 @@ Rewrite 成功后直接复用转录的写入流程：`USE_SENDINPUT=false` 使�
 
 **Test connectivity** 测试当前 API 草稿。提示词窗口选择独立 Provider 后，底部也会显示测试按钮，使用该提示词的 API 字段和主设置页当前的 **Network** 草稿。Rewrite 测试发送固定内容，不使用实际的 Title、Prompt Content、Extra config 或 Hotkey；尚未填写这些内容也可以测试。测试不读取选区、不回填文本，也不保存草稿。
 
-Audio 与 Rewrite 的连接测试均只请求一次，并与录音、转写和改写共用任务互斥与公共取消操作。关闭测试所在窗口会取消测试；在提示词窗口切换 Provider 或编辑 API 字段也会取消正在进行的测试并清除旧结果。测试期间提示词窗口暂时禁用保存和重复测试，取消按钮仍可用。正常 Rewrite 的超时、HTTP/2、TLS 校验、总尝试次数和退避时间全部使用 **Network**，无需独立配置 Retry。
+旧音频 API 与 Rewrite 的连接测试均只请求一次，并与录音、转写和改写共用任务互斥与公共取消操作。关闭测试所在窗口会取消测试；在提示词窗口切换 Provider 或编辑 API 字段也会取消正在进行的测试并清除旧结果。测试期间提示词窗口暂时禁用保存和重复测试，取消按钮仍可用。正常 Rewrite 的超时、HTTP/2、TLS 校验、总尝试次数和退避时间全部使用 **Network**，无需独立配置 Retry。
 
 ### 调试输出
 
@@ -319,7 +324,7 @@ Audio 与 Rewrite 的连接测试均只请求一次，并与录音、转写和�
 - 调试开关点击“保存”后生效，API 连接测试也遵守此规则。开关控制之后产生的日志，关闭某一类不会删除已经收集的记录。
 - 日志框每 200 ms 刷新一次；位于底部且没有选中文本时自动跟随新输出。向上滚动或选中文本后保留浏览位置，鼠标选区和滚动条拖动过程不会被刷新打断。
 - 日志仅保留在本次 GUI 运行的内存中，关闭设置窗口后仍然保留。最多保留 **2000 行或 1 MiB**，超出后淘汰最早的行，单条过长日志会截断。退出程序即清空，不写入磁盘。
-- **Upload debug** 覆盖 Audio、Rewrite 和所有连接测试，记录请求目标、尝试次数、HTTP 状态、耗时、重试和错误。配置中的 API 密钥及 URL 账号、密码和查询参数值会隐藏，包括网络错误中保留的原始百分号编码及大小写混合的转义形式；不主动记录正常的提示词、输入和结果正文，失败响应摘要可能包含服务端返回的详情。
+- 旧音频 API、Rewrite 及其连接测试的 **Upload debug** 会记录请求目标、尝试次数、HTTP 状态、耗时、重试和错误。配置中的 API 密钥及 URL 账号、密码和查询参数值会隐藏，包括网络错误中保留的原始百分号编码及大小写混合的转义形式；不主动记录正常的提示词、输入和结果正文，失败响应摘要可能包含服务端返回的详情。高级 Audio API 使用下文更严格的、只记录脱敏阶段的诊断。
 
 Core 通过可选接收接口向 GUI 传递诊断；日志框及会话缓冲属于 GUI。CLI 的调试信息继续输出到 stderr。
 
@@ -328,6 +333,46 @@ Core 通过可选接收接口向 GUI 传递诊断；日志框及会话缓冲属�
 - 焦点在快捷键输入框中时，`Esc` 用于录入快捷键，不关闭窗口。在 Provider、麦克风或音频输出列表中，按 `Esc` 先收起列表；在音频自定义输入框中则退出自定义编辑。其他情况下优先关闭设置窗口，设置窗口未打开时进入退出流程。
 - 录音、暂停、上传或 Rewrite 期间退出会显示确认对话框。
 - 退出会取消录音和当前请求，等待正在进行的 Rewrite 输入读取恢复剪贴板，并移除托盘图标、停止快捷键线程。
+
+## 高级 Audio API
+
+高级 Audio API 是受限、声明式的 ASR 协议工作流。它默认关闭：缺少 `ADVANCED_AUDIO_API`，或 `ADVANCED_AUDIO_API.enabled=false` 时，程序无需迁移配置即可保持现有旧音频 API 行为。启用高级 Audio API 后，经过校验的工作流在转写时优先。`API_ENDPOINT`、`TOKEN`、`MODEL`、`LANGUAGE`、`PROMPT`、`TEXT_PATH` 和 `ExtraConfig` 仍会作为旧设置保存且可编辑，但不参与高级转写。
+
+`dictate-core` 负责可序列化 Schema、校验、传输、远程音频处理、签名、取消和执行。GUI 与 CLI 使用同一套 Core 执行器。GUI 可以通过已配置的 Rewrite API，根据厂商文档或请求/响应示例生成工作流；CLI 没有工作流生成器，执行已保存的工作流也不依赖 LLM。
+
+### 工作流与设置
+
+GUI 的 **高级 Audio API** 页面可粘贴厂商资料、生成工作流、查看摘要和警告、校验、编辑原始工作流 JSON，并配置远程托管。生成结果必须通过 Core 校验；生成的工作流若校验失败，最多只会进行一次修复。发送给生成器的厂商资料会先在本地尽力脱敏。
+
+启用高级 Audio API 后，旧音频 API 页面仍可编辑，并会提示其设置当前不参与转写。
+
+工作流自行声明 **参数值** 和 **密钥**。GUI 根据这些声明动态生成控件，并将值与工作流分开保存，密钥输入会掩码显示。Core 会在任何网络请求前检查 Schema 版本、模板引用、声明 ID、阶段顺序、投递方式兼容性和远程托管要求。工作流不能执行任意代码、脚本、shell、分支、循环，也不能选择任意本地文件路径。
+
+配置会在 `ADVANCED_AUDIO_API` 下保存启用状态、工作流、参数值、密钥和远程托管。不要根据非正式示例手写工作流；应以下列 Schema 合同为准。
+
+- [高级 Audio API 合同](docs/advanced-audio-api-contract.md)
+- [高级 Audio API 协议矩阵](docs/advanced-audio-protocol-matrix.md)
+
+### 识别模式、投递方式与认证
+
+- `request`：发送一次 HTTP 请求并提取最终响应。
+- `request_stream`：发送一次 HTTP 请求后读取 SSE、NDJSON 或 JSON 分块，直到显式完成事件。
+- `async_poll`：可先准备或由服务商上传，只提交一次，再使用 GET 或 POST 轮询至终态，并最多执行两次只读结果请求。
+- `realtime_session`：通过 WebSocket 使用麦克风分块或录制文件回放。
+
+声明的音频投递方式可以是带类型的 multipart、裸音频、Base64、Data URI、公开 HTTPS URL、云 URI、服务商上传或实时分块。每个高级 HTTP 阶段自行声明可接受状态码，旧 API 的“仅 HTTP 200 成功”规则不适用。Bearer、Basic、API Key 和静态 header/query 可通过密钥模板声明。远程托管支持 WebDAV、S3 兼容存储和阿里云 OSS。WebDAV 只能提供公开 HTTPS URL；S3 兼容存储和 OSS 可提供公开 HTTPS URL 或各自的云 URI。这两种表示严格区分，不会隐式转换。内置动态签名器只有 AWS SigV4 和 Tencent TC3；禁止工作流自定义签名器代码，且动态签名不能用于流式 multipart 或裸音频上传。
+
+### 取消、重试与实时识别
+
+取消覆盖上传、HTTP 请求与响应、轮询等待、结果获取、WebSocket、回放节奏、最终收尾和尽力清理远程对象。允许重试的 `request` 和 `request_stream` 尝试会使用配置的重试策略。由于 submit 可能已经创建远程任务，绝不自动重试；轮询和只读结果请求可重试，但不会重新提交。识别成功后，**识别后删除** 控制已发布远程对象的正常删除。上传已发起后，上传失败、识别失败或取消仍会强制尽力删除；清理失败不会取代原始结果。
+
+对于实时工作流，Dictate 在发送按时间节奏的 `pcm_s16le` 麦克风音频时始终保留完整本地 WAV。不支持 `unbounded` 节奏或 `keep_session` 暂停行为。暂停会结束当前会话，恢复时新建会话。实时网络失败，或实时收尾期间取消时，会丢弃部分或已提交的实时转写状态，完成录音后从字节零开始在新会话中回放完整 WAV。重试同样从零开始新建回放会话。部分文本绝不会写入前台应用；只有一份最终完整转写走普通剪贴板或 SendInput 输出。CLI `--file` 可以把实时工作流作为录制文件回放运行。
+
+### 测试、诊断和第一版边界
+
+**测试工作流** 会先展示目标主机、是否需要远程上传、识别模式以及是否为录制音频实时回放；用户确认前不会访问网络。确认后，它使用固定的短音频通过相同的 Core 工作流执行。`UPLOAD_DEBUG` 对高级 Audio API 只记录固定阶段标签，不记录渲染后的 URL、查询字符串、header、请求或响应正文、音频、capture、转写、密钥、存储凭据、签名或预签名 URL。
+
+第一版有意不支持 gRPC、自定义 HTTP/2 事件流、仅回调或仅 Webhook 的完成方式、任意工作流步骤/分支/循环、用户脚本、自定义签名器代码、服务商专用实时恢复，以及将实时部分文本写入前台。
 
 ## 命令行程序
 
@@ -429,7 +474,7 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
   --output .\sample.txt
 ```
 
-如果省略 `--output`，输出默认为当前目录下的 `<输入文件名>.txt`。文件模式会先按音频配置转换输入文件，再上传识别；它不会注册全局快捷键，也不会自动粘贴。
+如果省略 `--output`，输出默认为当前目录下的 `<输入文件名>.txt`。文件模式会先按音频配置转换输入文件，再使用所选 Audio API 路径识别。启用实时工作流时，它会通过新的 WebSocket 会话回放准备后的文件，而不使用麦克风。它不会注册全局快捷键，也不会自动粘贴。
 
 ### CLI 参数
 
@@ -443,31 +488,35 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 | `--file <PATH>` | 进入文件模式并指定已有音频 |
 | `--output <PATH>` | 文件模式的文本输出路径 |
 
-#### Audio API
+#### 旧音频 API
 
 | 参数 | 用途 |
 |---|---|
-| `--api-endpoint <URL>` | 覆盖 ASR 接口地址 |
-| `--token <TOKEN>` | 覆盖 Bearer Token |
-| `--model <MODEL>` | 覆盖模型字段 |
-| `--language <LANGUAGE>` | 覆盖请求语言字段 |
-| `--prompt <TEXT>` | 覆盖提示词 |
-| `--text-path <PATH>` | 覆盖用于选取唯一响应值的 JSONPath，默认为 `$.text` |
-| `--extra-config <JSON>` | 覆盖字符串化额外 JSON 对象 |
+| `--api-endpoint <URL>` | 覆盖旧 ASR 接口地址 |
+| `--token <TOKEN>` | 覆盖旧 Bearer Token |
+| `--model <MODEL>` | 覆盖旧模型字段 |
+| `--language <LANGUAGE>` | 覆盖旧请求语言字段 |
+| `--prompt <TEXT>` | 覆盖旧提示词 |
+| `--text-path <PATH>` | 覆盖用于选取唯一旧响应值的 JSONPath，默认为 `$.text` |
+| `--extra-config <JSON>` | 覆盖旧接口的字符串化额外 JSON 对象 |
+
+这些覆盖参数只适用于旧音频 API。CLI 会从 JSON 配置加载并执行已启用的高级工作流，`--file` 模式也是如此；但不提供 `--generate-workflow`，也没有高级工作流覆盖参数。
 
 #### Audio Record
 
+这些参数用于准备非实时音频。启用实时工作流时，实时分块和文件回放均使用工作流声明的 PCM 形态。
+
 | 参数 | 用途 |
 |---|---|
-| `--codecs <CODEC>` | 覆盖音频编码器 |
+| `--codecs <CODEC>` | 覆盖非实时准备音频的编码器 |
 | `--list-input-devices` | 列出可用麦克风、稳定标识和系统默认设备，然后退出 |
 | `--input-device <ID>` | 指定本次运行的麦克风；传入 `default` 则跟随系统默认 |
-| `--container <FORMAT>` | 覆盖音频容器 |
-| `--channels <N>` | 覆盖最终上传音频的声道数 |
-| `--sampling-rate <HZ>` | 覆盖最终上传采样率；`--rate` 是兼容别名 |
-| `--sampling-rate-depth <BITS>` | 覆盖转换采样位深 |
-| `--bit-rate <KBPS>` | 覆盖音频比特率 |
-| `--enable-vad <BOOL>` | 开启或显式关闭语音裁剪，默认 false |
+| `--container <FORMAT>` | 覆盖非实时准备音频的容器 |
+| `--channels <N>` | 覆盖非实时准备音频的声道数 |
+| `--sampling-rate <HZ>` | 覆盖非实时准备采样率；`--rate` 是兼容别名 |
+| `--sampling-rate-depth <BITS>` | 覆盖非实时转换的采样位深 |
+| `--bit-rate <KBPS>` | 覆盖非实时准备音频的比特率 |
+| `--enable-vad <BOOL>` | 开启或显式关闭完整文件的语音裁剪，默认 false |
 | `--vad-padding-ms <0-1000>` | 边界填充毫秒数，默认 100 |
 | `--vad-start-threshold <0.5-1.0>` | 语音启动阈值，默认 0.6 |
 
@@ -476,7 +525,7 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 | 参数 | 用途 |
 |---|---|
 | `--request-timeout <SECONDS>` | 覆盖单次客户端请求超时 |
-| `--max-retry <N>` | 覆盖最大请求次数 |
+| `--max-retry <N>` | 覆盖旧请求尝试次数，或每个允许重试的高级阶段/会话的尝试次数 |
 | `--retry-base-delay <SECONDS>` | 覆盖指数退避初始等待 |
 | `--enable-http2 <BOOL>` | 启用或禁用 HTTP/2 |
 | `--verify-ssl <BOOL>` | 启用或禁用 TLS 证书校验 |
@@ -499,7 +548,7 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 |---|---|
 | `--cache-dir <PATH>` | 覆盖缓存目录 |
 | `--keep-cache <BOOL>` | 控制是否保留缓存 |
-| `--request-failed-notification <BOOL>` | 控制音频重试耗尽后是否写入 `[request failed]` |
+| `--request-failed-notification <BOOL>` | 控制旧音频 API 重试耗尽后是否写入 `[request failed]` |
 
 #### Debug
 
@@ -508,7 +557,7 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 | `--ffmpeg-debug <BOOL>` | FFmpeg 调试输出 |
 | `--record-debug <BOOL>` | 录音调试输出 |
 | `--hotkey-debug <BOOL>` | 快捷键调试输出 |
-| `--upload-debug <BOOL>` | Audio 与 Rewrite 请求调试输出 |
+| `--upload-debug <BOOL>` | 旧音频 API 与 Rewrite 记录请求调试信息；高级 Audio API 只输出脱敏阶段标签 |
 
 `--help` 显示完整帮助，`--version` 显示版本。
 
@@ -518,9 +567,9 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 
 GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认值，未知字段会被忽略。
 
-### OpenAI 完整配置示例
+### 旧 OpenAI 完整配置示例
 
-可直接复制 [完整示例文件](examples/example_provider_openai.json)，将 `TOKEN`、`REWRITE.api_key` 和第二条提示词的 `api_key` 替换为自己的 API Key。音频使用 `gpt-4o-mini-transcribe`，Rewrite 使用 Responses API 和 `gpt-5.6-terra`；`ctrl+alt+w` 按原语言润色并沿用主 Rewrite API，`ctrl+alt+e` 翻译为英文并使用独立 API 配置。第二条示例使用相同的 Provider，仍需独立填写地址、密钥和模型。
+可直接复制 [完整示例文件](examples/example_provider_openai.json)，将 `TOKEN`、`REWRITE.api_key` 和第二条提示词的 `api_key` 替换为自己的 API Key。示例的音频配置使用旧 API 和 `gpt-4o-mini-transcribe`，Rewrite 使用 Responses API 和 `gpt-5.6-terra`；`ctrl+alt+w` 按原语言润色并沿用主 Rewrite API，`ctrl+alt+e` 翻译为英文并使用独立 API 配置。第二条示例使用相同的 Provider，仍需独立填写地址、密钥和模型。
 
 ```json
 {
@@ -596,7 +645,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 }
 ```
 
-高级参数的展开形式与合并行为见下文 ExtraConfig。更换服务时，模型、字段和音频格式应以该服务为准；正常公网服务保持 `VERIFY_SSL=true`。
+这是旧音频 API 示例。高级参数的展开形式与合并行为见下文 ExtraConfig。更换服务时，模型、字段和音频格式应以该服务为准；正常公网服务保持 `VERIFY_SSL=true`。高级配置见[高级 Audio API](#高级-audio-api)及其合同；本 README 有意不提供手写的工作流 JSON 示例。
 
 ### 显示字段
 
@@ -605,11 +654,11 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 | `OPACITY` | `1.0` | GUI 浮窗透明度。允许 `0.10`–`1.00`，步进 `0.01`；`1.0` 为完全不透明。完整模式和 minimal 模式共用此设置。 |
 | `WINDOW_SCALE` | `1.0` | GUI 浮窗缩放。允许 `0.3`–`2.0`，步进 `0.1`；保存后立即应用于完整模式和 minimal 模式的窗口、绘制内容及鼠标命中区域。 |
 
-### Audio API 与响应字段
+### 旧音频 API 与响应字段
 
 | 字段 | 默认值 | 行为 |
 |---|---:|---|
-| `API_ENDPOINT` | `""` | ASR POST 地址；上传时不能为空 |
+| `API_ENDPOINT` | `""` | 旧 ASR POST 地址；上传时不能为空 |
 | `TOKEN` | `""` | 非空时发送 `Authorization: Bearer <token>` |
 | `MODEL` | `""` | 非空时发送 multipart 字段 `model` |
 | `LANGUAGE` | `""` | 非空时发送 multipart 字段 `language` |
@@ -653,7 +702,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 
 Base URL 已含路径时保留该前缀并补全对应接口，不重复添加已有接口后缀。Google 使用合并后的模型构造 URL，不将 `model` 留在请求体中。OpenAI Completions 沿用 Dictate 的命名，实际使用 Chat Completions 接口。
 
-额外参数在请求构造后递归合并，可覆盖模型和其他请求字段；规则见下文 ExtraConfig。Rewrite 按 Provider 提取结果，不使用音频 `TEXT_PATH`。支持 JSON 与服务返回的 SSE，忽略推理内容，只在流完成后一次性写入，不输出部分流结果；响应上限为 2 MiB。网络错误、HTTP 408/429/5xx 及对应的服务错误可自动重试；其他 HTTP 错误、配置错误、无效或空结果直接失败。JSON 和 SSE 中的 `length`、`max_tokens`、`MAX_TOKENS` 等已知非最终终止原因也直接失败，不自动重试、不回填；缺失或未知的终止原因仍保留对自定义服务的兼容。
+额外参数在请求构造后递归合并，可覆盖模型和其他请求字段；规则见下文 ExtraConfig。Rewrite 按 Provider 提取结果，不使用旧音频 `TEXT_PATH`。支持 JSON 与服务返回的 SSE，忽略推理内容，只在流完成后一次性写入，不输出部分流结果；响应上限为 2 MiB。网络错误、HTTP 408/429/5xx 及对应的服务错误可自动重试；其他 HTTP 错误、配置错误、无效或空结果直接失败。JSON 和 SSE 中的 `length`、`max_tokens`、`MAX_TOKENS` 等已知非最终终止原因也直接失败，不自动重试、不回填；缺失或未知的终止原因仍保留对自定义服务的兼容。
 
 ### 音频字段
 
@@ -661,8 +710,8 @@ Base URL 已含路径时保留该前缀并补全对应接口，不重复添加�
 |---|---:|---|
 | `INPUT_DEVICE` | `""` | Windows 录音输入设备的稳定标识；为空或缺失时，每次开始录音均使用当时的系统默认设备 |
 | `INPUT_DEVICE_NAME` | `""` | 缓存的设备显示名称，供离线时展示；不参与设备识别 |
-| `CHANNELS` | `1` | 允许 1–8；只控制最终上传音频的声道数 |
-| `SAMPLING_RATE` | `16000` | 最终上传采样率，必须大于 0，单位 Hz |
+| `CHANNELS` | `1` | 允许 1–8；控制非实时准备音频的声道数 |
+| `SAMPLING_RATE` | `16000` | 非实时准备音频的采样率，必须大于 0，单位 Hz |
 | `SAMPLING_RATE_DEPTH` | `16` | 允许 8、16、24、32；输出位深偏好，受编码器支持范围约束，与采集格式无关 |
 | `BIT_RATE` | `128` | 必须大于 0，单位 kbps |
 | `CODECS` | `"opus"` | 编码器名称或兼容别名，大小写不敏感 |
@@ -676,13 +725,13 @@ Base URL 已含路径时保留该前缀并补全对应接口，不重复添加�
 
 core 通过 WASAPI 共享模式打开所选设备，优先使用 Windows 中配置的设备默认格式。默认格式无法查询或不受共享模式支持时，改用同一设备的音频引擎混音格式；无法打开所选设备时明确报错，不切换设备。音频引擎可能使用浮点样本，即使物理麦克风使用整数采样。
 
-采集采样率、声道数和精度独立于 `SAMPLING_RATE`、`CHANNELS` 和 `SAMPLING_RATE_DEPTH`。临时 WAV 保留实际采样率、声道布局和有效精度；整数样本中的整字节填充位可无损移除，例如“32 位存储、24 位有效精度”会保存为紧凑的 24 位 PCM。`RECORD_DEBUG` 会记录设备、实际采集格式和是否回退到音频引擎格式。输出配置在生成上传音频时应用。
+采集采样率、声道数和精度独立于 `SAMPLING_RATE`、`CHANNELS` 和 `SAMPLING_RATE_DEPTH`。临时 WAV 保留实际采样率、声道布局和有效精度；整数样本中的整字节填充位可无损移除，例如“32 位存储、24 位有效精度”会保存为紧凑的 24 位 PCM。`RECORD_DEBUG` 会记录设备、实际采集格式和是否回退到音频引擎格式。输出配置在生成非实时准备音频时应用；实时高级 `realtime_session` 使用工作流声明的 PCM 形态。
 
 选择“跟随系统默认”后，Windows 默认设备的变化从下一次录音生效。指定设备的选择会一直保留，直到用户修改；设备断开时报错，重连后可再次尝试。正在进行的录音不会切换设备。暂停会停止采集，恢复时丢弃暂停前残留的缓冲样本。
 
 | 字段 | 默认值 | 行为 |
 |---|---:|---|
-| `ENABLE_VAD` | `false` | 适用于 GUI 录音、CLI 录音和 CLI `--file` |
+| `ENABLE_VAD` | `false` | 适用于 GUI 录音、CLI 录音和 CLI `--file` 的完整文件准备；实时分块不做录音后的裁剪 |
 | `VAD_PADDING_MS` | `100` | 整数 0～1000 ms；VAD 关闭时仍保留并校验 |
 | `VAD_START_THRESHOLD` | `0.6` | 范围 0.5～1.0，包含边界；VAD 关闭时仍保留并校验 |
 
@@ -692,18 +741,18 @@ Audio Record 页的启动阈值位于边界填充下方；关闭 VAD 后，两�
 
 首个语音片段之前、最后一个片段之后最多各保留完整 padding。内部拼接处，前段后方保留 floor(padding/2) 毫秒，后段前方保留剩余部分，总计一个 padding。原间隔不超过 padding 时完整保留并合并；padding 为 0 时直接拼接语音边界。
 
-未检测到语音时不请求 ASR、不生成文本文件。GUI/快捷键模式返回 Idle，提示“未检测到语音”并清除重试任务；CLI 文件模式打印结果后正常退出。临时文件会被清理。检测到语音时，重试缓冲仍保留原始高质量 WAV；手动重试，以及开启 VAD 时的自动 HTTP 重试，都会重新检测、裁剪和转码。关闭 VAD 时保持原有 HTTP 重试行为。`KEEP_CACHE` 按原有规则保存原始音频、最终转换音频和成功响应。
+当 VAD 在完整文件准备路径上运行且未检测到语音时，不请求 ASR、不生成文本文件。GUI/快捷键模式返回 Idle，提示“未检测到语音”并清除重试任务；CLI 文件模式打印结果后正常退出。临时文件会被清理。检测到语音时，重试缓冲仍保留原始高质量 WAV；手动重试，以及开启 VAD 时旧 API 的自动 HTTP 重试，都会重新检测、裁剪和转码。关闭 VAD 时保持原有旧 HTTP 重试行为。CLI `--file` 的实时回放仍经过文件准备路径，因此可使用 VAD；实时分块不做录音后的裁剪。`KEEP_CACHE` 控制已完成尝试的本地音频归档，包括高级运行时和文件模式尝试；成功的旧 API 响应仍遵守原有响应缓存规则。高级重试按阶段决定，见[高级 Audio API](#高级-audio-api)。
 
 内嵌构建支持 WAV/PCM、MP3、FLAC、Ogg/Opus、Ogg/Vorbis、M4A/MP4/AAC、M4A/ALAC、WebM/Matroska 音频、WavPack、AC3/EAC3。无法解码的流会明确报错，不回退到外部程序。
 
 ### 网络字段
 
-以下字段由 Audio API 与 Rewrite API 共用。`MAX_RETRY=3` 表示最多三次请求（含首次），连接测试始终只尝试一次。
+以下字段由旧音频 API、高级 Audio API 与 Rewrite API 共用。对旧音频 API，`MAX_RETRY=3` 表示最多三次请求（含首次），连接测试始终只尝试一次。高级模式只在允许重试的阶段应用这些设置；submit 使用上文单独说明的不重试规则。
 
 | 字段 | 默认值 | 行为 |
 |---|---:|---|
 | `REQUEST_TIMEOUT` | `60` | 大于 0 时设置 reqwest 客户端超时，单位秒；非正值表示不主动设置 |
-| `MAX_RETRY` | `3` | 最大请求次数，包含第一次请求 |
+| `MAX_RETRY` | `3` | 旧接口的最大请求次数，包含首次；高级模式中为每个可重试阶段或回放会话的最大尝试次数 |
 | `RETRY_BASE_DELAY` | `0.5` | 第一次重试前等待秒数，之后每次翻倍 |
 | `ENABLE_HTTP2` | `true` | 为 `false` 时强制 HTTP/1 |
 | `VERIFY_SSL` | `true` | 为 `false` 时接受无效 TLS 证书，不建议用于公网 |
@@ -721,17 +770,17 @@ Audio Record 页的启动阈值位于边界填充下方；关闭 VAD 后，两�
 | `USE_SENDINPUT` | `false` | GUI 和 CLI 快捷键模式使用 core 的 Unicode 直接写入通道；Rewrite 读取始终使用剪贴板 |
 | `CACHE_DIR` | `""` | 非空时尝试创建并转换为绝对路径；失败时回退当前目录并清空设置值 |
 | `KEEP_CACHE` | `false` | 只有 `CACHE_DIR` 非空且可用时才保留缓存 |
-| `REQUEST_FAILED_NOTIFICATION` | `false` | 音频重试耗尽后写入 `[request failed]`；Rewrite 永不输出占位文本 |
+| `REQUEST_FAILED_NOTIFICATION` | `false` | 旧音频 API 重试耗尽后写入 `[request failed]`；高级 Audio API 与 Rewrite 均不输出此占位文本 |
 | `FFMPEG_DEBUG` | `false` | 记录转换、VAD 和原生 libav 诊断 |
 | `RECORD_DEBUG` | `false` | 记录采集设备、格式和录音错误 |
 | `HOTKEY_DEBUG` | `true` | 记录快捷键事件和繁忙动作信息 |
-| `UPLOAD_DEBUG` | `false` | 记录 Audio/Rewrite 请求及连接测试的目标、尝试次数、状态、耗时和失败响应摘要 |
+| `UPLOAD_DEBUG` | `false` | 旧音频 API 与 Rewrite 记录请求及连接测试的目标、尝试次数、状态、耗时和失败响应摘要；高级 Audio API 只记录固定的脱敏阶段标签 |
 
 这些诊断显示在 GUI 的 Debug 日志框或 CLI 的 stderr。GUI 中修改开关需要保存，并影响后续记录。
 
-## ASR 接口兼容要求
+## 旧音频 API 接口兼容要求
 
-程序发送一个 HTTP POST 请求：
+高级 Audio API 关闭时，程序发送旧 HTTP POST 请求：
 
 ```http
 POST <API_ENDPOINT>
@@ -755,17 +804,17 @@ multipart 内容：
 
 ### ExtraConfig
 
-配置文件中的音频 `ExtraConfig` 和提示词 `extra_config` 都是包含 JSON 对象的字符串，如上面的完整示例所示。GUI 的 **Extra config** 输入框则直接填写下面展开后的对象，不加外层引号，也不转义双引号。失去焦点时，有效 JSON 会自动整理为两空格缩进；空白或无效输入保持原样。格式化不会自动保存，也不替代保存时的校验。
+配置文件中的旧音频 `ExtraConfig` 和提示词 `extra_config` 都是包含 JSON 对象的字符串，如上面的完整示例所示。GUI 的 **Extra config** 输入框则直接填写下面展开后的对象，不加外层引号，也不转义双引号。失去焦点时，有效 JSON 会自动整理为两空格缩进；空白或无效输入保持原样。格式化不会自动保存，也不替代保存时的校验。
 
 合并规则：
 
-- Audio API 的 `ExtraConfig` 和每条 Rewrite 提示词的 `extra_config` 共用递归规则，留空或仅空白表示没有额外参数，其他内容必须是 JSON 对象。
+- 旧音频 API 的 `ExtraConfig` 和每条 Rewrite 提示词的 `extra_config` 共用递归规则，留空或仅空白表示没有额外参数，其他内容必须是 JSON 对象。
 - 对象递归合并，未覆盖的同级字段保留；数组整体替换，不按索引合并；普通值直接覆盖，允许改变类型。
 - 对象中值为 `null` 的成员会被删除，包括新建嵌套对象及数组内对象中的成员。数组中的 `null` 元素保留。
-- Audio 合并完成后，字符串、数字和布尔值转为表单文本，对象和数组转为紧凑 JSON 字符串；二进制 `file` 字段保留给音频上传，不能在 ExtraConfig 中覆盖或删除。
+- 旧音频合并完成后，字符串、数字和布尔值转为表单文本，对象和数组转为紧凑 JSON 字符串；二进制 `file` 字段保留给旧音频上传，不能在 ExtraConfig 中覆盖或删除。
 - Rewrite 将合并后的结构直接作为 JSON 请求体发送，保留对象、数组、数字与布尔类型。
 
-Audio API 的展开形式：
+旧音频 API 的展开形式：
 
 ```json
 {
@@ -815,7 +864,7 @@ Audio API 的展开形式：
 {"options":{"keep":1,"add":3},"items":[null,{"text":"x"}]}
 ```
 
-### TEXT_PATH
+### 旧 `TEXT_PATH`
 
 `TEXT_PATH` 通过 [`serde_json_path`](https://docs.rs/serde_json_path/0.7.2/serde_json_path/) 使用标准 JSONPath。默认值 `$.text` 选择顶层 `text` 字段。路径以 `$` 开头，表示响应的根节点。
 
@@ -863,15 +912,15 @@ JSON 配置中可以写 `"TEXT_PATH": "$.segments[?@.id == 42].text"`。PowerShe
 - 提取错误不会自动重试上传，也不会粘贴 `[request failed]`。GUI 和 CLI 快捷键模式显示错误，有可重试录音时继续保留；CLI 文件模式以退出码 `1` 结束，不写入转写文本文件。
 - 匹配到空字符串属于提取成功。GUI 和 CLI 快捷键模式返回 `Idle`，不粘贴任何内容；文件模式写入空文本文件。
 
-### 重试与取消
+### 旧接口重试与取消
 
-- 请求错误和非 200 响应会进入重试流程。
+- 旧请求错误和非 200 响应会进入重试流程。
 - JSONPath 语法错误和响应提取错误不进入自动重试流程。
 - `MAX_RETRY` 包含首次请求。
 - 等待时间从 `RETRY_BASE_DELAY` 开始，每次失败后乘以 2。
 - 手动取消会中止正在进行的请求发送、响应读取或重试等待。
 - 取消不是错误：GUI 和 CLI 的快捷键模式会返回 `Idle` 并显示“请求已取消”。
-- 只有音频请求重试耗尽且 `REQUEST_FAILED_NOTIFICATION=true` 时，才会尝试粘贴 `[request failed]`。
+- 只有旧音频 API 重试耗尽且 `REQUEST_FAILED_NOTIFICATION=true` 时，才会尝试粘贴 `[request failed]`。
 - GUI 和 CLI 的快捷键模式会把最近一条已结束的录音作为可重试 WAV 保存在内存中，前提是大小不超过 100,000,000 字节。手动取消请求，以及重试成功或失败后，都会保留该 WAV。
 - 取消录制不会替换上一条可重试 WAV。结束一段新录音会替换它；新录音超过上限时不保留可重试 WAV。
 
@@ -937,7 +986,7 @@ GUI 录入沿用原有字符串字段，修饰键顺序固定为 `ctrl`、`shift
 
 如果粘贴快捷键已经发送，但恢复原剪贴板失败，程序会把它与“粘贴前失败”区分显示。
 
-在 Audio Hotkeys 页面恢复等待项下方开启“使用 SendInput”，或设置 `USE_SENDINPUT=true`、传入 `--use-sendinput true`，即可直接输入 Unicode 文本。旧配置缺少字段时默认关闭。识别结果、音频重试结果、成功的 Rewrite 结果和音频 `[request failed]` 提示均遵守此设置；标准输出和文件输出不受影响。开启 SendInput 后，两个剪贴板等待项仍可编辑，因为 Rewrite 读取仍会使用；仅在保存期间暂时禁用。
+在 Audio Hotkeys 页面恢复等待项下方开启“使用 SendInput”，或设置 `USE_SENDINPUT=true`、传入 `--use-sendinput true`，即可直接输入 Unicode 文本。旧配置缺少字段时默认关闭。识别结果、音频重试结果、成功的 Rewrite 结果和旧音频 API 的 `[request failed]` 提示均遵守此设置；标准输出和文件输出不受影响。开启 SendInput 后，两个剪贴板等待项仍可编辑，因为 Rewrite 读取仍会使用；仅在保存期间暂时禁用。
 
 `USE_SENDINPUT` 只控制写入。SendInput 写入通道不读写剪贴板，不自动回退或重发；Rewrite 读取始终执行上文的备份、`Ctrl+C`、读取和恢复流程。文本按 UTF-16 分批发送，批次不会拆开代理对。CRLF 和 LF 统一为 CR；换行和 Tab 发送 Unicode 字符事件，不模拟物理 Enter/Tab 按键，实际效果仍取决于目标控件。修饰键未释放时最多等待两秒；取消停止后续批次，已输入内容无法撤回。部分发送会明确提示可能已有文本。API 成功表示事件已注入，不代表目标控件已接收；输入焦点、控件兼容性和 Windows 权限限制仍然适用。
 
@@ -959,9 +1008,9 @@ RecordTemp_<16 位十六进制字符>.wav
 audio-YYYY-MM-DD-HH.MM.SS.<ext>
 ```
 
-只有 HTTP 200 的响应会写入对应的 `.json` 文件，包括 JSON 解析或文本提取失败时的原始响应；文件内容不一定是合法 JSON。失败或在收到 HTTP 成功响应前取消时，不会生成响应文件。
+对于旧音频 API，只有 HTTP 200 的响应会写入对应的 `.json` 文件，包括 JSON 解析或文本提取失败时的原始响应；文件内容不一定是合法 JSON。失败或在收到 HTTP 成功响应前取消时，不会生成响应文件。高级工作流自行使用声明的可接受状态码，不遵守这条旧响应缓存规则。
 
-GUI 和 CLI 快捷键模式的重试缓冲独立于这里的可选磁盘缓存：它只在内存中保留最近一条已结束 WAV，最大 100,000,000 字节，并会在进程退出时释放（包括正常关闭、注销或断电）。重试时会临时还原一个 `RecordTemp_` WAV 以供转换，并在本次尝试后删除；不会创建持久化重试缓存。`KEEP_CACHE` 仍只控制普通录音请求原有的可选音频归档。
+GUI 和 CLI 快捷键模式的重试缓冲独立于这里的可选磁盘缓存：它只在内存中保留最近一条已结束 WAV，最大 100,000,000 字节，并会在进程退出时释放（包括正常关闭、注销或断电）。重试时会临时还原一个 `RecordTemp_` WAV 以供转换，并在本次尝试后删除；不会创建持久化重试缓存。`KEEP_CACHE` 控制可选的本地音频归档，包括高级运行时和文件模式尝试。
 
 Rewrite 不创建音频缓存或持久化请求/响应缓存，也不改变音频重试缓冲。
 
@@ -1090,8 +1139,8 @@ FFmpeg 8.1 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独�
 
 ## 安全与隐私
 
-- 录音和转码在本机完成；转换后的音频发送到 `API_ENDPOINT`。触发 Rewrite 时，目标应用复制出的文本、提示词及额外参数会发送到配置的 Rewrite 服务；读取期间会临时改变剪贴板，在发送请求前恢复备份。
-- `TOKEN`、`REWRITE.api_key` 和各提示词的 `api_key` 以明文保存在 JSON 配置中。GUI 的密码输入框只负责遮挡显示，不提供磁盘加密。
+- 录音和转码在本机完成。旧转换音频会发送到 `API_ENDPOINT`；高级音频或其声明的远程引用会发送到工作流配置的目标。触发 Rewrite 时，目标应用复制出的文本、提示词及额外参数会发送到配置的 Rewrite 服务；读取期间会临时改变剪贴板，在发送请求前恢复备份。
+- `TOKEN`、`REWRITE.api_key`、各提示词的 `api_key`、高级密钥和远程存储凭据均以明文保存在 JSON 配置中。GUI 的密码输入框只负责遮挡显示，不提供磁盘加密。
 - 对公网服务应保持 `VERIFY_SSL=true`。
 - `VERIFY_SSL=false` 会接受无效证书，可能遭受中间人攻击。
 - HTTP 客户端不会读取系统代理设置。如需代理，应在可信网关或 API 端处理。
@@ -1119,7 +1168,7 @@ FFmpeg 8.1 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独�
 
 | 组件 | 路径 | 作用 / 输出 |
 |---|---|---|
-| 核心库 | `crates/dictate-core/` | 配置、ASR、Rewrite、选区读取、递归参数、录音、共享写入和状态机 |
+| 核心库 | `crates/dictate-core/` | 配置、旧与高级音频 API 执行、Rewrite、选区读取、递归参数、录音、远程音频、共享写入和状态机 |
 | CLI | `crates/dictate-cli/` | `dictate-cli.exe` |
 | 原生 GUI | `crates/dictate-gui/` | `Dictate.exe` |
 | libav 桥接 | `native/` | GUI 与 CLI 共用的 C ABI |

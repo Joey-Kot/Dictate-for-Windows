@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -32,6 +33,144 @@ pub enum RecorderState {
 pub struct RecordingResult {
     pub wav_path: Option<PathBuf>,
     pub canceled: bool,
+}
+
+/// One raw packet captured from the microphone.
+///
+/// Packets retain the device's native bytes and format. They are emitted only
+/// after the same packet has been accepted by the local WAV writer, so a live
+/// consumer can never make the local recording secondary.
+#[derive(Clone)]
+pub struct CapturePacket {
+    format: Arc<CaptureFormat>,
+    bytes: Vec<u8>,
+}
+
+impl CapturePacket {
+    /// Returns the native microphone format for this packet.
+    pub fn format(&self) -> &CaptureFormat {
+        &self.format
+    }
+
+    /// Returns the original, unconverted bytes supplied by the audio backend.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes the packet and returns its shared format and raw bytes.
+    pub fn into_parts(self) -> (Arc<CaptureFormat>, Vec<u8>) {
+        (self.format, self.bytes)
+    }
+}
+
+/// The receiving side of a bounded live-capture packet channel.
+///
+/// The overflow flag is shared with its sender. A full channel means live
+/// ASR no longer has a gap-free copy of the recording, so the live session
+/// must fail and the Runtime can replay the authoritative local WAV.
+pub struct CapturePacketReceiver {
+    receiver: mpsc::Receiver<CapturePacket>,
+    backpressured: Arc<AtomicBool>,
+}
+
+impl CapturePacketReceiver {
+    pub(crate) fn try_recv(&self) -> Result<CapturePacket, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub(crate) fn backpressure_exceeded(&self) -> bool {
+        self.backpressured.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<CapturePacket, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+#[derive(Clone)]
+struct CapturePacketTarget {
+    sender: mpsc::SyncSender<CapturePacket>,
+    backpressured: Arc<AtomicBool>,
+}
+
+/// A non-blocking optional tee destination for captured microphone packets.
+///
+/// It is intentionally backed by a bounded channel. The recorder uses only
+/// `try_send`: a disconnected or full live consumer drops that packet and
+/// cannot block, fail, or otherwise interrupt local WAV capture.
+#[derive(Clone)]
+pub struct CapturePacketSink {
+    target: Arc<Mutex<Option<CapturePacketTarget>>>,
+}
+
+impl CapturePacketSink {
+    fn empty() -> Self {
+        Self {
+            target: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn offer(&self, format: &Arc<CaptureFormat>, bytes: &[u8]) {
+        // The recorder thread must never wait for either Runtime changing the
+        // destination or a slow realtime consumer. If Runtime happens to be
+        // replacing the destination, dropping this one live packet is safe:
+        // the local WAV remains authoritative and can be replayed in full.
+        let target = self.target.try_lock().and_then(|target| target.clone());
+        if let Some(target) = target {
+            if target.backpressured.load(Ordering::Acquire) {
+                return;
+            }
+            match target.sender.try_send(CapturePacket {
+                format: Arc::clone(format),
+                bytes: bytes.to_vec(),
+            }) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    // Never emit a live transcript with a missing audio
+                    // interval. Stop only the optional live path; capture
+                    // keeps writing its local WAV for a full replay.
+                    target.backpressured.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn target(&self) -> Option<CapturePacketTarget> {
+        self.target.lock().clone()
+    }
+
+    fn replace_target(&self, target: Option<CapturePacketTarget>) {
+        *self.target.lock() = target;
+    }
+
+    fn clear(&self) {
+        self.replace_target(None);
+    }
+}
+
+/// Creates a bounded packet tee for [`Recorder::set_capture_packet_sink`].
+///
+/// A capacity of zero is valid: packets are delivered only when the receiver
+/// is already waiting, and are otherwise dropped without blocking recording.
+pub fn capture_packet_channel(capacity: usize) -> (CapturePacketSink, CapturePacketReceiver) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let backpressured = Arc::new(AtomicBool::new(false));
+    (
+        CapturePacketSink {
+            target: Arc::new(Mutex::new(Some(CapturePacketTarget {
+                sender,
+                backpressured: Arc::clone(&backpressured),
+            }))),
+        },
+        CapturePacketReceiver {
+            receiver,
+            backpressured,
+        },
+    )
 }
 
 #[derive(Debug, Error, Clone)]
@@ -94,6 +233,7 @@ struct RecorderInner {
     state: RecorderState,
     active: Option<ActiveRecording>,
     on_error: Option<Arc<dyn Fn(RecorderError) + Send + Sync>>,
+    packet_sink: CapturePacketSink,
 }
 
 pub struct Recorder {
@@ -127,12 +267,24 @@ impl Recorder {
                 state: RecorderState::Idle,
                 active: None,
                 on_error: None,
+                packet_sink: CapturePacketSink::empty(),
             })),
         }
     }
 
     pub fn set_error_handler(&self, handler: Option<Arc<dyn Fn(RecorderError) + Send + Sync>>) {
         self.inner.lock().on_error = handler;
+    }
+
+    /// Sets the optional non-blocking packet tee used by live realtime ASR.
+    ///
+    /// Replacing or clearing a sink while recording is active redirects the
+    /// existing capture tee. The capture thread only uses `try_lock` and
+    /// `try_send`, so this control operation cannot make microphone capture
+    /// wait for the realtime network path.
+    pub fn set_capture_packet_sink(&self, sink: Option<CapturePacketSink>) {
+        let target = sink.and_then(|sink| sink.target());
+        self.inner.lock().packet_sink.replace_target(target);
     }
 
     pub fn state(&self) -> RecorderState {
@@ -147,6 +299,7 @@ impl Recorder {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let cancellation = lifecycle.child_token();
         let captured_handler;
+        let captured_packet_sink;
         {
             let mut inner = self.inner.lock();
             if inner.state != RecorderState::Idle {
@@ -154,6 +307,7 @@ impl Recorder {
             }
             inner.state = RecorderState::Recording;
             captured_handler = inner.on_error.clone();
+            captured_packet_sink = inner.packet_sink.clone();
             inner.active = Some(ActiveRecording {
                 done: done_rx,
                 cancellation: cancellation.clone(),
@@ -176,6 +330,7 @@ impl Recorder {
                     started_tx,
                     done_tx,
                     captured_handler,
+                    captured_packet_sink,
                 )
             })
         {
@@ -207,6 +362,7 @@ impl Recorder {
             return false;
         }
         inner.state = RecorderState::Canceled;
+        inner.packet_sink.clear();
         if let Some(active) = &inner.active {
             active.cancellation.cancel();
         }
@@ -236,6 +392,9 @@ impl Recorder {
                 return Err(RecorderError::NotRunning);
             }
             inner.state = requested_state;
+            // Closing the bounded sender is how a LiveChunkSource flushes its
+            // converter, sends the protocol finish message, and exits.
+            inner.packet_sink.clear();
             let active = inner.active.take().ok_or(RecorderError::WorkerStopped)?;
             active.cancellation.cancel();
             active.done
@@ -257,6 +416,7 @@ fn record_loop(
     started: tokio::sync::oneshot::Sender<Result<(), RecorderError>>,
     done: mpsc::SyncSender<Result<RecordingResult, RecorderError>>,
     captured_handler: Option<Arc<dyn Fn(RecorderError) + Send + Sync>>,
+    packet_sink: CapturePacketSink,
 ) {
     let wav_path = generate_temp_wav(&temp_dir);
     let initialized = match backend.initialize() {
@@ -301,6 +461,7 @@ fn record_loop(
         return;
     }
     let format = stream.format().clone();
+    let packet_format = Arc::new(format.clone());
     if config.record_debug {
         crate::debug_log::write(
             crate::debug_log::Category::Record,
@@ -378,6 +539,7 @@ fn record_loop(
                     let _ = fs::remove_file(&wav_path);
                     break 'recording Err(RecorderError::WriteWav(error.to_string()));
                 }
+                forward_capture_packet(&packet_sink, &packet_format, &samples);
                 if samples.is_empty() {
                     thread::sleep(SUCCESSFUL_WRITE_DELAY);
                 }
@@ -415,6 +577,7 @@ fn record_loop(
         let previous = guard.state;
         guard.state = RecorderState::Idle;
         guard.active = None;
+        guard.packet_sink.clear();
         previous
     };
     let asynchronous_error = result.as_ref().err().cloned();
@@ -426,6 +589,13 @@ fn record_loop(
     {
         handler(error);
     }
+}
+
+fn forward_capture_packet(sink: &CapturePacketSink, format: &Arc<CaptureFormat>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    sink.offer(format, bytes);
 }
 
 fn finish_start_failure(
@@ -648,5 +818,200 @@ mod tests {
         assert!(error.to_string().contains("10 consecutive errors"));
         assert_eq!(recorder.state(), RecorderState::Idle);
         assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn packet_sink_receives_raw_packets_and_native_format() {
+        let backend = Arc::new(FakeBackend::default());
+        let temp = tempfile::tempdir().unwrap();
+        let recorder =
+            Recorder::with_backend(Config::default(), temp.path().to_path_buf(), backend);
+        let (sink, receiver) = capture_packet_channel(4);
+        recorder.set_capture_packet_sink(Some(sink));
+
+        recorder.start(CancellationToken::new()).await.unwrap();
+        let packet =
+            tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(1)))
+                .await
+                .unwrap()
+                .expect("recorder should forward a packet");
+        let result = recorder.stop().await.unwrap();
+
+        assert_eq!(packet.format().sample_rate, 44_100);
+        assert_eq!(packet.format().channels, 2);
+        assert_eq!(packet.format().bits_per_sample, 24);
+        assert_eq!(packet.bytes(), vec![1; 600].as_slice());
+        let wav = hound::WavReader::open(result.wav_path.unwrap()).unwrap();
+        assert!(wav.duration() > 0);
+    }
+
+    #[tokio::test]
+    async fn live_chunk_source_drains_the_tee_without_becoming_the_recording_authority() {
+        use crate::advanced_audio::realtime::{LiveChunkSource, RealtimeChunkSource};
+        use crate::advanced_audio::schema::{RealtimeAudioStream, RealtimePacing};
+
+        let backend = Arc::new(FakeBackend::default());
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::with_backend(
+            Config::default(),
+            temp.path().to_path_buf(),
+            backend.clone(),
+        );
+        let (sink, receiver) = capture_packet_channel(16);
+        recorder.set_capture_packet_sink(Some(sink));
+        recorder.start(CancellationToken::new()).await.unwrap();
+
+        let mut source = LiveChunkSource::new(
+            receiver,
+            RealtimeAudioStream {
+                codec: "pcm_s16le".into(),
+                sample_rate: 16_000,
+                channels: 1,
+                chunk_duration_ms: 20,
+                pacing: RealtimePacing::Realtime,
+            },
+        );
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.next_chunk(&CancellationToken::new()),
+        )
+        .await
+        .expect("the live source should receive recorder tee packets")
+        .unwrap()
+        .expect("several native packets should produce a realtime chunk");
+        assert!(!chunk.bytes.is_empty());
+
+        // A failed or stopped live session closes only the optional tee. The
+        // recorder must keep making the local WAV available for replay.
+        recorder.set_capture_packet_sink(None);
+        let reads_before = backend.read_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(backend.read_calls.load(Ordering::SeqCst) > reads_before);
+
+        while let Some(_chunk) = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.next_chunk(&CancellationToken::new()),
+        )
+        .await
+        .expect("a closed tee must not leave the live source waiting")
+        .unwrap()
+        {}
+
+        let result = recorder.stop().await.unwrap();
+        let wav = hound::WavReader::open(result.wav_path.unwrap()).unwrap();
+        assert!(wav.duration() > 0);
+    }
+
+    #[tokio::test]
+    async fn disconnected_packet_sink_does_not_stop_local_wav_recording() {
+        let backend = Arc::new(FakeBackend::default());
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::with_backend(
+            Config::default(),
+            temp.path().to_path_buf(),
+            backend.clone(),
+        );
+        let (sink, receiver) = capture_packet_channel(4);
+        drop(receiver);
+        recorder.set_capture_packet_sink(Some(sink));
+
+        recorder.start(CancellationToken::new()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let result = recorder.stop().await.unwrap();
+
+        assert!(backend.read_calls.load(Ordering::SeqCst) > 0);
+        let wav = hound::WavReader::open(result.wav_path.unwrap()).unwrap();
+        assert!(wav.duration() > 0);
+    }
+
+    #[tokio::test]
+    async fn full_packet_sink_never_blocks_the_recorder_thread() {
+        let backend = Arc::new(FakeBackend::default());
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::with_backend(
+            Config::default(),
+            temp.path().to_path_buf(),
+            backend.clone(),
+        );
+        let (sink, _receiver) = capture_packet_channel(1);
+        recorder.set_capture_packet_sink(Some(sink));
+
+        recorder.start(CancellationToken::new()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.read_calls.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a full sink must not stall packet reads");
+        let result = tokio::time::timeout(Duration::from_secs(1), recorder.stop())
+            .await
+            .expect("a full sink must not delay stop")
+            .unwrap();
+
+        let wav = hound::WavReader::open(result.wav_path.unwrap()).unwrap();
+        assert!(wav.duration() > 0);
+    }
+
+    #[tokio::test]
+    async fn full_packet_sink_invalidates_live_source_for_recorded_replay() {
+        use crate::advanced_audio::realtime::{
+            LiveChunkSource, RealtimeChunkSource, RealtimeSourceError,
+        };
+        use crate::advanced_audio::schema::{RealtimeAudioStream, RealtimePacing};
+
+        let (sink, receiver) = capture_packet_channel(0);
+        sink.offer(&Arc::new(test_format()), &[0; 600]);
+
+        let mut source = LiveChunkSource::new(
+            receiver,
+            RealtimeAudioStream {
+                codec: "pcm_s16le".into(),
+                sample_rate: 16_000,
+                channels: 1,
+                chunk_duration_ms: 20,
+                pacing: RealtimePacing::Realtime,
+            },
+        );
+        let error = source
+            .next_chunk(&CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RealtimeSourceError::Backpressure));
+    }
+
+    #[tokio::test]
+    async fn pause_closes_packet_segment_and_resume_uses_new_sink() {
+        let backend = Arc::new(FakeBackend::default());
+        let temp = tempfile::tempdir().unwrap();
+        let recorder =
+            Recorder::with_backend(Config::default(), temp.path().to_path_buf(), backend);
+        let (first_sink, first_receiver) = capture_packet_channel(4);
+        recorder.set_capture_packet_sink(Some(first_sink));
+        recorder.start(CancellationToken::new()).await.unwrap();
+        assert!(first_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        assert_eq!(recorder.toggle_pause().unwrap(), RecorderState::Paused);
+        // Runtime clears this target after pause so the first LiveChunkSource
+        // receives a disconnect and can send its finish message.
+        recorder.set_capture_packet_sink(None);
+        loop {
+            match first_receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("clearing a live packet sink must close its receiver")
+                }
+            }
+        }
+
+        let (second_sink, second_receiver) = capture_packet_channel(4);
+        recorder.set_capture_packet_sink(Some(second_sink));
+        assert_eq!(recorder.toggle_pause().unwrap(), RecorderState::Recording);
+        assert!(second_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        let result = recorder.stop().await.unwrap();
+        let wav = hound::WavReader::open(result.wav_path.unwrap()).unwrap();
+        assert!(wav.duration() > 0);
     }
 }

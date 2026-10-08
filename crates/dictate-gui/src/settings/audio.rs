@@ -336,7 +336,7 @@ pub(super) fn refresh(state: &mut SettingsState) {
             &state.audio_draft,
             state.language,
             state.dpi,
-            state.active_group == 2,
+            state.active_group == 3,
             state.saving,
         );
     }
@@ -387,7 +387,7 @@ pub(super) fn action(state: &mut SettingsState, field: usize, action: usize, det
         }
         return;
     }
-    if state.saving || state.active_group != 2 || !state.audio_draft.enabled(field) {
+    if state.saving || state.active_group != 3 || !state.audio_draft.enabled(field) {
         return;
     }
     if action == 4 {

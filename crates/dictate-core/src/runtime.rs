@@ -8,15 +8,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Config;
-use crate::asr::{AsrClient, AsrError, Transcription};
+use crate::advanced_audio::LiveChunkSource;
+use crate::asr::{AsrError, Transcription};
+use crate::audio_api::{AudioApiClient, AudioApiError};
 use crate::cache;
 use crate::clipboard::ClipboardError;
 use crate::converter::{AudioConverter, ConvertError, prepare_audio_for_upload};
 use crate::hotkey::{self, HotkeyRegistration};
-use crate::recorder::{Recorder, RecorderError, RecorderState, RecordingResult};
+use crate::recorder::{
+    CapturePacketReceiver, Recorder, RecorderError, RecorderState, RecordingResult,
+    capture_packet_channel,
+};
 use crate::text_input;
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(250);
@@ -65,7 +71,7 @@ pub enum RuntimeError {
     #[error("{0}")]
     Config(#[from] crate::config::ConfigError),
     #[error("{0}")]
-    Asr(#[from] AsrError),
+    AudioApi(#[from] AudioApiError),
     #[error("{0}")]
     Recorder(#[from] RecorderError),
     #[error("{0}")]
@@ -98,7 +104,7 @@ struct RuntimeInner {
     config: Config,
     temp_dir: PathBuf,
     recorder: Arc<Recorder>,
-    asr_client: Arc<AsrClient>,
+    audio_client: Arc<AudioApiClient>,
     hotkeys: Option<HotkeyRegistration>,
     // A failed registration must not disable the user's intent to use hotkeys.
     hotkeys_requested: bool,
@@ -109,6 +115,29 @@ struct RuntimeInner {
     active_request_cancellation: Option<CancellationToken>,
     retry_buffer_enabled: bool,
     retry_recording: Option<Arc<Vec<u8>>>,
+    live_realtime: Option<LiveRealtimeSession>,
+    // The live session is normally owned by `live_realtime`. While Pause is
+    // waiting for its terminal event, it is temporarily taken out of that
+    // slot. Keep its token reachable only during that interval so Cancel can
+    // interrupt connect/receive/finalization without changing Recording's
+    // ordinary cancel path.
+    live_finalization_cancellation: Option<CancellationToken>,
+    completed_live_transcriptions: Vec<Transcription>,
+    live_realtime_failed: bool,
+}
+
+struct LiveRealtimeSession {
+    cancellation: CancellationToken,
+    task: JoinHandle<Result<Transcription, AudioApiError>>,
+}
+
+/// The live portions of one logical recording. A failed portion invalidates
+/// every committed portion: the only correct recovery is a new full replay of
+/// the local WAV from audio offset zero.
+struct LiveRealtimeState {
+    active: Option<LiveRealtimeSession>,
+    committed: Vec<Transcription>,
+    failed: bool,
 }
 
 pub struct Runtime {
@@ -142,14 +171,14 @@ impl Runtime {
         config.validate()?;
         let temp_dir = cache::initialize_cache_dir(&mut config);
         cache::cleanup_old_temp_items(&temp_dir);
-        let asr_client = Arc::new(AsrClient::new(config.clone())?);
+        let audio_client = Arc::new(AudioApiClient::new(config.clone())?);
         let recorder = Arc::new(Recorder::new(config.clone(), temp_dir.clone()));
         let runtime = Arc::new(Self {
             inner: Mutex::new(RuntimeInner {
                 config,
                 temp_dir,
                 recorder,
-                asr_client,
+                audio_client,
                 hotkeys: None,
                 hotkeys_requested: false,
                 event: Event::default(),
@@ -159,6 +188,10 @@ impl Runtime {
                 active_request_cancellation: None,
                 retry_buffer_enabled: false,
                 retry_recording: None,
+                live_realtime: None,
+                live_finalization_cancellation: None,
+                completed_live_transcriptions: Vec::new(),
+                live_realtime_failed: false,
             }),
             action_lock: Arc::new(AsyncMutex::new(())),
             lifecycle: CancellationToken::new(),
@@ -249,7 +282,7 @@ impl Runtime {
         }
         match id {
             1 => self.toggle_recording_locked().await,
-            2 => self.toggle_pause_locked(),
+            2 => self.toggle_pause_locked().await,
             3 => self.cancel_or_retry_locked().await,
             _ => {}
         }
@@ -532,7 +565,7 @@ impl Runtime {
         }
         config.validate()?;
         let temp_dir = cache::initialize_cache_dir(&mut config);
-        let asr_client = Arc::new(AsrClient::new(config.clone())?);
+        let audio_client = Arc::new(AudioApiClient::new(config.clone())?);
         let recorder = Arc::new(Recorder::new(config.clone(), temp_dir.clone()));
         let (previous_config, previous_hotkeys, hotkeys_requested) = {
             let mut inner = self.inner.lock();
@@ -560,7 +593,7 @@ impl Runtime {
             }
             inner.config = config;
             inner.temp_dir = temp_dir;
-            inner.asr_client = asr_client;
+            inner.audio_client = audio_client;
             inner.recorder = recorder;
             inner.hotkeys = replacement.take();
             inner.active_session = 0;
@@ -600,6 +633,7 @@ impl Runtime {
             return;
         }
         self.lifecycle.cancel();
+        self.cancel_live_realtime();
         let (recorder, hotkeys, request_cancellation) = {
             let mut inner = self.inner.lock();
             inner.retry_recording = None;
@@ -609,6 +643,7 @@ impl Runtime {
                 inner.active_request_cancellation.take(),
             )
         };
+        recorder.set_capture_packet_sink(None);
         recorder.request_cancel();
         if let Some(cancellation) = request_cancellation {
             cancellation.cancel();
@@ -635,7 +670,10 @@ impl Runtime {
         let state = self.snapshot().state;
         if matches!(state, State::Idle | State::Error) {
             let (recorder, session) = self.begin_recording_session();
+            self.reset_live_realtime(&recorder);
+            let live_receiver = self.prepare_live_realtime(&recorder);
             if let Err(error) = recorder.start(self.lifecycle.child_token()).await {
+                recorder.set_capture_packet_sink(None);
                 self.clear_recording_session(&recorder, session);
                 if !self.is_stopped() {
                     self.set_retryable_error("Recording start failed", &error);
@@ -643,9 +681,14 @@ impl Runtime {
                 return;
             }
             if self.is_stopped() {
+                recorder.set_capture_packet_sink(None);
+                self.cancel_live_realtime();
                 recorder.request_cancel();
                 self.clear_recording_session(&recorder, session);
                 return;
+            }
+            if let Some(receiver) = live_receiver {
+                self.start_live_realtime(receiver);
             }
             self.set_state(State::Recording, "Recording started", None::<&RuntimeError>);
             return;
@@ -657,6 +700,9 @@ impl Runtime {
             let inner = self.inner.lock();
             (inner.recorder.clone(), inner.active_session)
         };
+        // Closing the tee before stopping the WAV writer lets the live source
+        // flush its final partial packet and send the realtime finish message.
+        recorder.set_capture_packet_sink(None);
         match recorder.stop().await {
             Ok(result) => {
                 self.clear_recording_session(&recorder, session);
@@ -665,6 +711,7 @@ impl Runtime {
                     return;
                 }
                 if result.canceled {
+                    self.cancel_live_realtime();
                     self.set_state(State::Idle, "Recording canceled", None::<&RuntimeError>);
                     return;
                 }
@@ -724,6 +771,150 @@ impl Runtime {
         }
     }
 
+    /// Cancels any state left by a prior logical recording before a new one
+    /// starts. A recorder keeps its local WAV independently of this tee.
+    fn reset_live_realtime(&self, recorder: &Arc<Recorder>) {
+        recorder.set_capture_packet_sink(None);
+        let (finalization_cancellation, previous) = {
+            let mut inner = self.inner.lock();
+            inner.completed_live_transcriptions.clear();
+            inner.live_realtime_failed = false;
+            (
+                inner.live_finalization_cancellation.take(),
+                inner.live_realtime.take(),
+            )
+        };
+        if let Some(cancellation) = finalization_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(previous) = previous {
+            previous.cancellation.cancel();
+            previous.task.abort();
+        }
+    }
+
+    /// Creates the recorder's optional bounded packet tee before capture
+    /// starts or before a paused recorder resumes. The local WAV is always
+    /// written first by `Recorder`.
+    fn prepare_live_realtime(&self, recorder: &Arc<Recorder>) -> Option<CapturePacketReceiver> {
+        let realtime = {
+            let inner = self.inner.lock();
+            inner.audio_client.is_realtime_workflow()
+                && !inner.live_realtime_failed
+                && inner.live_realtime.is_none()
+        };
+        if !realtime {
+            recorder.set_capture_packet_sink(None);
+            return None;
+        }
+        let (sink, receiver) = capture_packet_channel(128);
+        recorder.set_capture_packet_sink(Some(sink));
+        Some(receiver)
+    }
+
+    fn start_live_realtime(&self, receiver: CapturePacketReceiver) {
+        let (client, target) = {
+            let inner = self.inner.lock();
+            (
+                inner.audio_client.clone(),
+                inner.audio_client.realtime_audio_stream(),
+            )
+        };
+        let Some(target) = target else {
+            self.inner.lock().live_realtime_failed = true;
+            return;
+        };
+        let cancellation = self.lifecycle.child_token();
+        let task_cancellation = cancellation.clone();
+        let task = self.executor.spawn(async move {
+            let mut source = LiveChunkSource::new(receiver, target);
+            client
+                .transcribe_live(&task_cancellation, &mut source)
+                .await
+        });
+        let mut inner = self.inner.lock();
+        if inner.live_realtime.is_some() {
+            // Runtime actions are serialized, so this branch is defensive.
+            // Do not merge an ambiguous live session; replay the local WAV.
+            inner.live_realtime_failed = true;
+            drop(inner);
+            cancellation.cancel();
+            task.abort();
+        } else {
+            inner.live_realtime = Some(LiveRealtimeSession { cancellation, task });
+        }
+    }
+
+    async fn finalize_live_realtime_segment(&self, recorder: &Arc<Recorder>) {
+        // Dropping the sender, rather than canceling the task, lets the
+        // session flush the converter and receive its explicit final event.
+        recorder.set_capture_packet_sink(None);
+        let session = self.inner.lock().live_realtime.take();
+        let Some(session) = session else {
+            return;
+        };
+        // `toggle_pause_locked` holds `action_lock` while it waits below.
+        // Expose this exact session token for that interval so the Cancel
+        // hotkey can wake WebSocket connect/receive/finalization. It is not
+        // installed while ordinary microphone capture is active.
+        let finalization_cancellation = session.cancellation.clone();
+        self.inner.lock().live_finalization_cancellation = Some(finalization_cancellation.clone());
+        let result = session.task.await;
+        let canceled = finalization_cancellation.is_cancelled();
+        let mut inner = self.inner.lock();
+        inner.live_finalization_cancellation = None;
+        if canceled {
+            // A canceled finalization may have accumulated a partial final
+            // segment. Keep no live result; a later Stop will replay the
+            // authoritative WAV from its beginning.
+            inner.completed_live_transcriptions.clear();
+            inner.live_realtime_failed = true;
+            return;
+        }
+        match result {
+            Ok(Ok(transcription)) if !inner.live_realtime_failed => {
+                inner.completed_live_transcriptions.push(transcription);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => {
+                // Do not retain a transcript from any preceding segment. A
+                // later stop must replay the entire local recording.
+                inner.completed_live_transcriptions.clear();
+                inner.live_realtime_failed = true;
+            }
+        }
+    }
+
+    fn take_live_realtime(&self) -> LiveRealtimeState {
+        let mut inner = self.inner.lock();
+        let state = LiveRealtimeState {
+            active: inner.live_realtime.take(),
+            committed: std::mem::take(&mut inner.completed_live_transcriptions),
+            failed: inner.live_realtime_failed,
+        };
+        inner.live_realtime_failed = false;
+        state
+    }
+
+    fn cancel_live_realtime(&self) {
+        let (finalization_cancellation, session) = {
+            let mut inner = self.inner.lock();
+            inner.completed_live_transcriptions.clear();
+            inner.live_realtime_failed = false;
+            (
+                inner.live_finalization_cancellation.take(),
+                inner.live_realtime.take(),
+            )
+        };
+        if let Some(cancellation) = finalization_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(session) = session {
+            session.cancellation.cancel();
+            session.task.abort();
+        }
+    }
+
     fn begin_active_request(&self) -> CancellationToken {
         let cancellation = self.lifecycle.child_token();
         self.inner.lock().active_request_cancellation = Some(cancellation.clone());
@@ -737,10 +928,16 @@ impl Runtime {
     fn cancel_active_request(&self) -> bool {
         let cancellation = {
             let inner = self.inner.lock();
-            if !matches!(inner.event.state, State::Uploading | State::Rewriting) {
-                return false;
+            if matches!(inner.event.state, State::Uploading | State::Rewriting) {
+                inner.active_request_cancellation.clone()
+            } else {
+                // This is populated only after Pause has closed the recorder
+                // tee and while its live realtime task is being finalized.
+                // In particular, do not expose a live session token during
+                // normal Recording: Cancel must keep acquiring the action
+                // lock and canceling the recorder as it did before realtime.
+                inner.live_finalization_cancellation.clone()
             }
-            inner.active_request_cancellation.clone()
         };
         let Some(cancellation) = cancellation else {
             return false;
@@ -769,28 +966,49 @@ impl Runtime {
             }
         };
         if should_report {
+            recorder.set_capture_packet_sink(None);
+            self.cancel_live_realtime();
             self.set_retryable_error("Recording failed", &error);
         }
     }
 
-    fn toggle_pause_locked(&self) {
-        let (recorder, debug) = {
+    async fn toggle_pause_locked(&self) {
+        let (state, recorder, debug) = {
             let inner = self.inner.lock();
-            (inner.recorder.clone(), inner.config.hotkey_debug)
+            (
+                inner.event.state,
+                inner.recorder.clone(),
+                inner.config.hotkey_debug,
+            )
+        };
+        // Install the new bounded target before unpausing the microphone so
+        // the resumed session cannot miss its first capture packet.
+        let live_receiver = if state == State::Paused {
+            self.prepare_live_realtime(&recorder)
+        } else {
+            None
         };
         match recorder.toggle_pause() {
             Ok(RecorderState::Paused) => {
+                self.finalize_live_realtime_segment(&recorder).await;
                 self.set_state(State::Paused, "Recording paused", None::<&RuntimeError>)
             }
             Ok(RecorderState::Recording) => {
+                if let Some(receiver) = live_receiver {
+                    self.start_live_realtime(receiver);
+                }
                 self.set_state(State::Recording, "Recording resumed", None::<&RuntimeError>)
             }
             Ok(_) => {}
-            Err(_) if debug => crate::debug_log::write(
-                crate::debug_log::Category::Hotkey,
-                format_args!("[hotkey] not recording; cannot pause/resume"),
-            ),
-            Err(_) => {}
+            Err(_) => {
+                recorder.set_capture_packet_sink(None);
+                if debug {
+                    crate::debug_log::write(
+                        crate::debug_log::Category::Hotkey,
+                        format_args!("[hotkey] not recording; cannot pause/resume"),
+                    );
+                }
+            }
         }
     }
 
@@ -813,6 +1031,7 @@ impl Runtime {
             }
             return;
         }
+        self.cancel_live_realtime();
         match recorder.cancel().await {
             Ok(_) => {
                 self.clear_recording_session(&recorder, session);
@@ -964,8 +1183,19 @@ impl Runtime {
         };
         let (config, client) = {
             let inner = self.inner.lock();
-            (inner.config.clone(), inner.asr_client.clone())
+            (inner.config.clone(), inner.audio_client.clone())
         };
+        if client.is_realtime_workflow() {
+            self.transcribe_realtime_recording(
+                &wav_path,
+                &config,
+                &client,
+                cancellation,
+                cache_attempt,
+            )
+            .await;
+            return;
+        }
         let output_path = cache::recording_output_path(&wav_path, &config.container);
         if let Err(error) = prepare_audio_for_upload(
             self.converter.as_ref(),
@@ -1083,7 +1313,7 @@ impl Runtime {
                     _ => {}
                 }
             }
-            Err(AsrError::Canceled) => {
+            Err(error) if error.is_canceled() => {
                 clean_up_recording_attempt(
                     &config,
                     cache_attempt,
@@ -1126,7 +1356,7 @@ impl Runtime {
                     cache_attempt,
                     &wav_path,
                     &output_path,
-                    matches!(&error, AsrError::TextExtraction { .. }),
+                    error.is_text_extraction_error(),
                     &raw,
                 );
                 if !self.is_stopped() {
@@ -1135,6 +1365,184 @@ impl Runtime {
                     } else {
                         self.set_retryable_error("Upload failed", &error);
                     }
+                }
+            }
+        }
+    }
+
+    async fn transcribe_realtime_recording(
+        &self,
+        wav_path: &Path,
+        config: &Config,
+        client: &AudioApiClient,
+        cancellation: &CancellationToken,
+        cache_attempt: bool,
+    ) {
+        let cache_path = cache::recording_output_path(wav_path, "wav");
+        let mut live = self.take_live_realtime();
+        let had_live_session = live.active.is_some() || !live.committed.is_empty();
+        if live.failed {
+            if let Some(session) = live.active.take() {
+                session.cancellation.cancel();
+                session.task.abort();
+            }
+            live.committed.clear();
+        }
+        let transcription = if !live.failed && had_live_session {
+            self.set_state(
+                State::Uploading,
+                "Finalizing realtime ASR",
+                None::<&RuntimeError>,
+            );
+            if let Some(session) = live.active.take() {
+                let live_cancellation = session.cancellation;
+                let mut task = session.task;
+                let live_result = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        live_cancellation.cancel();
+                        task.abort();
+                        clean_up_recording_attempt(config, cache_attempt, wav_path, &cache_path, false, &[]);
+                        if !self.is_stopped() {
+                            self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                        }
+                        return;
+                    }
+                    result = &mut task => result,
+                };
+                match live_result {
+                    Ok(Ok(transcription)) => {
+                        live.committed.push(transcription);
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // A live websocket failure never affects the local
+                        // WAV. Discard every committed segment and replay the
+                        // complete recording through a fresh session.
+                        live.failed = true;
+                        live.committed.clear();
+                    }
+                }
+            }
+            if !live.failed {
+                let mut text = String::new();
+                let mut raw_response = Vec::new();
+                for transcription in live.committed {
+                    text.push_str(&transcription.text);
+                    if raw_response
+                        .len()
+                        .saturating_add(transcription.raw_response.len())
+                        <= 32 * 1024 * 1024
+                    {
+                        raw_response.extend_from_slice(&transcription.raw_response);
+                    }
+                }
+                Ok(Transcription { text, raw_response })
+            } else {
+                self.set_state(
+                    State::Uploading,
+                    "Replaying audio for transcription",
+                    None::<&RuntimeError>,
+                );
+                client.transcribe(cancellation, wav_path).await
+            }
+        } else {
+            self.set_state(
+                State::Uploading,
+                "Replaying audio for transcription",
+                None::<&RuntimeError>,
+            );
+            client.transcribe(cancellation, wav_path).await
+        };
+
+        match transcription {
+            Ok(transcription) => {
+                if self.is_stopped() {
+                    clean_up_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        &cache_path,
+                        true,
+                        &transcription.raw_response,
+                    );
+                    return;
+                }
+                if cancellation.is_cancelled() {
+                    clean_up_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        &cache_path,
+                        false,
+                        &[],
+                    );
+                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                    return;
+                }
+                if transcription.text.is_empty() {
+                    clean_up_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        &cache_path,
+                        true,
+                        &transcription.raw_response,
+                    );
+                    self.set_state(State::Idle, "Empty result from ASR", None::<&RuntimeError>);
+                    return;
+                }
+                let paste = text_input::send_text(&transcription.text, cancellation, config).await;
+                clean_up_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    &cache_path,
+                    true,
+                    &transcription.raw_response,
+                );
+                match paste {
+                    Ok(()) if !self.is_stopped() => self.set_state(
+                        State::Idle,
+                        if config.use_sendinput {
+                            "Text input sent"
+                        } else {
+                            "Transcription pasted"
+                        },
+                        None::<&RuntimeError>,
+                    ),
+                    Err(error) if error.canceled_before_output() && !self.is_stopped() => {
+                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
+                    }
+                    Err(error) if !self.is_stopped() => {
+                        self.set_retryable_error(error.status(), &error);
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) if error.is_canceled() || cancellation.is_cancelled() => {
+                clean_up_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    &cache_path,
+                    false,
+                    &[],
+                );
+                if !self.is_stopped() {
+                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                }
+            }
+            Err(error) => {
+                let raw = error.last_response().to_vec();
+                clean_up_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    &cache_path,
+                    false,
+                    &raw,
+                );
+                if !self.is_stopped() {
+                    self.set_retryable_error("Realtime transcription failed", &error);
                 }
             }
         }
@@ -1197,15 +1605,22 @@ pub async fn run_file_mode_with_cancellation(
         path: input_path.to_path_buf(),
         source,
     })?;
-    let client = AsrClient::new(config.clone())?;
-    let temporary = cache::temporary_output_path(&temp_dir, &config.container_extension());
+    let client = AudioApiClient::new(config.clone())?;
+    // Recorded realtime replay currently consumes a WAV and converts it into
+    // the workflow-declared PCM stream itself. Keep that preparation entirely
+    // within the normal --file path so all recognition modes still enter
+    // AudioApiClient through the same public interface.
+    let realtime_stream = client.realtime_audio_stream();
+    let preparation_config = file_mode_preparation_config(&config, realtime_stream.as_ref());
+    let temporary =
+        cache::temporary_output_path(&temp_dir, &preparation_config.container_extension());
     if let Err(error) = prepare_audio_for_upload(
         converter.as_ref(),
         &cancellation,
-        &config,
+        &preparation_config,
         input_path,
         &temporary,
-        config.sampling_rate,
+        preparation_config.sampling_rate,
     )
     .await
     {
@@ -1214,16 +1629,16 @@ pub async fn run_file_mode_with_cancellation(
     }
     let transcription = match client
         .transcribe_with_retry_prepare(&cancellation, &temporary, || async {
-            if !config.enable_vad {
+            if !preparation_config.enable_vad {
                 return Ok(());
             }
             prepare_audio_for_upload(
                 converter.as_ref(),
                 &cancellation,
-                &config,
+                &preparation_config,
                 input_path,
                 &temporary,
-                config.sampling_rate,
+                preparation_config.sampling_rate,
             )
             .await
             .map_err(AsrError::from)
@@ -1237,7 +1652,7 @@ pub async fn run_file_mode_with_cancellation(
                 &config,
                 None,
                 Some(&temporary),
-                matches!(&error, AsrError::TextExtraction { .. }),
+                error.is_text_extraction_error(),
                 &raw,
             );
             return Err(error.into());
@@ -1253,6 +1668,28 @@ pub async fn run_file_mode_with_cancellation(
         ))
     });
     finish_file_mode_output(&config, &temporary, output, transcription)
+}
+
+/// Chooses the file preparation format before the unified AudioApiClient is
+/// invoked. HTTP-style and Legacy workflows retain their existing settings.
+/// A realtime replay is deliberately prepared as a PCM WAV whose shape comes
+/// from the validated workflow: `RecordedReplaySource` can then use the same
+/// decode/chunk/pacing path as retry and live-failure replay.
+fn file_mode_preparation_config(
+    config: &Config,
+    realtime_stream: Option<&crate::advanced_audio::schema::RealtimeAudioStream>,
+) -> Config {
+    let Some(stream) = realtime_stream else {
+        return config.clone();
+    };
+
+    let mut preparation = config.clone();
+    preparation.codecs = "pcm".into();
+    preparation.container = "wav".into();
+    preparation.channels = i32::from(stream.channels);
+    preparation.sampling_rate = stream.sample_rate as i32;
+    preparation.sampling_rate_depth = 16;
+    preparation
 }
 
 fn finish_file_mode_output(
@@ -1333,12 +1770,137 @@ fn clean_up_recording_attempt(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
     use tokio::sync::Barrier;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::Message;
 
     use super::*;
+    use crate::advanced_audio::schema::{
+        AdvancedAudioConfig, AdvancedAudioWorkflow, AdvancedRecognition, AudioDelivery, AudioSpec,
+        PauseBehavior, RealtimeAudioMessage, RealtimeAudioStream, RealtimeCompletion,
+        RealtimeConnect, RealtimeMessage, RealtimePacing, RealtimeTransport, RealtimeWorkflow,
+        SignerConfig, StreamAction, StreamRule, WorkflowSchemaVersion,
+    };
+    use crate::audio_devices::{CaptureFormat, test_capture_format};
+    use crate::recorder::{AudioBackend, AudioStream};
 
     struct NoopConverter;
+
+    #[tokio::test]
+    async fn pause_finalizes_live_segment_before_resume() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let recorder = runtime.inner.lock().recorder.clone();
+        let cancellation = CancellationToken::new();
+        let task: JoinHandle<Result<Transcription, AudioApiError>> = tokio::spawn(async {
+            Ok(Transcription {
+                text: "first segment".into(),
+                raw_response: b"first".to_vec(),
+            })
+        });
+        runtime.inner.lock().live_realtime = Some(LiveRealtimeSession { cancellation, task });
+
+        runtime.finalize_live_realtime_segment(&recorder).await;
+
+        let live = runtime.take_live_realtime();
+        assert!(!live.failed);
+        assert!(live.active.is_none());
+        assert_eq!(live.committed.len(), 1);
+        assert_eq!(live.committed[0].text, "first segment");
+    }
+
+    #[tokio::test]
+    async fn failed_live_segment_discards_committed_segments_for_full_replay() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let recorder = runtime.inner.lock().recorder.clone();
+        let cancellation = CancellationToken::new();
+        let task: JoinHandle<Result<Transcription, AudioApiError>> =
+            tokio::spawn(async { Err(AudioApiError::LiveRealtimeUnavailable) });
+        {
+            let mut inner = runtime.inner.lock();
+            inner.completed_live_transcriptions.push(Transcription {
+                text: "must be discarded".into(),
+                raw_response: b"partial".to_vec(),
+            });
+            inner.live_realtime = Some(LiveRealtimeSession { cancellation, task });
+        }
+
+        runtime.finalize_live_realtime_segment(&recorder).await;
+
+        let live = runtime.take_live_realtime();
+        assert!(live.failed);
+        assert!(live.active.is_none());
+        assert!(live.committed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_bypasses_action_lock_during_live_finalization_only() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        let recorder = runtime.inner.lock().recorder.clone();
+        runtime.set_state(State::Recording, "Recording started", None::<&RuntimeError>);
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let task: JoinHandle<Result<Transcription, AudioApiError>> = tokio::spawn(async move {
+            let _ = started_sender.send(());
+            task_cancellation.cancelled().await;
+            // A result that races with cancellation must not become an
+            // incomplete committed segment.
+            Ok(Transcription {
+                text: "must not commit".into(),
+                raw_response: Vec::new(),
+            })
+        });
+        runtime.inner.lock().live_realtime = Some(LiveRealtimeSession { cancellation, task });
+
+        let finalizing_runtime = runtime.clone();
+        let finalizing = tokio::spawn(async move {
+            let _guard = finalizing_runtime.action_lock.clone().lock_owned().await;
+            finalizing_runtime
+                .finalize_live_realtime_segment(&recorder)
+                .await;
+        });
+        started_receiver.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime
+                    .inner
+                    .lock()
+                    .live_finalization_cancellation
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause should expose the live finalization cancellation token");
+
+        assert!(runtime.try_cancel_or_retry());
+        tokio::time::timeout(Duration::from_secs(1), finalizing)
+            .await
+            .expect("cancel should interrupt live finalization")
+            .unwrap();
+
+        let live = runtime.take_live_realtime();
+        assert!(live.failed);
+        assert!(live.active.is_none());
+        assert!(live.committed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_does_not_expose_live_finalization_cancel_path() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        runtime.set_state(State::Recording, "Recording started", None::<&RuntimeError>);
+        let _guard = runtime.action_lock.clone().lock_owned().await;
+
+        assert!(!runtime.try_cancel_or_retry());
+    }
 
     struct NoSpeechConverter;
     #[async_trait]
@@ -1398,6 +1960,223 @@ mod tests {
         ) -> Result<(), ConvertError> {
             Ok(())
         }
+    }
+
+    struct RealtimeCaptureBackend {
+        captured_packets: Arc<AtomicUsize>,
+    }
+
+    impl AudioBackend for RealtimeCaptureBackend {
+        fn open_stream(&self, _: &str) -> Result<Box<dyn AudioStream>, String> {
+            Ok(Box::new(RealtimeCaptureStream {
+                format: test_capture_format(16_000, 1, 16, 16, false),
+                captured_packets: self.captured_packets.clone(),
+            }))
+        }
+    }
+
+    struct RealtimeCaptureStream {
+        format: CaptureFormat,
+        captured_packets: Arc<AtomicUsize>,
+    }
+
+    impl AudioStream for RealtimeCaptureStream {
+        fn format(&self) -> &CaptureFormat {
+            &self.format
+        }
+
+        fn start(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn read(&mut self, buffer: &mut Vec<u8>) -> Result<(), String> {
+            buffer.clear();
+            for _ in 0..160 {
+                buffer.extend_from_slice(&0x0102_i16.to_le_bytes());
+            }
+            // Keep the fake close to microphone cadence. This gives the live
+            // source time to consume the bounded tee before the test stops.
+            std::thread::sleep(Duration::from_millis(3));
+            self.captured_packets.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn realtime_replay_workflow(url: String) -> AdvancedAudioWorkflow {
+        AdvancedAudioWorkflow {
+            schema_version: WorkflowSchemaVersion::default(),
+            name: "runtime realtime replay fake".into(),
+            parameters: vec![],
+            secrets: vec![],
+            audio: AudioSpec {
+                delivery: AudioDelivery::RealtimeChunks,
+                mime: None,
+            },
+            recognition: AdvancedRecognition::RealtimeSession {
+                realtime: Box::new(RealtimeWorkflow {
+                    transport: RealtimeTransport::WebSocket,
+                    connect: RealtimeConnect {
+                        url,
+                        query: Default::default(),
+                        headers: Default::default(),
+                        signer: SignerConfig::None,
+                        subprotocol: None,
+                    },
+                    initial_messages: vec![RealtimeMessage::Text {
+                        value: "start".into(),
+                    }],
+                    audio_stream: RealtimeAudioStream {
+                        codec: "pcm_s16le".into(),
+                        sample_rate: 16_000,
+                        channels: 1,
+                        chunk_duration_ms: 10,
+                        pacing: RealtimePacing::Realtime,
+                    },
+                    audio_message: RealtimeAudioMessage::Binary,
+                    receive_rules: vec![
+                        StreamRule {
+                            event: Some("partial".into()),
+                            path: Some("$.text".into()),
+                            action: StreamAction::ReplacePartial,
+                            equals: None,
+                        },
+                        StreamRule {
+                            event: Some("segment".into()),
+                            path: Some("$.text".into()),
+                            action: StreamAction::CommitSegment,
+                            equals: None,
+                        },
+                        StreamRule {
+                            event: Some("final".into()),
+                            path: Some("$.text".into()),
+                            action: StreamAction::SetFinalText,
+                            equals: None,
+                        },
+                        StreamRule {
+                            event: Some("complete".into()),
+                            path: None,
+                            action: StreamAction::Complete,
+                            equals: None,
+                        },
+                    ],
+                    finish_messages: vec![RealtimeMessage::Text {
+                        value: "finish".into(),
+                    }],
+                    completion: RealtimeCompletion {
+                        event: None,
+                        path: None,
+                        equals: None,
+                    },
+                    pause_behavior: PauseBehavior::RestartSession,
+                    finalization_timeout_ms: 1_000,
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn live_websocket_failure_replays_the_complete_local_wav_in_a_fresh_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/realtime", listener.local_addr().unwrap());
+        let (first_audio_sender, first_audio_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut first = accept_async(stream).await.unwrap();
+            match first.next().await.unwrap().unwrap() {
+                Message::Text(text) => assert_eq!(text.as_str(), "start"),
+                message => panic!("expected first-session start message, got {message:?}"),
+            }
+            let live_audio_bytes = loop {
+                match first.next().await.unwrap().unwrap() {
+                    Message::Binary(bytes) => break bytes.len(),
+                    Message::Ping(payload) => first.send(Message::Pong(payload)).await.unwrap(),
+                    message => panic!("expected first-session binary audio, got {message:?}"),
+                }
+            };
+            let _ = first_audio_sender.send(());
+            // A transport-level failure ends only the live session. The
+            // recorder keeps its complete WAV while Runtime opens a fresh
+            // connection for replay below.
+            drop(first);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut replay = accept_async(stream).await.unwrap();
+            match replay.next().await.unwrap().unwrap() {
+                Message::Text(text) => assert_eq!(text.as_str(), "start"),
+                message => panic!("expected replay start message, got {message:?}"),
+            }
+            let mut replay_audio_bytes = 0;
+            loop {
+                match replay.next().await.unwrap().unwrap() {
+                    Message::Binary(bytes) => replay_audio_bytes += bytes.len(),
+                    Message::Text(text) if text.as_str() == "finish" => break,
+                    Message::Ping(payload) => replay.send(Message::Pong(payload)).await.unwrap(),
+                    message => panic!("unexpected replay message: {message:?}"),
+                }
+            }
+            for event in [
+                r#"{"event":"partial","text":"draft"}"#,
+                r#"{"event":"segment","text":"committed"}"#,
+                r#"{"event":"final","text":""}"#,
+                r#"{"event":"complete"}"#,
+            ] {
+                replay.send(Message::Text(event.into())).await.unwrap();
+            }
+            (live_audio_bytes, replay_audio_bytes)
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: directory.path().to_string_lossy().into_owned(),
+            advanced_audio_api: AdvancedAudioConfig {
+                enabled: true,
+                workflow: Some(realtime_replay_workflow(endpoint)),
+                ..AdvancedAudioConfig::default()
+            },
+            ..Config::default()
+        };
+        let runtime = Runtime::new(config, Arc::new(NoopConverter)).unwrap();
+        let captured_packets = Arc::new(AtomicUsize::new(0));
+        let recorder = Arc::new(Recorder::with_backend(
+            runtime.config(),
+            directory.path().to_path_buf(),
+            Arc::new(RealtimeCaptureBackend {
+                captured_packets: captured_packets.clone(),
+            }),
+        ));
+        runtime.inner.lock().recorder = recorder;
+        runtime.enable_retry_buffer();
+
+        runtime.toggle_recording_locked().await;
+        tokio::time::timeout(Duration::from_secs(2), first_audio_receiver)
+            .await
+            .expect("the live websocket should receive recorder audio")
+            .expect("the fake server should report the live audio");
+        runtime.toggle_recording_locked().await;
+
+        let (live_audio_bytes, replay_audio_bytes) =
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .expect("the replay websocket should finish")
+                .unwrap();
+        assert!(live_audio_bytes > 0);
+        assert!(replay_audio_bytes > live_audio_bytes);
+        assert_eq!(
+            replay_audio_bytes,
+            captured_packets.load(Ordering::SeqCst) * 320,
+            "replay must include every 160-frame capture packet in the local WAV",
+        );
+        assert!(runtime.has_retryable_recording());
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(runtime.snapshot().message, "Empty result from ASR");
     }
 
     struct CancelAwareConverter {
@@ -1696,6 +2475,47 @@ mod tests {
         );
         assert!(matches!(result, Err(RuntimeError::OutputFile { .. })));
         assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn file_mode_realtime_replay_prepares_workflow_pcm_wav() {
+        let config = Config {
+            codecs: "opus".into(),
+            container: "opus".into(),
+            channels: 2,
+            sampling_rate: 48_000,
+            sampling_rate_depth: 24,
+            ..Config::default()
+        };
+        let stream = crate::advanced_audio::schema::RealtimeAudioStream {
+            codec: "pcm_s16le".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            chunk_duration_ms: 80,
+            pacing: crate::advanced_audio::schema::RealtimePacing::Realtime,
+        };
+
+        let preparation = file_mode_preparation_config(&config, Some(&stream));
+
+        assert_eq!(preparation.codecs, "pcm");
+        assert_eq!(preparation.container, "wav");
+        assert_eq!(preparation.channels, 1);
+        assert_eq!(preparation.sampling_rate, 16_000);
+        assert_eq!(preparation.sampling_rate_depth, 16);
+    }
+
+    #[test]
+    fn file_mode_non_realtime_preparation_preserves_existing_config() {
+        let config = Config {
+            codecs: "opus".into(),
+            container: "opus".into(),
+            channels: 2,
+            sampling_rate: 48_000,
+            sampling_rate_depth: 24,
+            ..Config::default()
+        };
+
+        assert_eq!(file_mode_preparation_config(&config, None), config);
     }
 
     #[tokio::test]

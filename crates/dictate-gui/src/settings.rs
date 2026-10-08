@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use dictate_core::Config;
-use dictate_core::asr::AsrClient;
+use dictate_core::audio_api::AudioApiClient;
 use dictate_core::converter::AudioConverter;
 use dictate_core::runtime::{Event, Runtime};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -32,17 +32,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DI_NORMAL,
     DefWindowProcW, DestroyIcon, DestroyWindow, DrawIconEx, EC_LEFTMARGIN, EC_RIGHTMARGIN,
-    EN_KILLFOCUS, EN_SETFOCUS, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD,
-    ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetMessagePos, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, HCURSOR, HMENU, HTCAPTION, HTCLIENT, HWND_TOP, IDC_ARROW,
-    LoadCursorW, MB_ICONERROR, MB_OK, MessageBoxW, PostMessageW, RegisterClassExW, SW_HIDE,
-    SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_WINDOWPOSCHANGED,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_PASSWORD, ES_READONLY, ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetMessagePos,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HCURSOR, HMENU,
+    HTCAPTION, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindowVisible, LoadCursorW, MB_ICONERROR, MB_OK,
+    MessageBoxW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPOS, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -51,6 +52,7 @@ use crate::platform;
 use crate::render::{PANEL_CORNER_RADIUS, RoundedOutlineRenderer, continuous_rounded_rect_polygon};
 use crate::resources;
 
+mod advanced_audio;
 mod audio;
 mod debug;
 mod dropdown;
@@ -109,6 +111,7 @@ const CONNECTIVITY_TEST_PCM: &str = include_str!("../../../scripts/connectivity_
 const GROUPS: &[(&str, &str)] = &[
     ("Display", "display"),
     ("API", "audio_api"),
+    (advanced_audio::GROUP, "advanced_audio_api"),
     ("Audio", "audio_record"),
     ("Rewrite", "rewrite_api"),
     ("Network", "network"),
@@ -374,6 +377,7 @@ struct SettingsState {
     connectivity_receiver: Option<std::sync::mpsc::Receiver<(Result<(), String>, u128)>>,
     rewrite_test: bool,
     connectivity_elapsed: u128,
+    advanced_audio: advanced_audio::Page,
     rewrite: rewrite::Page,
     debug: debug::Page,
     language: Language,
@@ -524,6 +528,7 @@ impl SettingsWindow {
             connectivity_receiver: None,
             rewrite_test: false,
             connectivity_elapsed: 0,
+            advanced_audio: advanced_audio::Page::new(&runtime.config()),
             rewrite: rewrite::Page::new(runtime.config().rewrite),
             debug: debug::Page::default(),
             language,
@@ -649,6 +654,9 @@ unsafe extern "system" fn settings_proc(
                 return LRESULT(0);
             }
             if rewrite::command(state, id, notification) {
+                return LRESULT(0);
+            }
+            if advanced_audio::command(state, id, notification) {
                 return LRESULT(0);
             }
             if notification == BN_CLICKED
@@ -801,7 +809,7 @@ unsafe extern "system" fn settings_proc(
                     {
                         picker.set_open(false, state.language, state.dpi)
                     }
-                    4 if !state.saving && state.active_group == 2 => {
+                    4 if !state.saving && state.active_group == 3 => {
                         picker.set_open(true, state.language, state.dpi)
                     }
                     5 => {
@@ -830,6 +838,12 @@ unsafe extern "system" fn settings_proc(
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
                 let control = HWND(lparam.0 as *mut c_void);
+                if advanced_audio::is_generation_status_control(state, control) {
+                    SetBkMode(hdc, windows::Win32::Graphics::Gdi::OPAQUE);
+                    SetBkColor(hdc, rgb(26, 35, 39));
+                    SetTextColor(hdc, rgb(221, 183, 105));
+                    return LRESULT(state.input_brush.0 as isize);
+                }
                 // Keep these STATIC labels enabled to avoid embossed disabled text.
                 // Their color follows the corresponding input's enabled state.
                 let color_control = state
@@ -860,9 +874,17 @@ unsafe extern "system" fn settings_proc(
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
             let hdc = HDC(wparam.0 as *mut c_void);
+            let control = HWND(lparam.0 as *mut c_void);
             unsafe {
                 SetBkColor(hdc, rgb(26, 35, 39));
-                SetTextColor(hdc, rgb(235, 242, 243));
+                SetTextColor(
+                    hdc,
+                    if advanced_audio::is_generation_status_control(state, control) {
+                        rgb(221, 183, 105)
+                    } else {
+                        rgb(235, 242, 243)
+                    },
+                );
             }
             LRESULT(state.input_brush.0 as isize)
         }
@@ -887,6 +909,7 @@ unsafe extern "system" fn settings_proc(
                 );
             }
             resize_controls(state);
+            advanced_audio::resize(state);
             if let Some(picker) = &mut state.microphone {
                 picker.rebuild(state.language, state.dpi);
             }
@@ -912,6 +935,10 @@ unsafe extern "system" fn settings_proc(
             poll_connectivity(state);
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == advanced_audio::TIMER => {
+            advanced_audio::poll_generation(state);
+            LRESULT(0)
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == debug::TIMER => {
             debug::refresh(&mut state.debug);
             LRESULT(0)
@@ -934,6 +961,7 @@ unsafe extern "system" fn settings_proc(
         }
         WM_DESTROY => {
             state.connectivity_cancel.cancel();
+            advanced_audio::cancel_generation(state);
             hotkeys::deactivate();
             unsafe {
                 let _ =
@@ -1229,6 +1257,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
         );
     }
 
+    advanced_audio::create(state, instance)?;
     rewrite::create(state, instance)?;
     debug::create(state, instance)?;
     audio::refresh(state);
@@ -1526,11 +1555,12 @@ fn paint_window(state: &SettingsState) {
             .map(|group| group.0)
             .unwrap_or("Display");
         let focused = GetFocus();
-        for frame in state
-            .input_frames
-            .iter()
-            .filter(|frame| frame.group == active)
-        {
+        for frame in state.input_frames.iter().filter(|frame| {
+            frame.group == active
+                && IsWindowVisible(frame.control).as_bool()
+                && windows::Win32::UI::WindowsAndMessaging::GetParent(frame.control).ok()
+                    == Some(state.hwnd)
+        }) {
             rounded_box(
                 hdc,
                 scaled_rect(frame.rect, state.dpi),
@@ -1548,6 +1578,11 @@ fn paint_window(state: &SettingsState) {
         }
         if active == "API" || active == "Rewrite" {
             paint_connectivity_status(state, hdc);
+        }
+        if active == "API" {
+            advanced_audio::paint_legacy_notice(state, hdc);
+        } else if active == advanced_audio::GROUP {
+            advanced_audio::paint(state, hdc);
         }
         SelectObject(hdc, old);
         let _ = EndPaint(state.hwnd, &paint);
@@ -1736,6 +1771,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         let (fill, border, text_color, radius) = if id == ID_TEST_CONNECTIVITY
             || (rewrite::ID_ADD..=rewrite::ID_TEST).contains(&id)
             || debug::is_button(id)
+            || advanced_audio::is_button(id)
         {
             (
                 if disabled {
@@ -2078,7 +2114,11 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
 
 unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
     let s = |value| platform::scale(value, state.dpi);
-    if (state.active_group == 3) != state.rewrite_test {
+    let active = GROUPS
+        .get(state.active_group)
+        .map(|group| group.0)
+        .unwrap_or("Display");
+    if (active == "Rewrite") != state.rewrite_test {
         return;
     }
     let left = if state.rewrite_test {
@@ -2191,6 +2231,7 @@ fn refresh_language(state: &SettingsState) {
         );
     }
     rewrite::refresh_labels(state);
+    advanced_audio::sync_visibility(state);
     for (hwnd, key) in &state.localized_controls {
         let text = if *key == "API" {
             "API"
@@ -2224,6 +2265,7 @@ fn update_page_visibility(state: &SettingsState) {
             let _ = ShowWindow(hwnd, if *group == active { SW_SHOW } else { SW_HIDE });
         }
     }
+    advanced_audio::sync_visibility(state);
     if active != "Display" || !state.language_open {
         unsafe {
             let _ = ShowWindow(state.language_panel, SW_HIDE);
@@ -2359,6 +2401,7 @@ fn start_connectivity(state: &mut SettingsState, rewrite: bool) {
             }
         }
     }
+    advanced_audio::update_controls(state);
     unsafe {
         let _ = InvalidateRect(Some(state.hwnd), None, true);
     }
@@ -2421,6 +2464,7 @@ fn poll_connectivity(state: &mut SettingsState) {
             }
         }
     }
+    advanced_audio::update_controls(state);
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
             Some(state.hwnd),
@@ -2434,17 +2478,36 @@ async fn run_connectivity_test(
     config: Config,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
-    let client = AsrClient::new(config.clone()).map_err(|error| error.to_string())?;
-    if config.api_endpoint.is_empty() {
+    let client = AudioApiClient::new(config.clone()).map_err(|error| error.to_string())?;
+    if !client.is_advanced() && config.api_endpoint.is_empty() {
         return Err("API endpoint is empty".into());
     }
-    let (input, output) = connectivity_test_paths(&config.container_extension());
+    // Realtime test execution deliberately follows the same recorded-replay
+    // path as CLI/retry.  Its source currently accepts PCM WAV, so prepare a
+    // workflow-compatible WAV rather than routing the UI through a separate
+    // WebSocket implementation or reusing an unrelated legacy container.
+    let mut conversion_config = config.clone();
+    let extension = if client.is_realtime_workflow() {
+        let target = client
+            .realtime_audio_stream()
+            .ok_or_else(|| "Realtime workflow has no audio stream settings.".to_string())?;
+        conversion_config.codecs = "pcm".into();
+        conversion_config.container = "wav".into();
+        conversion_config.channels = i32::from(target.channels);
+        conversion_config.sampling_rate = i32::try_from(target.sample_rate)
+            .map_err(|_| "Realtime workflow sample rate is too large.".to_string())?;
+        conversion_config.sampling_rate_depth = 16;
+        "wav".into()
+    } else {
+        config.container_extension()
+    };
+    let (input, output) = connectivity_test_paths(&extension);
     let result = async {
         write_connectivity_test_wav(&input)?;
         platform::GuiLibAvConverter
             .convert(
                 &cancellation,
-                &config,
+                &conversion_config,
                 &input,
                 &output,
                 CONNECTIVITY_TEST_SAMPLE_RATE,
@@ -2681,6 +2744,7 @@ fn read_config(state: &SettingsState) -> Result<Config, String> {
         object.insert(field.key.into(), value);
     }
     let mut config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    config.advanced_audio_api = advanced_audio::read(state)?;
     config.rewrite = rewrite::read(state);
     dictate_core::additional_parameters::parse(&config.extra_config)
         .map_err(|e| format!("Extra config: {e}"))?;
@@ -2778,6 +2842,7 @@ fn update_input_controls(state: &SettingsState) {
             }
         }
     }
+    advanced_audio::update_controls(state);
 }
 
 fn create_font(dpi: u32, points: i32, bold: bool) -> HFONT {

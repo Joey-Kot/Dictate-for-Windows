@@ -49,6 +49,20 @@ dependencies. Exact versions are locked in `Cargo.lock`. Release source
 archives retain crate license metadata; generated binary packages continue to
 include this notice and the project license.
 
+### Advanced Audio API transport and cryptographic primitives
+
+- bytes 1.12.1 — MIT; source: https://crates.io/crates/bytes/1.12.1
+  (Tokio project: https://github.com/tokio-rs/bytes)
+- tokio-tungstenite 0.24.0 — MIT; source: https://crates.io/crates/tokio-tungstenite/0.24.0
+  (Tokio project: https://github.com/snapview/tokio-tungstenite)
+
+- hmac 0.12.1 — MIT OR Apache-2.0; source: https://crates.io/crates/hmac/0.12.1
+  (RustCrypto MACs: https://github.com/RustCrypto/MACs)
+- sha1 0.10.7 — MIT OR Apache-2.0; source: https://crates.io/crates/sha1/0.10.7
+  (RustCrypto hashes: https://github.com/RustCrypto/hashes)
+- sha2 0.10.9 — MIT OR Apache-2.0; source: https://crates.io/crates/sha2/0.10.9
+  (RustCrypto hashes: https://github.com/RustCrypto/hashes)
+
 ## Project License
 
 - GPL-3.0-or-later

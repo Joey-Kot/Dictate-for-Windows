@@ -1,0 +1,12 @@
+event: delta
+data: {"text":"hel"}
+
+event: delta
+data: {"text":"lo"}
+
+event: final
+data: {"text":"complete transcript"}
+
+event: done
+data: {}
+

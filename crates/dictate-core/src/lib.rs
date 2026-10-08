@@ -1,5 +1,7 @@
 pub mod additional_parameters;
+pub mod advanced_audio;
 pub mod asr;
+pub mod audio_api;
 pub mod cache;
 pub mod clipboard;
 pub mod config;

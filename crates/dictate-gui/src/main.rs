@@ -1,6 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(any(windows, test))]
+#[cfg_attr(all(test, not(windows)), allow(dead_code))]
+mod advanced_audio_prompt;
+#[cfg(any(windows, test))]
 mod audio_options;
 #[cfg(any(windows, test))]
 mod debug_log;
