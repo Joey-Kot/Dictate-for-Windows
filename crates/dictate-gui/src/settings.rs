@@ -10,8 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use dictate_core::Config;
-use dictate_core::audio_api::AudioApiClient;
-use dictate_core::converter::AudioConverter;
 use dictate_core::runtime::{Event, Runtime};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -105,6 +103,11 @@ const FIELD_TOP: i32 = 94;
 const FIELD_HEIGHT: i32 = 34;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const CLIPBOARD_DELAY_KEYS: [&str; 2] = ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"];
+const SEGMENTED_UPLOAD_KEYS: [&str; 3] = [
+    "MAX_UPLOAD_SEGMENT_SECONDS",
+    "MIN_UPLOAD_PAUSE_MS",
+    "MAX_UPLOAD_CONCURRENCY",
+];
 const CONNECTIVITY_TEST_SAMPLE_RATE: i32 = 16_000;
 const CONNECTIVITY_TEST_PCM: &str = include_str!("../../../scripts/connectivity_test.pcm.b64");
 
@@ -276,6 +279,30 @@ const FIELDS: &[FieldSpec] = &[
         label: "Verify SSL",
         group: "Network",
         kind: FieldKind::Boolean,
+    },
+    FieldSpec {
+        key: "ENABLE_SEGMENTED_UPLOAD",
+        label: "Segmented upload",
+        group: "Network",
+        kind: FieldKind::Boolean,
+    },
+    FieldSpec {
+        key: "MAX_UPLOAD_SEGMENT_SECONDS",
+        label: "Max segment (s)",
+        group: "Network",
+        kind: FieldKind::Integer,
+    },
+    FieldSpec {
+        key: "MIN_UPLOAD_PAUSE_MS",
+        label: "Min pause (ms)",
+        group: "Network",
+        kind: FieldKind::Integer,
+    },
+    FieldSpec {
+        key: "MAX_UPLOAD_CONCURRENCY",
+        label: "Upload concurrency",
+        group: "Network",
+        kind: FieldKind::Integer,
     },
     FieldSpec {
         key: "START_KEY",
@@ -2500,64 +2527,36 @@ async fn run_connectivity_test(
     config: Config,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
-    let client = AudioApiClient::new(config.clone()).map_err(|error| error.to_string())?;
-    if !client.is_advanced() && config.api_endpoint.is_empty() {
+    if !config.advanced_audio_api.enabled && config.api_endpoint.is_empty() {
         return Err("API endpoint is empty".into());
     }
-    // Realtime test execution deliberately follows the same recorded-replay
-    // path as CLI/retry.  Its source currently accepts PCM WAV, so prepare a
-    // workflow-compatible WAV rather than routing the UI through a separate
-    // WebSocket implementation or reusing an unrelated legacy container.
-    let mut conversion_config = config.clone();
-    let extension = if client.is_realtime_workflow() {
-        let target = client
-            .realtime_audio_stream()
-            .ok_or_else(|| "Realtime workflow has no audio stream settings.".to_string())?;
-        conversion_config.codecs = "pcm".into();
-        conversion_config.container = "wav".into();
-        conversion_config.channels = i32::from(target.channels);
-        conversion_config.sampling_rate = i32::try_from(target.sample_rate)
-            .map_err(|_| "Realtime workflow sample rate is too large.".to_string())?;
-        conversion_config.sampling_rate_depth = 16;
-        "wav".into()
-    } else {
-        config.container_extension()
-    };
-    let (input, output) = connectivity_test_paths(&extension);
+    let input = connectivity_test_source_path();
     let result = async {
         write_connectivity_test_wav(&input)?;
-        platform::GuiLibAvConverter
-            .convert(
-                &cancellation,
-                &conversion_config,
-                &input,
-                &output,
-                CONNECTIVITY_TEST_SAMPLE_RATE,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        client
-            .test_connection_cancellable(&cancellation, &output)
-            .await
-            .map_err(|error| error.to_string())
+        dictate_core::runtime::test_audio_api_with_source(
+            config,
+            &platform::GuiLibAvConverter,
+            &input,
+            CONNECTIVITY_TEST_SAMPLE_RATE,
+            &std::env::temp_dir(),
+            cancellation,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
     .await;
     let _ = fs::remove_file(&input);
-    let _ = fs::remove_file(&output);
     result
 }
 
-fn connectivity_test_paths(extension: &str) -> (PathBuf, PathBuf) {
+fn connectivity_test_source_path() -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let stem = format!("dictate-connectivity-{}-{timestamp}", std::process::id());
     let directory = std::env::temp_dir();
-    (
-        directory.join(format!("{stem}-source.wav")),
-        directory.join(format!("{stem}-converted.{extension}")),
-    )
+    directory.join(format!("{stem}-source.wav"))
 }
 
 fn write_connectivity_test_wav(path: &Path) -> Result<(), String> {
@@ -2845,6 +2844,21 @@ fn update_input_controls(state: &SettingsState) {
                 .unwrap_or(false);
         unsafe {
             let _ = EnableWindow(*control, enabled);
+            let _ = InvalidateRect(Some(*control), None, true);
+        }
+    }
+    let segmented_upload_enabled = !state.saving
+        && state
+            .boolean_values
+            .get("ENABLE_SEGMENTED_UPLOAD")
+            .copied()
+            .unwrap_or(false);
+    for key in SEGMENTED_UPLOAD_KEYS {
+        let Some(control) = state.controls.get(key) else {
+            continue;
+        };
+        unsafe {
+            let _ = EnableWindow(*control, segmented_upload_enabled);
             let _ = InvalidateRect(Some(*control), None, true);
         }
     }

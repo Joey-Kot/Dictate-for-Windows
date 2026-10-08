@@ -161,6 +161,74 @@ algorithms are Core code, never workflow-provided code. Dynamic signers cannot
 be used with streaming multipart or `raw_audio` uploads because those bodies
 are intentionally not materialized merely to calculate a payload hash.
 
+## Segmented-upload runtime behavior
+
+Segmented upload is an opt-in application runtime policy. It is not an
+`ADVANCED_AUDIO_API` workflow field, an `audio.delivery` value, or a
+provider-specific extension. Its settings live in the top-level Network
+configuration:
+
+```json
+{
+  "ENABLE_SEGMENTED_UPLOAD": false,
+  "MAX_UPLOAD_SEGMENT_SECONDS": 300,
+  "MIN_UPLOAD_PAUSE_MS": 700,
+  "MAX_UPLOAD_CONCURRENCY": 1
+}
+```
+
+The switch defaults to `false`. The three numeric values respectively express
+the strict maximum source-timeline span of one segment, the minimum qualifying
+pause duration, and the maximum number of complete segment workflows that may
+be active at once. Each numeric value must be greater than zero even while the
+switch is off, so a disabled configuration remains valid only when its retained
+settings are valid too.
+
+When enabled, the policy applies to Legacy recognition and to every non-realtime
+Advanced execution: `request`, `request_stream`, and `async_poll`, including
+their ordinary file delivery, `provider_upload`, `public_https_url`, and
+`cloud_uri` paths. `realtime_session` is explicitly excluded even if the switch
+is on; it keeps its existing live/replay session behavior and is never sent to
+the segmented batch path.
+
+For a newly built plan, libav decodes the original media in its source-frame
+domain and performs amplitude-based silence analysis to find pauses that meet
+`MIN_UPLOAD_PAUSE_MS`. This is not the Earshot VAD trimming path used by normal
+`ENABLE_VAD` preparation. During segmented export, that trimming path is
+disabled: pauses only choose boundaries and are never removed, padded away, or
+concatenated out of the audio.
+
+The resulting `SegmentPlan` is a contiguous, non-overlapping partition of the
+complete original source timeline using half-open frame ranges. Before a strict
+maximum boundary, planning prefers the end of the latest eligible pause. If a
+pause crosses that boundary, or no eligible pause exists, the boundary is a
+hard cut at the configured maximum. Each range is exported as its own
+standalone media file. Thus every segment, including internal silence, remains
+on the original timeline; the batch neither drops nor duplicates source-frame
+ranges. If analysis finds that the entire source is silent, preparation returns
+`No speech detected` and sends no segment.
+
+Each exported file runs one complete existing `AudioApiClient` workflow. The
+concurrency setting limits complete workflows, not merely upload HTTP requests:
+for Advanced remote or asynchronous paths it includes publishing, submit,
+polling, result retrieval, and the workflow's cleanup. On the first segment
+failure or user cancellation, no additional segment is scheduled; already
+started workflows receive cancellation and are allowed to finish their normal
+cleanup before the batch returns. A batch produces text only when every segment
+succeeds, then concatenates the segment texts in original source order without
+inserting spaces, punctuation, or another separator. Failure or cancellation
+does not produce a partial transcript.
+
+For an interactive retryable recording, Dictate retains the original WAV under
+the existing in-memory retry limit and freezes its upload mode, `SegmentPlan`,
+maximum duration, minimum-pause value, and concurrency. A newly selected plan
+is retained before export begins, so even an export failure does not require a
+new analysis on Retry. Retry re-exports every segment and reruns the complete
+batch; it does not re-analyze pauses or reuse any previously successful segment
+text. The Settings Audio API Test workflow and CLI `--file` use the same
+segmented preparation and bounded-batch path when it applies. The `--file`
+input remains caller-owned and is never moved or deleted.
+
 ## Template security boundary
 
 The only supported template values are:
@@ -179,8 +247,9 @@ dynamic DLLs, or arbitrary disk writes. The validator verifies declared
 variables/secrets,
 capture ordering, fixed namespaces, and compatible audio placeholders before
 any network connection is made. The workflow cannot select an arbitrary local
-path: audio comes only from the current prepared recording, recorder stream,
-retry recording, or an audio file explicitly supplied to CLI `--file`.
+path: audio comes only from the current prepared audio file (the current
+independently exported segment in segmented mode), recorder stream, retry
+recording, or an audio file explicitly supplied to CLI `--file`.
 
 `audio:base64`, `audio:data_uri`, `audio:public_url`, and `audio:cloud_uri`
 are each restricted to their matching audio-delivery type. Realtime reserves
@@ -221,6 +290,12 @@ recognition; cleanup failure never replaces a transcript or cancellation
 outcome. Once an upload request has been issued, an upload failure, failed
 recognition, or cancellation forces a best-effort DELETE regardless of that
 setting, while retaining the original error.
+
+In a segmented non-realtime batch, every started segment has its own remote
+publication, recognition, and cleanup lifecycle. A batch never turns several
+segments into one shared remote object. If a batch fails or is canceled, it
+stops launching later segments, cancels the started workflows, and waits for
+their existing per-object cleanup paths before returning.
 
 ## Realtime behavior
 
@@ -284,7 +359,9 @@ material.
 The bounded limits are: workflow JSON 256 KiB; one template 32 KiB; at most
 64 parameters, secrets, headers, query entries, captures, or stream rules; at
 most 32 initial and 32 finish messages; poll interval at least 100 ms and poll
-timeout at most 24 hours. Base64/Data-URI source audio is limited to 16 MiB.
+timeout at most 24 hours. Base64/Data-URI input is limited to 16 MiB for each
+current prepared audio file. In segmented mode, that is a limit for each
+exported segment rather than an aggregate limit on the original recording.
 HTTP responses, streamed raw responses, and WebSocket messages are limited to
 32 MiB; body-based extraction is limited to 2 MiB; each SSE event, NDJSON line,
 or JSON chunk is limited to 1 MiB.

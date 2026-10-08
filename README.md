@@ -15,10 +15,11 @@ The current implementation uses Rust, Win32, Direct2D, and DirectWrite.
 
 - **Recording and transcription**: record through the floating window or global hotkeys, with support for pausing, cancellation, and retranscribing the most recent recording.
 - **Text rewriting**: assign hotkeys to prompts and use text models from different providers to rewrite selected text.
-- **Custom APIs**: configure Legacy Audio API and Rewrite endpoints, models, prompts, and extra request parameters.
-- **Advanced Audio API**: opt into a validated, declarative workflow for request, streaming-response, asynchronous polling, or WebSocket realtime transcription.
+- **Custom APIs**: configure an OpenAI-compatible Audio API and Rewrite APIs from different providers, with their models, prompts, and extra request parameters.
+- **Advanced custom Audio API Provider**: generate and validate a declarative ASR provider workflow from separate user requirements and vendor material, with typed, conditional, single-select, and multi-select controls for request, streaming-response, asynchronous polling, or WebSocket realtime transcription.
 - **Automatic text insertion**: transcription and Rewrite results share clipboard paste or SendInput output to the current application.
 - **Audio processing**: choose a microphone and output format, with optional voice detection and trimming; embedded FFmpeg requires no separate installation.
+- **Local concurrent segmented upload**: use embedded FFmpeg/libav amplitude-based silence analysis to choose preferred pause boundaries while preserving the complete audio timeline, export independent media segments, and submit them to ASR APIs with bounded concurrency.
 - **GUI and CLI**: a multilingual native floating window and a command-line program support everyday recording, scripting, and transcription of existing audio files.
 
 ## Downloads
@@ -53,8 +54,13 @@ flowchart LR
         Runtime["Interactive runtime<br/>State, one task at a time, and cancellation"]
         Recorder["WASAPI recording<br/>Retry the most recent recording"]
         Selection["Read text with Ctrl+C<br/>Back up and restore the clipboard"]
-        Prepare["Embedded libav audio conversion<br/>Optional VAD detection and trimming"]
-        ASR["Legacy Audio API / Advanced workflow<br/>Produce final transcript"]
+        Source["Original audio<br/>Recording WAV or --file source"]
+        Prepare["Embedded libav complete-file preparation<br/>Optional Earshot VAD trimming"]
+        SegmentPrepare["Embedded libav pause analysis + SegmentPlan<br/>Export independent complete media files"]
+        ASR["One Legacy / Advanced non-realtime ASR workflow<br/>Produce a final transcript"]
+        SegmentBatch["Bounded segment batch<br/>One complete non-realtime workflow per segment"]
+        Merge["Source-order text merge<br/>Only after every segment succeeds"]
+        Realtime["Advanced realtime_session<br/>Live microphone chunks, session finalization, or WAV replay"]
         Rewrite["Rewrite API<br/>Prompts and Provider"]
         Output["Shared text output<br/>Clipboard Ctrl+V / SendInput"]
     end
@@ -62,16 +68,27 @@ flowchart LR
     GUI --> Runtime
     CLI --> Runtime
     Runtime -->|Record| Recorder
-    Recorder --> Prepare
-    Recorder -->|Live realtime chunks| ASR
-    FileMode --> Prepare
+    Recorder --> Source
+    Recorder -->|Live realtime chunks| Realtime
+    FileMode --> Source
+    Source -->|Nonrealtime complete-file path| Prepare
     Prepare --> ASR
+    Source -->|Segmented non-realtime path| SegmentPrepare
+    SegmentPrepare --> SegmentBatch
+    SegmentBatch --> Merge
+    Source -->|CLI --file realtime PCM preparation| Prepare
+    Prepare -->|CLI realtime replay| Realtime
+    Source -->|Interactive realtime recovery or Retry| Realtime
     Runtime -->|Prompt hotkey| Selection
     Selection -->|Request after restoring the clipboard| Rewrite
     ASR -->|Interactive mode| Output
+    Merge -->|Interactive mode| Output
+    Realtime -->|Interactive mode| Output
     Rewrite -->|Complete nonempty result| Output
     Output --> App["Current foreground application"]
     ASR -->|File mode| TextFile["Text file"]
+    Merge -->|File mode| TextFile
+    Realtime -->|File mode| TextFile
 ```
 
 Audio and Rewrite use separate API configurations and share network settings and text output methods. The Audio API path is Legacy by default and switches to Advanced only when `ADVANCED_AUDIO_API.enabled=true`. Each Rewrite prompt can use the main Rewrite API or its own Provider, Base URL, API Key, and Model. Rewrite always reads input through the clipboard, regardless of `USE_SENDINPUT`.
@@ -96,14 +113,34 @@ sequenceDiagram
             User->>Core: Pause / Resume
             Core->>Audio: Pause / Resume capture
         end
-        User->>Core: Stop recording
-        Core->>Audio: Finalize WAV and prepare audio for the selected delivery
-        Note over Core,Audio: Optional VAD detection and trimming, format conversion with embedded libav
-        Audio-->>Core: Audio preparation result
-        break VAD detects no speech
-            Core-->>User: Clear the retry buffer and finish without an ASR request
+        opt Advanced realtime_session is enabled
+            Core->>API: Send live microphone chunks while recording
         end
-        Core->>API: Deliver audio through the selected Legacy or Advanced Audio API
+        User->>Core: Stop recording
+        Core->>Audio: Finalize original WAV
+        alt Segmented upload is enabled and the selected workflow is non-realtime
+            Core->>Audio: Analyze source-frame pauses and build a SegmentPlan
+            Note over Core,Audio: libav amplitude-silence analysis chooses boundaries and retains all source frames including silence
+            Audio-->>Core: Independently decodable media segments
+            break Analysis finds only silence
+                Core-->>User: Clear the retry buffer and finish without an ASR request
+            end
+            Core->>API: Run one complete ASR workflow per segment (bounded concurrency)
+            API-->>Core: Final result for each segment
+            Core->>Core: Concatenate results in source order only after every segment succeeds
+        else Non-realtime complete-file path
+            Core->>Audio: Prepare audio for the selected delivery
+            Note over Core,Audio: Optional Earshot VAD trimming and format conversion with embedded libav
+            Audio-->>Core: Prepared audio
+            break VAD detects no speech
+                Core-->>User: Clear the retry buffer and finish without an ASR request
+            end
+            Core->>API: Deliver prepared audio through the selected Legacy or Advanced Audio API
+            API-->>Core: Return response
+        else realtime_session
+            Core->>API: Finalize the live session and wait for the final transcript
+            API-->>Core: Return final response
+        end
     else Rewrite selected text
         User->>Core: Trigger a prompt hotkey
         Core->>Clipboard: Back up and clear
@@ -117,10 +154,10 @@ sequenceDiagram
             Core-->>User: Finish the task without sending a Rewrite request
         end
         Core->>API: Send the prompt and text through the Rewrite API
+        API-->>Core: Return response
     end
 
-    API-->>Core: Return response
-    Core->>Core: Extract and validate the result using the selected Audio extractor or Rewrite Provider
+    Core->>Core: Extract and validate the complete result using the selected Audio extractor or Rewrite Provider
     opt Text is available for insertion and the task has not been canceled
         alt USE_SENDINPUT=true
             Core->>App: Insert Unicode text with SendInput
@@ -135,7 +172,7 @@ sequenceDiagram
     Core-->>User: Finish and update the state
 ```
 
-- The stop/finalize path in this diagram describes complete-file delivery. The Legacy Audio API converts and uploads complete audio only after recording stops; it does not provide realtime recognition. An Advanced `realtime_session` can send microphone chunks while recording, finalizes the current session on pause, and opens a new session on resume. Every Advanced mode waits for one complete final transcript and never inserts partial text into the foreground application.
+- After recording stops, a non-realtime path either prepares one complete file or, when segmented upload is enabled, analyzes the original source and exports independent complete media files. Legacy never provides realtime recognition. An Advanced `realtime_session` can send microphone chunks while recording, finalizes the current session on pause, and opens a new session on resume; it never enters the segmented path. Every Advanced mode waits for one complete final transcript and never inserts partial text into the foreground application.
 - Rewrite input reading and clipboard output share **Paste delay** and **Restore delay**. Both settings still apply to Rewrite input reading when SendInput is enabled.
 - Failed requests, empty results, and Rewrite results received after cancellation do not proceed to text output. Text output that has already begun cannot be undone; see “Clipboard and automatic paste” for details.
 
@@ -169,7 +206,9 @@ stateDiagram-v2
     Error --> Idle: Save valid settings
 
     note right of Uploading
-        Audio preparation, ASR request, and text output
+        Audio preparation, optional segment planning/export,
+        one complete ASR workflow or a bounded segment batch,
+        source-order merge, and text output
         Audio API connectivity tests also reuse this state
     end note
     note right of Rewriting
@@ -179,18 +218,19 @@ stateDiagram-v2
 ```
 
 - Recording (including pauses), transcription, Rewrite, and connectivity tests run one at a time. New tasks are discarded while busy, without queuing; cancellation can stop the current task, but new tasks are not accepted until cleanup and clipboard restoration finish.
-- Legacy Audio API and Rewrite connectivity tests use the current settings draft and make a single request. Advanced **Test workflow** executes the declared workflow after confirmation, so it can include remote upload, polling, result fetches, or recorded realtime replay. Tests do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
-- Retry retranscribes only the most recent completed audio recording and does not trigger Rewrite. The retry buffer is held only in memory, up to 100,000,000 bytes. It is replaced when a new recording finishes, retained after cancellation during recording, request cancellation, or completion of a retry, and cleared when VAD detects no speech.
+- Rewrite connectivity tests use the current settings draft and make a single request. Legacy audio connectivity tests normally do the same. With segmented upload enabled for a non-realtime Audio API, the Legacy test and Advanced **Test workflow** instead use the same segment preparation and bounded batch dispatch as transcription. The fixed short test source can still produce one segment, so a successful test is not evidence that a provider accepts the configured maximum duration. Advanced **Test workflow** executes the declared workflow after confirmation and can include remote upload, polling, result fetches, or recorded realtime replay. Tests do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
+- Retry retranscribes only the most recent completed audio recording and does not trigger Rewrite. The retry buffer is held only in memory, up to 100,000,000 bytes. It is replaced when a new recording finishes, retained after cancellation during recording, request cancellation, or completion of a retry, and cleared when complete-file VAD or segmented analysis finds no speech. Once a segmented plan has been created, Retry retains the original WAV plus that plan and its maximum duration, minimum-pause, and concurrency settings; it re-exports and resends the entire batch without reanalyzing pauses or reusing earlier segment text.
 
 ## Scope and limitations
 
 - Current releases provide Windows x86_64 builds only.
 - The GUI is a native Windows-only program. The CLI source can be compiled on other systems, but global Windows hotkeys are available only on Windows.
 - Microphone capture and device enumeration are supported only on Windows. Both the GUI and CLI can use a specified recording input device or follow the system default, resolving the device again each time recording starts.
-- The Legacy Audio API uploads complete audio after recording and does not support realtime streaming recognition.
+- With segmented upload disabled, the Legacy Audio API uploads one prepared complete audio file after recording and does not support realtime streaming recognition. With it enabled, each independently decodable segment is sent through a separate Legacy multipart request.
 - Legacy ASR endpoints must accept `multipart/form-data` and return JSON.
 - The Legacy Audio API treats only HTTP 200 as success; Rewrite accepts successful status codes and requires a parseable, nonempty text result.
 - The optional Advanced Audio API supports bounded request, streaming-response, asynchronous polling, and WebSocket realtime workflows. It may use HTTP, HTTPS, WebSocket, or secure WebSocket endpoints; localhost and LAN targets are allowed.
+- Optional segmented upload applies to Legacy and Advanced non-realtime workflows (`request`, `request_stream`, and `async_poll`), including their declared delivery steps. An Advanced `realtime_session` always retains its existing live or recorded-replay path and is never segmented.
 - The current Advanced Audio API boundary does not support gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflows, branches, loops, user scripts, custom signer code, provider-specific realtime resume, or foreground insertion of live partial text.
 - The HTTP client does not use the system proxy, automatically follow redirects, or enable automatic response compression.
 - Embedded libav runs on a blocking worker thread, with cancellation callbacks integrated into decoding, interval processing, and file I/O. Cleanup waits for the worker thread to close its output.
@@ -270,7 +310,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 | Advanced Audio API | Enable switch, separate user-requirements and vendor-material inputs, workflow generation and validation, typed Values including JSON-object and JSON-array editors with conditional display, Secrets, raw Workflow JSON, Remote hosting, and Test workflow |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
 | Rewrite API | Provider, Base URL, API Key, Model, prompt list, ADD PROMPT, and connectivity test |
-| Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API |
+| Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API; optional pause-preserving segmented upload for Audio API transcription |
 | Audio Hotkeys | Three hotkeys, a low-level keyboard hook switch, two clipboard delays, and a SendInput switch |
 | Cache | Cache directory, cache retention, and Legacy request-failure placeholder text |
 | Debug | FFmpeg, recording, hotkey, and upload debug switches, plus a live read-only output box with Copy all and Clear controls |
@@ -366,15 +406,17 @@ The configuration stores the enabled state, workflow, Values, Secrets, and Remot
 
 Declared audio delivery can be typed multipart or raw audio, Base64, Data URI, public HTTPS URL, cloud URI, provider upload, or realtime chunks. Each Advanced HTTP stage declares its accepted statuses; the Legacy HTTP-200-only rule does not apply. Bearer, Basic, API-key, and static header/query authentication can use Secret templates. Remote hosting supports WebDAV, S3-compatible storage, and Aliyun OSS. WebDAV supplies only a public HTTPS URL; S3-compatible storage and OSS can supply a public HTTPS URL or their cloud URI. Those representations are distinct and are never converted implicitly. Built-in dynamic signers are AWS SigV4 and Tencent TC3; workflow-provided signer code is not allowed, and dynamic signing cannot be used with streamed multipart or raw-audio uploads.
 
+When top-level segmented upload is enabled, each exported segment runs the complete declared non-realtime workflow rather than a protocol-specific shortcut. This includes a segment's own provider upload, remote object, submit, poll, result-fetch, and cleanup lifecycle where declared. `realtime_session` does not use segmentation. Base64 and Data URI materialize one prepared audio file at a time and remain limited to 16 MiB per file; in segmented mode that is a per-exported-segment limit, not an aggregate limit for the original recording.
+
 ### Cancellation, retries, and realtime
 
-Cancellation covers uploads, HTTP request and response work, poll waits, result fetches, WebSocket work, replay pacing, finalization, and best-effort remote cleanup. Eligible `request` and `request_stream` attempts use the configured retry policy. Submit is never automatically retried because it may have created a remote task. Poll and read-only result requests can retry without resubmitting. After successful recognition, **Delete after recognition** controls normal deletion of a published remote object. Once an upload has been issued, upload failures, recognition failures, and cancellation still force a best-effort delete; a cleanup failure never replaces the original outcome.
+Cancellation covers uploads, HTTP request and response work, poll waits, result fetches, WebSocket work, replay pacing, finalization, and best-effort remote cleanup. In a segmented non-realtime batch, once the runtime observes cancellation or a segment error, it stops further dispatch, cancels already started segment work, and waits for it to finish so each workflow can run its existing cleanup. It never returns a partial transcript. Eligible `request` and `request_stream` attempts use the configured retry policy. Submit is never automatically retried because it may have created a remote task. Poll and read-only result requests can retry without resubmitting. After successful recognition, **Delete after recognition** controls normal deletion of a published remote object. Once an upload has been issued, upload failures, recognition failures, and cancellation still force a best-effort delete; a cleanup failure never replaces the original outcome.
 
 For a realtime workflow, Dictate streams paced `pcm_s16le` microphone audio while retaining the complete local WAV. `unbounded` pacing and `keep_session` pause behavior are rejected. Pausing finalizes the current session and resuming starts a new one. A live network failure, or cancellation during live finalization, discards partial/committed live transcript state, finishes recording, then replays the complete WAV from byte zero in a fresh session. Retrying likewise starts a fresh replay session from zero. Partial text is never sent to the foreground application; only one final transcript uses the normal clipboard or SendInput output. CLI `--file` can run a realtime workflow as recorded replay.
 
 ### Testing, diagnostics, and current boundary
 
-**Test workflow** shows the target hosts, remote-upload requirement, recognition mode, and whether the test is recorded realtime replay before the user confirms network access. After confirmation, it uses fixed short audio through the same Core workflow. `UPLOAD_DEBUG` records only fixed Advanced phase labels: it does not log rendered URLs, query strings, headers, request or response bodies, audio, captures, transcripts, Secrets, storage credentials, signatures, or presigned URLs.
+**Test workflow** shows the target hosts, remote-upload requirement, recognition mode, and whether the test is recorded realtime replay before the user confirms network access. After confirmation, it uses fixed short audio through the same Core workflow. With segmented upload enabled for a non-realtime workflow, the test also uses pause analysis, segment export, and bounded batch dispatch; the fixed source may still yield only one segment. A passing test therefore verifies the configured path against that source, not a provider's production duration limit or every possible multipart workflow. `UPLOAD_DEBUG` records only fixed Advanced phase labels: it does not log rendered URLs, query strings, headers, request or response bodies, audio, captures, transcripts, Secrets, storage credentials, signatures, or presigned URLs.
 
 The current implementation intentionally excludes gRPC, custom HTTP/2 event streams, callback-only or webhook-only completion, arbitrary workflow stages/branches/loops, user scripts, custom signer code, provider-specific realtime resume, and foreground insertion of live partial text.
 
@@ -478,7 +520,7 @@ The device list marks the current system default device. A successful query (inc
   --output .\sample.txt
 ```
 
-If `--output` is omitted, output defaults to `<input filename>.txt` in the current directory. File mode first converts the input file according to the audio configuration, then uses the selected Audio API path for transcription. With an enabled realtime workflow, it replays the prepared file through a fresh WebSocket session rather than using a microphone. It does not register global hotkeys or paste automatically.
+If `--output` is omitted, output defaults to `<input filename>.txt` in the current directory. With segmented upload enabled for a non-realtime Audio API, file mode analyzes the caller-owned source, exports independent media segments, and writes one source-order merged transcript only after the full batch succeeds. Otherwise it prepares one file according to the audio configuration, then uses the selected Audio API path for transcription. With an enabled realtime workflow, it replays the prepared file through a fresh WebSocket session rather than using a microphone. It does not register global hotkeys or paste automatically, and never moves or deletes the `--file` source.
 
 ### CLI options
 
@@ -524,6 +566,8 @@ These options prepare non-realtime audio. An enabled realtime workflow uses its 
 | `--vad-padding-ms <0-1000>` | Set boundary padding in milliseconds; defaults to 100 |
 | `--vad-start-threshold <0.5-1.0>` | Set the speech onset threshold; defaults to 0.6 |
 
+These VAD options affect complete-file preparation only. A configured segmented upload uses its separate libav pause-analysis settings and preserves the original source timeline.
+
 #### Network
 
 | Option | Purpose |
@@ -533,6 +577,8 @@ These options prepare non-realtime audio. An enabled realtime workflow uses its 
 | `--retry-base-delay <SECONDS>` | Override the initial delay for exponential backoff |
 | `--enable-http2 <BOOL>` | Enable or disable HTTP/2 |
 | `--verify-ssl <BOOL>` | Enable or disable TLS certificate verification |
+
+Segmented-upload settings have no command-line overrides. Configure `ENABLE_SEGMENTED_UPLOAD`, `MAX_UPLOAD_SEGMENT_SECONDS`, `MIN_UPLOAD_PAUSE_MS`, and `MAX_UPLOAD_CONCURRENCY` in the JSON configuration or GUI before invoking file mode.
 
 #### Audio Hotkeys
 
@@ -601,6 +647,10 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "RETRY_BASE_DELAY": 0.5,
   "ENABLE_HTTP2": true,
   "VERIFY_SSL": true,
+  "ENABLE_SEGMENTED_UPLOAD": false,
+  "MAX_UPLOAD_SEGMENT_SECONDS": 300,
+  "MIN_UPLOAD_PAUSE_MS": 700,
+  "MAX_UPLOAD_CONCURRENCY": 1,
   "HOTKEY_HOOK": true,
   "START_KEY": "ctrl+alt+q",
   "PAUSE_KEY": "ctrl+alt+s",
@@ -734,23 +784,33 @@ When “Follow system default” is selected, changes to the Windows default dev
 
 | Field | Default | Behavior |
 |---|---:|---|
-| `ENABLE_VAD` | `false` | Applies to complete-file preparation in GUI recording, CLI recording, and CLI `--file`; live realtime does not post-trim chunks |
+| `ENABLE_VAD` | `false` | Applies to the complete-file preparation path in GUI recording, CLI recording, and CLI `--file`; it is not applied while exporting segmented uploads, and live realtime does not post-trim chunks |
 | `VAD_PADDING_MS` | `100` | Integer from 0 to 1000 ms; preserved and validated even when VAD is disabled |
 | `VAD_START_THRESHOLD` | `0.6` | Range 0.5–1.0, inclusive; preserved and validated even when VAD is disabled |
 
-On the Audio Record page, the start threshold appears below boundary padding. Disabling VAD grays out both inputs while preserving their values. Earshot 1.2.2 performs detection on streaming 16 kHz mono PCM and outputs only speech intervals. Final trimming, concatenation, resampling, and encoding always use the original audio. No analysis WAV or intermediate trimmed files are generated, and no libavfilter, large filtergraph, or fixed limit on the number of intervals is used.
+On the complete-file path, the Audio Record page's start threshold appears below boundary padding. Disabling VAD grays out both inputs while preserving their values. Earshot 1.2.2 performs detection on streaming 16 kHz mono PCM and outputs only speech intervals. Final trimming, concatenation, resampling, and encoding always use the original audio. No analysis WAV or intermediate trimmed files are generated, and no libavfilter, large filtergraph, or fixed limit on the number of intervals is used.
 
 Speech onset is confirmed after 3 consecutive frames reach `VAD_START_THRESHOLD`, with a lookback of up to 6 candidate frames, including the frames used to confirm onset. The continuation threshold is fixed at 0.5, and each segment must accumulate at least 4 frames that reach this threshold.
 
 Up to the full padding duration is retained before the first speech segment and after the last. At internal joins, floor(padding/2) milliseconds are retained after the preceding segment, and the remainder before the following segment, for one padding duration in total. If the original gap is no longer than the padding duration, it is preserved in full and the segments are merged. With padding set to 0, speech boundaries are joined directly.
 
-When VAD runs on a complete-file preparation path and detects no speech, no ASR request is sent and no text file is generated. GUI/hotkey mode returns to Idle, displays “No speech detected,” and clears the retry task; CLI file mode prints the result and exits normally. Temporary files are cleaned up. When speech is detected, the retry buffer still retains the original high-quality WAV. Manual retries, and Legacy automatic HTTP retries with VAD enabled, rerun detection, trimming, and transcoding. Disabling VAD preserves the existing Legacy HTTP retry behavior. CLI `--file` realtime replay still follows its file-preparation path and can use VAD; live realtime does not post-trim chunks. `KEEP_CACHE` controls the local audio archive for completed attempts, including Advanced runtime and file-mode attempts; successful Legacy responses follow the existing response-cache rule. Advanced retry behavior is stage-specific and described in [Advanced Audio API](#advanced-audio-api).
+When VAD runs on a complete-file preparation path and detects no speech, no ASR request is sent and no text file is generated. GUI/hotkey mode returns to Idle, displays “No speech detected,” and clears the retry task; CLI file mode prints the result and exits normally. Temporary files are cleaned up. When speech is detected, the retry buffer still retains the original high-quality WAV. Manual retries, and Legacy automatic HTTP retries with VAD enabled, rerun detection, trimming, and transcoding. Disabling VAD preserves the existing Legacy HTTP retry behavior. CLI `--file` realtime replay still follows its complete-file preparation path and can use VAD; live realtime does not post-trim chunks. `KEEP_CACHE` controls the local audio archive for completed attempts, including Advanced runtime and file-mode attempts; successful Legacy responses follow the existing response-cache rule. Advanced retry behavior is stage-specific and described in [Advanced Audio API](#advanced-audio-api).
+
+### Segmented upload
+
+Segmented upload is a top-level **Network** setting, not an Advanced Audio API workflow field. When enabled, it applies after recording stops and in CLI `--file` mode for the Legacy API and every Advanced non-realtime workflow: `request`, `request_stream`, and `async_poll`. It also applies to their declared audio-delivery steps, such as provider upload or remote hosting. `realtime_session` is explicitly excluded and continues to use its live microphone or recorded-replay behavior.
+
+The segmented path uses embedded libav amplitude-based silence analysis on the original source-frame timeline, not Earshot VAD trimming. `MIN_UPLOAD_PAUSE_MS` selects candidate pauses. Before each strict `MAX_UPLOAD_SEGMENT_SECONDS` source-frame limit, the planner prefers the end of the latest usable qualifying pause; if that pause crosses the limit, or no usable pause exists, it hard-cuts at the limit. Therefore a hard cut can occur in speech. The final source range is never split merely because it contains a pause.
+
+Every exported segment is an independently decodable complete media file. The plan is a contiguous, non-overlapping partition of the original timeline, so internal silence is retained and no original source frame is removed or duplicated. `ENABLE_VAD` is deliberately disabled for this export. If analysis determines that the whole source is silent, no segment is sent and the result is “No speech detected.”
+
+`MAX_UPLOAD_CONCURRENCY` limits complete recognition workflows, rather than only upload HTTP calls. Each active Advanced segment can therefore independently perform remote upload, submit, polling, result retrieval, and its existing cleanup. Results are retained only until all segments succeed, then concatenated directly in original segment order without inserted whitespace or punctuation. A failed or canceled segment batch produces no partial transcript.
 
 The embedded build supports WAV/PCM, MP3, FLAC, Ogg/Opus, Ogg/Vorbis, M4A/MP4/AAC, M4A/ALAC, WebM/Matroska audio, WavPack, and AC3/EAC3. Streams that cannot be decoded produce an explicit error, with no fallback to an external program.
 
 ### Network fields
 
-The following fields are shared by the Legacy Audio API, Advanced Audio API, and Rewrite API. For the Legacy Audio API, `MAX_RETRY=3` means at most three requests, including the first; its connection tests always make only one attempt. Advanced applies the same retry settings only to the stages that permit retries; submit has the separate no-retry rule described above.
+`REQUEST_TIMEOUT`, `MAX_RETRY`, `RETRY_BASE_DELAY`, `ENABLE_HTTP2`, and `VERIFY_SSL` are shared by the Legacy Audio API, Advanced Audio API, and Rewrite API. The segmented-upload fields apply only to Audio API transcription. For the Legacy Audio API, `MAX_RETRY=3` means at most three requests, including the first; its connection tests always make only one attempt. Advanced applies the same retry settings only to the stages that permit retries; submit has the separate no-retry rule described above.
 
 | Field | Default | Behavior |
 |---|---:|---|
@@ -759,6 +819,12 @@ The following fields are shared by the Legacy Audio API, Advanced Audio API, and
 | `RETRY_BASE_DELAY` | `0.5` | Delay in seconds before the first retry, doubling with each subsequent retry |
 | `ENABLE_HTTP2` | `true` | Forces HTTP/1 when `false` |
 | `VERIFY_SSL` | `true` | Accepts invalid TLS certificates when `false`; not recommended for the public internet |
+| `ENABLE_SEGMENTED_UPLOAD` | `false` | Enables post-recording or file-mode segmented upload for Legacy and Advanced non-realtime workflows; `realtime_session` is never segmented |
+| `MAX_UPLOAD_SEGMENT_SECONDS` | `300` | Strict positive maximum source-timeline span, in seconds, for each segment |
+| `MIN_UPLOAD_PAUSE_MS` | `700` | Strict positive minimum pause duration, in milliseconds, for libav silence analysis to consider as a segment boundary candidate |
+| `MAX_UPLOAD_CONCURRENCY` | `1` | Strict positive maximum number of concurrently active complete segment workflows, including their remote upload, request, polling, result, and cleanup work |
+
+The three numeric segmented-upload fields are validated and retained even when `ENABLE_SEGMENTED_UPLOAD=false`. They have no CLI override flags: set them in the GUI's **Network** page or in the JSON configuration. Their maximum-length bound is measured on the original source-frame timeline; it is not a claim about encoded byte size or an individual provider's acceptance limit.
 
 ### Hotkey, clipboard, cache, and debug fields
 
@@ -783,7 +849,7 @@ These diagnostics appear in the GUI's Debug log box or the CLI's stderr. Changes
 
 ## Legacy Audio API compatibility
 
-When Advanced Audio API is disabled, the program sends a Legacy HTTP POST request:
+When Advanced Audio API is disabled, the program sends each Legacy ASR operation as the following HTTP POST request. With segmented upload disabled, there is one operation for the prepared recording; with it enabled, each generated segment uses the same request shape independently.
 
 ```http
 POST <API_ENDPOINT>
@@ -1004,15 +1070,19 @@ RecordTemp_<16 hexadecimal characters>.wav
 
 Converted files use the same base name with the configured container extension. When both input and output are WAV, `_convert` is added to the converted file name to avoid overwriting the original recording.
 
-When `KEEP_CACHE=false` or `CACHE_DIR` is empty, temporary audio is deleted after the process finishes. With caching enabled, files are renamed to:
+A segmented attempt instead creates a `RecordTemp_<16 hexadecimal characters>` directory containing its generated independent media files. This uses the same temporary prefix, so unfinished directories are removed during the next startup cleanup.
+
+When `KEEP_CACHE=false` or `CACHE_DIR` is empty, runtime-owned temporary audio is deleted after the process finishes. With caching enabled, single-file audio is renamed to:
 
 ```text
 audio-YYYY-MM-DD-HH.MM.SS.<ext>
 ```
 
-For the Legacy Audio API, only HTTP 200 responses are written to the corresponding `.json` file, including the raw response when JSON parsing or text extraction fails; the file contents are not necessarily valid JSON. No response file is generated if the request fails or is canceled before a successful HTTP response is received. Advanced workflows use their own accepted statuses and do not use this Legacy response-cache rule.
+For a non-segmented Legacy Audio API attempt, only HTTP 200 responses are written to the corresponding `.json` file, including the raw response when JSON parsing or text extraction fails; the file contents are not necessarily valid JSON. No response file is generated if the request fails or is canceled before a successful HTTP response is received. Advanced workflows use their own accepted statuses and do not use this Legacy response-cache rule.
 
-The retry buffer in the GUI and CLI hotkey mode is independent of this optional disk cache: it keeps only the most recently finished WAV in memory, up to 100,000,000 bytes, and is released when the process exits (including normal shutdown, sign-out, or power loss). A retry temporarily recreates a `RecordTemp_` WAV for conversion and deletes it after that attempt; no persistent retry cache is created. `KEEP_CACHE` controls the optional local audio archive, including Advanced runtime and file-mode attempts.
+For a successful segmented interactive attempt whose complete text was delivered, caching retains both the original WAV and a uniquely named `audio-...-segments` directory. A segmented CLI `--file` attempt can retain only that generated directory: the caller-owned source is never moved or deleted. Failed, canceled, empty-result, and output-failed segmented attempts remove generated segment directories; runtime-owned recording WAVs are removed as well. Per-segment raw responses are never concatenated or cached as a batch response.
+
+The retry buffer in the GUI and CLI hotkey mode is independent of this optional disk cache: it keeps only the most recently finished WAV in memory, up to 100,000,000 bytes, and is released when the process exits (including normal shutdown, sign-out, or power loss). A retry temporarily recreates a `RecordTemp_` WAV; a segmented retry creates a fresh attempt directory, re-exports every segment from that WAV using its frozen plan, and deletes generated artifacts after the attempt. No persistent retry cache is created. `KEEP_CACHE` controls the optional local audio archive, including Advanced runtime and file-mode attempts.
 
 Rewrite does not create an audio cache or a persistent request/response cache, and does not alter the audio retry buffer.
 
@@ -1141,14 +1211,14 @@ FFmpeg 8.1 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoder
 
 ## Security and privacy
 
-- Recording and transcoding take place locally. Legacy converted audio is sent to `API_ENDPOINT`; Advanced audio or its declared remote reference is sent to the workflow's configured targets. When Rewrite is triggered, text copied from the target application, the prompt, and extra parameters are sent to the configured Rewrite service; reading temporarily changes the clipboard, and its backup is restored before the request is sent.
+- Recording and transcoding take place locally. When segmented upload is enabled, libav pause analysis and export of the independent media files also take place locally. Legacy converted audio is sent to `API_ENDPOINT`; Advanced audio or its declared remote reference is sent to the workflow's configured targets. Each started Advanced segment can have its own remote-upload and cleanup lifecycle. When Rewrite is triggered, text copied from the target application, the prompt, and extra parameters are sent to the configured Rewrite service; reading temporarily changes the clipboard, and its backup is restored before the request is sent.
 - When generating an Advanced workflow, optional user requirements and vendor material are best-effort redacted locally, then sent as separate structured fields to the configured Rewrite service. Their contents cannot change their application-assigned roles or override the workflow compiler's schema and safety rules. The GUI imposes no manual length limit, but the service's request or token limits can still reject the input.
 - `TOKEN`, `REWRITE.api_key`, each prompt's `api_key`, Advanced Secrets, and remote-storage credentials are stored in plain text in the JSON configuration. The GUI's password fields only mask their display and provide no encryption on disk.
 - Keep `VERIFY_SSL=true` for public services.
 - `VERIFY_SSL=false` accepts invalid certificates, potentially exposing connections to man-in-the-middle attacks.
 - The HTTP client does not read system proxy settings. If a proxy is needed, handle it at a trusted gateway or API endpoint.
 - The application does not verify whether the configured API is trustworthy; use only services to which you are willing to send recordings or selected text.
-- `CACHE_DIR` may contain original recordings, transcoded audio, and service responses, and should be managed as sensitive data.
+- `CACHE_DIR` may contain original recordings, transcoded audio, complete exported segment media files, and service responses, and should be managed as sensitive data.
 - Automatic paste depends on the current foreground window. After starting a recording or Rewrite, keep input focus where you want the text to appear.
 
 ## Implementation constraints

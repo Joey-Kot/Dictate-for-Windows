@@ -9,6 +9,9 @@ use thiserror::Error;
 use crate::hotkey;
 
 pub const DEFAULT_VAD_START_THRESHOLD: f64 = 0.6;
+pub const DEFAULT_MAX_UPLOAD_SEGMENT_SECONDS: u32 = 300;
+pub const DEFAULT_MIN_UPLOAD_PAUSE_MS: u32 = 700;
+pub const DEFAULT_MAX_UPLOAD_CONCURRENCY: u32 = 1;
 
 pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
     if !(0.5..=1.0).contains(&value) {
@@ -82,6 +85,14 @@ pub struct Config {
     pub enable_http2: bool,
     #[serde(rename = "VERIFY_SSL")]
     pub verify_ssl: bool,
+    #[serde(rename = "ENABLE_SEGMENTED_UPLOAD")]
+    pub enable_segmented_upload: bool,
+    #[serde(rename = "MAX_UPLOAD_SEGMENT_SECONDS")]
+    pub max_upload_segment_seconds: u32,
+    #[serde(rename = "MIN_UPLOAD_PAUSE_MS")]
+    pub min_upload_pause_ms: u32,
+    #[serde(rename = "MAX_UPLOAD_CONCURRENCY")]
+    pub max_upload_concurrency: u32,
     #[serde(rename = "HOTKEY_HOOK")]
     pub hotkey_hook: bool,
     #[serde(rename = "USE_SENDINPUT")]
@@ -142,6 +153,10 @@ impl Default for Config {
             retry_base_delay: 0.5,
             enable_http2: true,
             verify_ssl: true,
+            enable_segmented_upload: false,
+            max_upload_segment_seconds: DEFAULT_MAX_UPLOAD_SEGMENT_SECONDS,
+            min_upload_pause_ms: DEFAULT_MIN_UPLOAD_PAUSE_MS,
+            max_upload_concurrency: DEFAULT_MAX_UPLOAD_CONCURRENCY,
             hotkey_hook: true,
             use_sendinput: false,
             start_key: "ctrl+alt+q".into(),
@@ -244,6 +259,21 @@ impl Config {
         if self.vad_padding_ms > 1000 {
             return Err(ConfigError::Invalid(
                 "invalid VAD_PADDING_MS (allowed 0..=1000 ms)".into(),
+            ));
+        }
+        if self.max_upload_segment_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "invalid MAX_UPLOAD_SEGMENT_SECONDS (must be > 0)".into(),
+            ));
+        }
+        if self.min_upload_pause_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "invalid MIN_UPLOAD_PAUSE_MS (must be > 0)".into(),
+            ));
+        }
+        if self.max_upload_concurrency == 0 {
+            return Err(ConfigError::Invalid(
+                "invalid MAX_UPLOAD_CONCURRENCY (must be > 0)".into(),
             ));
         }
         if !self.opacity.is_finite()
@@ -450,6 +480,69 @@ mod tests {
                 .to_string()
                 .contains("VAD_PADDING_MS")
         );
+    }
+
+    #[test]
+    fn segmented_upload_defaults_roundtrip_and_bounds() {
+        let old: super::Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.enable_segmented_upload);
+        assert_eq!(
+            old.max_upload_segment_seconds,
+            super::DEFAULT_MAX_UPLOAD_SEGMENT_SECONDS
+        );
+        assert_eq!(old.min_upload_pause_ms, super::DEFAULT_MIN_UPLOAD_PAUSE_MS);
+        assert_eq!(
+            old.max_upload_concurrency,
+            super::DEFAULT_MAX_UPLOAD_CONCURRENCY
+        );
+
+        let config: super::Config = serde_json::from_value(serde_json::json!({
+            "ENABLE_SEGMENTED_UPLOAD": true,
+            "MAX_UPLOAD_SEGMENT_SECONDS": 300,
+            "MIN_UPLOAD_PAUSE_MS": 700,
+            "MAX_UPLOAD_CONCURRENCY": 2,
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<super::Config>(&serde_json::to_string(&config).unwrap())
+                .unwrap(),
+            config
+        );
+
+        for (key, config) in [
+            (
+                "MAX_UPLOAD_SEGMENT_SECONDS",
+                super::Config {
+                    max_upload_segment_seconds: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "MIN_UPLOAD_PAUSE_MS",
+                super::Config {
+                    min_upload_pause_ms: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "MAX_UPLOAD_CONCURRENCY",
+                super::Config {
+                    max_upload_concurrency: 0,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(config.validate().unwrap_err().to_string().contains(key));
+        }
+
+        for input in [
+            r#"{"MAX_UPLOAD_SEGMENT_SECONDS":-1}"#,
+            r#"{"MIN_UPLOAD_PAUSE_MS":-1}"#,
+            r#"{"MAX_UPLOAD_CONCURRENCY":-1}"#,
+        ] {
+            assert!(serde_json::from_str::<super::Config>(input).is_err());
+        }
     }
     use super::*;
 

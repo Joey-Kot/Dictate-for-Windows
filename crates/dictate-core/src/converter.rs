@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +17,25 @@ pub struct ConversionSettings {
     pub sample_format: String,
 }
 
+/// A half-open range of original, per-channel source frames.
+///
+/// It is deliberately separate from output samples and encoded-media timing:
+/// a segmented retry can reuse these exact source coordinates without running
+/// silence analysis again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFrameInterval {
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+/// Non-destructive source analysis used to build a bounded upload plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentAnalysis {
+    pub source_rate: u32,
+    pub source_frames: u64,
+    pub silence_intervals: Vec<SourceFrameInterval>,
+}
+
 #[derive(Debug, Error)]
 pub enum ConvertError {
     #[error("No speech detected")]
@@ -31,6 +50,8 @@ pub enum ConvertError {
     Failed { message: String },
     #[error("libav conversion is unavailable in this build")]
     LibAvUnavailable,
+    #[error("segmented upload is unavailable for this audio converter")]
+    SegmentedUploadUnavailable,
 }
 
 #[async_trait]
@@ -43,6 +64,44 @@ pub trait AudioConverter: Send + Sync {
         output: &Path,
         source_rate: i32,
     ) -> Result<(), ConvertError>;
+
+    /// Analyze the original decoded audio without performing VAD trimming or
+    /// conversion. Implementations return pause candidates in the exact
+    /// source-frame domain later consumed by `export_segments`.
+    async fn analyze_segments(
+        &self,
+        cancellation: &CancellationToken,
+        config: &Config,
+        input: &Path,
+        min_pause_ms: u32,
+    ) -> Result<SegmentAnalysis, ConvertError> {
+        let _ = (cancellation, config, input, min_pause_ms);
+        Err(ConvertError::SegmentedUploadUnavailable)
+    }
+
+    /// Export a previously frozen contiguous source-frame plan. Each output
+    /// is a standalone media file; failures leave no batch outputs behind.
+    async fn export_segments(
+        &self,
+        cancellation: &CancellationToken,
+        config: &Config,
+        input: &Path,
+        outputs: &[PathBuf],
+        intervals: &[SourceFrameInterval],
+        expected_source_rate: u32,
+        expected_source_frames: u64,
+    ) -> Result<(), ConvertError> {
+        let _ = (
+            cancellation,
+            config,
+            input,
+            outputs,
+            intervals,
+            expected_source_rate,
+            expected_source_frames,
+        );
+        Err(ConvertError::SegmentedUploadUnavailable)
+    }
 }
 
 /// Shared front-end entry; implementations own analysis and final conversion.

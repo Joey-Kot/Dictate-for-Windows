@@ -465,3 +465,216 @@ async fn native_output_encoders_roundtrip_and_invalid_input() {
     );
     assert!(!output.exists());
 }
+
+fn export_segments_bridge(
+    input: &Path,
+    outputs: &[&Path],
+    intervals: &[Interval],
+    expected_source_rate: i32,
+    expected_source_frames: i64,
+) -> i32 {
+    let input = string(input.to_string_lossy().as_bytes()).unwrap();
+    let output_strings: Vec<_> = outputs
+        .iter()
+        .map(|path| string(path.to_string_lossy().as_bytes()).unwrap())
+        .collect();
+    let output_paths: Vec<_> = output_strings.iter().map(|path| path.as_ptr()).collect();
+    let token = CancellationToken::new();
+    let context = (&token as *const CancellationToken).cast_mut().cast();
+    let mut error = [0; 4096];
+    let result = unsafe {
+        dictate_ffmpeg_export_segments(
+            input.as_ptr(),
+            output_paths.as_ptr(),
+            intervals.as_ptr(),
+            intervals.len(),
+            c"pcm_s16le".as_ptr(),
+            2,
+            expected_source_rate,
+            0,
+            0,
+            c"s16".as_ptr(),
+            expected_source_rate,
+            expected_source_frames,
+            0,
+            canceled,
+            context,
+            error.as_mut_ptr(),
+            4096,
+        )
+    };
+    if result < 0 {
+        eprintln!(
+            "export segments bridge: {}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+    }
+    result
+}
+
+#[tokio::test]
+async fn native_segmented_analysis_marks_short_complete_silence_as_no_speech() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("short-silence.wav");
+    let source_frames = 1_600_u64; // 100 ms at 16 kHz, below the 700 ms pause setting.
+    wav(&input, 16_000, 1, &vec![0; source_frames as usize]);
+
+    let analysis = EmbeddedFfmpegConverter
+        .analyze_segments(
+            &CancellationToken::new(),
+            &Config::default(),
+            &input,
+            700,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(analysis.source_rate, 16_000);
+    assert_eq!(analysis.source_frames, source_frames);
+    assert_eq!(
+        analysis.silence_intervals,
+        vec![SourceFrameInterval {
+            start_frame: 0,
+            end_frame: source_frames,
+        }]
+    );
+}
+
+#[test]
+fn native_segmented_pcm_exports_preserve_boundaries_and_clean_up_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.wav");
+    let source_frames = 4_877_i64;
+    let data: Vec<i16> = (0..source_frames)
+        .flat_map(|frame| {
+            let left = ((frame * 31 % 30_000) - 15_000) as i16;
+            let right = ((frame * 47 % 30_000) - 15_000) as i16;
+            [left, right]
+        })
+        .collect();
+    wav(&input, 48_000, 2, &data);
+
+    let first = dir.path().join("first.wav");
+    let second = dir.path().join("second.wav");
+    let third = dir.path().join("third.wav");
+    let outputs = [first.as_path(), second.as_path(), third.as_path()];
+    let intervals = [
+        Interval {
+            start_frame: 0,
+            end_frame: 137,
+        },
+        Interval {
+            start_frame: 137,
+            end_frame: 2_111,
+        },
+        Interval {
+            start_frame: 2_111,
+            end_frame: source_frames,
+        },
+    ];
+    assert_eq!(
+        export_segments_bridge(&input, &outputs, &intervals, 48_000, source_frames),
+        0
+    );
+    let reconstructed: Vec<i16> = outputs
+        .iter()
+        .flat_map(|path| {
+            hound::WavReader::open(path)
+                .unwrap()
+                .samples()
+                .map(Result::unwrap)
+                .collect::<Vec<i16>>()
+        })
+        .collect();
+    assert_eq!(reconstructed, data);
+
+    // The bridge discovers this plan/source mismatch only after it has
+    // written a segment.  Its own failure path must still remove that file,
+    // rather than relying on the Rust wrapper's defensive cleanup.
+    let mismatched = dir.path().join("mismatched.wav");
+    let mismatched_intervals = [Interval {
+        start_frame: 0,
+        end_frame: source_frames - 1,
+    }];
+    assert!(
+        export_segments_bridge(
+            &input,
+            &[mismatched.as_path()],
+            &mismatched_intervals,
+            48_000,
+            source_frames - 1,
+        ) < 0
+    );
+    assert!(!mismatched.exists());
+}
+
+#[tokio::test]
+async fn native_segmented_encoded_outputs_are_independently_decodable() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("speech.wav");
+    let samples = speech();
+    wav(&input, 16_000, 1, &samples);
+    let intervals = [
+        SourceFrameInterval {
+            start_frame: 0,
+            end_frame: 3_111,
+        },
+        SourceFrameInterval {
+            start_frame: 3_111,
+            end_frame: 8_333,
+        },
+        SourceFrameInterval {
+            start_frame: 8_333,
+            end_frame: samples.len() as u64,
+        },
+    ];
+    let converter = EmbeddedFfmpegConverter;
+    let token = CancellationToken::new();
+    for (codec, extension) in [("opus", "ogg"), ("mp3", "mp3"), ("aac", "m4a")] {
+        let output_dir = dir.path().join(codec);
+        std::fs::create_dir(&output_dir).unwrap();
+        let outputs: Vec<_> = (0..intervals.len())
+            .map(|index| output_dir.join(format!("segment-{index}.{extension}")))
+            .collect();
+        let config = Config {
+            codecs: codec.into(),
+            container: extension.into(),
+            sampling_rate: 48_000,
+            bit_rate: 128,
+            ..Default::default()
+        };
+        converter
+            .export_segments(
+                &token,
+                &config,
+                &input,
+                &outputs,
+                &intervals,
+                16_000,
+                samples.len() as u64,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{codec}: {error}"));
+        for (index, output) in outputs.iter().enumerate() {
+            let decoded = output_dir.join(format!("decoded-{index}.wav"));
+            converter
+                .convert(
+                    &token,
+                    &Config {
+                        codecs: "pcm".into(),
+                        container: "wav".into(),
+                        ..Default::default()
+                    },
+                    output,
+                    &decoded,
+                    48_000,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{codec} segment {index}: {error}"));
+            assert!(
+                hound::WavReader::open(&decoded).unwrap().duration() > 100,
+                "{codec} segment {index} was empty"
+            );
+        }
+    }
+}

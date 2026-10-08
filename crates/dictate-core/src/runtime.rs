@@ -15,6 +15,7 @@ use crate::Config;
 use crate::advanced_audio::LiveChunkSource;
 use crate::asr::{AsrError, Transcription};
 use crate::audio_api::{AudioApiClient, AudioApiError};
+use crate::audio_segments::SegmentPlan;
 use crate::cache;
 use crate::clipboard::ClipboardError;
 use crate::converter::{AudioConverter, ConvertError, prepare_audio_for_upload};
@@ -23,11 +24,33 @@ use crate::recorder::{
     CapturePacketReceiver, Recorder, RecorderError, RecorderState, RecordingResult,
     capture_packet_channel,
 };
+use crate::segmented_upload::{PreparedSegmentedUpload, prepare_segmented_upload};
 use crate::text_input;
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_RETRY_AUDIO_BYTES: u64 = 100_000_000;
+
+/// The retry buffer intentionally retains the original WAV rather than any
+/// encoded segment output.  Segment boundaries and the upload concurrency are
+/// frozen with it so changing those settings after a failure cannot alter the
+/// retry's source timeline or dispatch behavior.
+#[derive(Clone)]
+struct RetryRecording {
+    original_wav: Arc<Vec<u8>>,
+    upload_mode: RetryUploadMode,
+}
+
+#[derive(Clone)]
+enum RetryUploadMode {
+    Single,
+    Segmented {
+        plan: Option<Arc<SegmentPlan>>,
+        max_segment_seconds: u32,
+        min_pause_ms: u32,
+        max_concurrency: u32,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
@@ -114,7 +137,7 @@ struct RuntimeInner {
     active_session: u64,
     active_request_cancellation: Option<CancellationToken>,
     retry_buffer_enabled: bool,
-    retry_recording: Option<Arc<Vec<u8>>>,
+    retry_recording: Option<Arc<RetryRecording>>,
     live_realtime: Option<LiveRealtimeSession>,
     // The live session is normally owned by `live_realtime`. While Pause is
     // waiting for its terminal event, it is temporarily taken out of that
@@ -1089,6 +1112,7 @@ impl Runtime {
         );
 
         let wav_path = cache::temporary_output_path(&temp_dir, "wav");
+        let upload_mode = recording.upload_mode.clone();
         let write_cancellation = cancellation.clone();
         let write_result = tokio::task::spawn_blocking({
             let wav_path = wav_path.clone();
@@ -1096,7 +1120,7 @@ impl Runtime {
                 if write_cancellation.is_cancelled() {
                     return Ok(());
                 }
-                std::fs::write(&wav_path, recording.as_slice())
+                std::fs::write(&wav_path, recording.original_wav.as_slice())
             }
         })
         .await;
@@ -1128,13 +1152,14 @@ impl Runtime {
             return;
         }
 
-        self.transcribe_recording(
+        self.transcribe_recording_with_upload_mode(
             RecordingResult {
                 wav_path: Some(wav_path),
                 canceled: false,
             },
             &cancellation,
             false,
+            upload_mode,
         )
         .await;
         self.clear_active_request();
@@ -1145,7 +1170,7 @@ impl Runtime {
             return;
         }
 
-        {
+        let upload_mode = {
             let mut inner = self.inner.lock();
             if !inner.retry_buffer_enabled {
                 return;
@@ -1153,13 +1178,42 @@ impl Runtime {
             // A completed recording always supersedes the old retry task. If it cannot be kept
             // within the limit, retry is unavailable until another recording completes.
             inner.retry_recording = None;
-        }
+            retry_upload_mode(&inner.config, &inner.audio_client)
+        };
 
         let recording = result.wav_path.as_deref().and_then(load_retry_recording);
         let mut inner = self.inner.lock();
         if !self.is_stopped() && inner.retry_buffer_enabled {
-            inner.retry_recording = recording;
+            inner.retry_recording = recording.map(|original_wav| {
+                Arc::new(RetryRecording {
+                    original_wav,
+                    upload_mode,
+                })
+            });
         }
+    }
+
+    /// Records the first valid plan for the currently retryable recording.
+    /// This happens before segment export so an export failure still leaves a
+    /// stable source-frame partition for Retry. Later retries export exactly
+    /// these ranges even if the user changes segmented-upload settings.
+    fn save_segment_plan_for_retry(&self, plan: SegmentPlan) {
+        let mut inner = self.inner.lock();
+        let Some(recording) = inner.retry_recording.as_ref() else {
+            return;
+        };
+        let mut replacement = (**recording).clone();
+        let RetryUploadMode::Segmented {
+            plan: stored_plan, ..
+        } = &mut replacement.upload_mode
+        else {
+            return;
+        };
+        if stored_plan.is_some() {
+            return;
+        }
+        *stored_plan = Some(Arc::new(plan));
+        inner.retry_recording = Some(Arc::new(replacement));
     }
 
     fn set_retryable_error<E: std::fmt::Display + ?Sized>(&self, message: &str, error: &E) {
@@ -1177,13 +1231,37 @@ impl Runtime {
         cancellation: &CancellationToken,
         cache_attempt: bool,
     ) {
+        let upload_mode = {
+            let inner = self.inner.lock();
+            retry_upload_mode(&inner.config, &inner.audio_client)
+        };
+        self.transcribe_recording_with_upload_mode(
+            result,
+            cancellation,
+            cache_attempt,
+            upload_mode,
+        )
+        .await;
+    }
+
+    async fn transcribe_recording_with_upload_mode(
+        &self,
+        result: RecordingResult,
+        cancellation: &CancellationToken,
+        cache_attempt: bool,
+        upload_mode: RetryUploadMode,
+    ) {
         let Some(wav_path) = result.wav_path else {
             self.set_retryable_error("Recording failed", &RuntimeError::MissingWav);
             return;
         };
-        let (config, client) = {
+        let (config, client, temp_dir) = {
             let inner = self.inner.lock();
-            (inner.config.clone(), inner.audio_client.clone())
+            (
+                inner.config.clone(),
+                inner.audio_client.clone(),
+                inner.temp_dir.clone(),
+            )
         };
         if client.is_realtime_workflow() {
             self.transcribe_realtime_recording(
@@ -1192,6 +1270,28 @@ impl Runtime {
                 &client,
                 cancellation,
                 cache_attempt,
+            )
+            .await;
+            return;
+        }
+        if let RetryUploadMode::Segmented {
+            plan,
+            max_segment_seconds,
+            min_pause_ms,
+            max_concurrency,
+        } = upload_mode
+        {
+            self.transcribe_segmented_recording(
+                &wav_path,
+                &config,
+                &client,
+                &temp_dir,
+                cancellation,
+                cache_attempt,
+                plan,
+                max_segment_seconds,
+                min_pause_ms,
+                max_concurrency,
             )
             .await;
             return;
@@ -1358,6 +1458,224 @@ impl Runtime {
                     &output_path,
                     error.is_text_extraction_error(),
                     &raw,
+                );
+                if !self.is_stopped() {
+                    if cancellation.is_cancelled() {
+                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                    } else {
+                        self.set_retryable_error("Upload failed", &error);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transcribe_segmented_recording(
+        &self,
+        wav_path: &Path,
+        config: &Config,
+        client: &AudioApiClient,
+        temporary_root: &Path,
+        cancellation: &CancellationToken,
+        cache_attempt: bool,
+        frozen_plan: Option<Arc<SegmentPlan>>,
+        max_segment_seconds: u32,
+        min_pause_ms: u32,
+        max_concurrency: u32,
+    ) {
+        let mut preparation_config = config.clone();
+        // This function is reached only through the frozen Segmented retry
+        // mode or a currently enabled new recording. Keep that mode explicit
+        // even if the user has turned the setting off since a failed retry.
+        preparation_config.enable_segmented_upload = true;
+        preparation_config.max_upload_segment_seconds = max_segment_seconds;
+        preparation_config.min_upload_pause_ms = min_pause_ms;
+        preparation_config.max_upload_concurrency = max_concurrency;
+        self.set_state(
+            State::Uploading,
+            "Preparing segmented upload",
+            None::<&RuntimeError>,
+        );
+        let save_plan = |plan: &SegmentPlan| self.save_segment_plan_for_retry(plan.clone());
+        let prepared = match prepare_segmented_upload(
+            self.converter.as_ref(),
+            cancellation,
+            &preparation_config,
+            wav_path,
+            temporary_root,
+            frozen_plan.as_deref(),
+            Some(&save_plan),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                clean_up_segmented_recording_attempt(config, cache_attempt, wav_path, None, false);
+                if !self.is_stopped() {
+                    if cancellation.is_cancelled() || matches!(error, ConvertError::Canceled) {
+                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                    } else if matches!(error, ConvertError::NoSpeech) {
+                        self.inner.lock().retry_recording = None;
+                        self.set_state(State::Idle, "No speech detected", None::<&RuntimeError>);
+                    } else {
+                        self.set_retryable_error("FFmpeg conversion failed", &error);
+                    }
+                }
+                return;
+            }
+        };
+        if self.is_stopped() {
+            clean_up_segmented_recording_attempt(
+                config,
+                cache_attempt,
+                wav_path,
+                Some(&prepared),
+                false,
+            );
+            return;
+        }
+        if cancellation.is_cancelled() {
+            clean_up_segmented_recording_attempt(
+                config,
+                cache_attempt,
+                wav_path,
+                Some(&prepared),
+                false,
+            );
+            self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+            return;
+        }
+        let max_concurrency = match segment_concurrency(max_concurrency) {
+            Ok(value) => value,
+            Err(error) => {
+                clean_up_segmented_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    Some(&prepared),
+                    false,
+                );
+                if !self.is_stopped() {
+                    self.set_retryable_error("Segmented upload preparation failed", &error);
+                }
+                return;
+            }
+        };
+        let upload_message = format!("Uploading {} audio segments", prepared.files.len());
+        self.set_state(State::Uploading, &upload_message, None::<&RuntimeError>);
+        let transcription = client
+            .transcribe_segments(cancellation, &prepared.files, max_concurrency)
+            .await;
+        match transcription {
+            Ok(transcription) => {
+                if self.is_stopped() {
+                    clean_up_segmented_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        Some(&prepared),
+                        false,
+                    );
+                    return;
+                }
+                if cancellation.is_cancelled() {
+                    clean_up_segmented_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        Some(&prepared),
+                        false,
+                    );
+                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                    return;
+                }
+                if transcription.text.is_empty() {
+                    clean_up_segmented_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        Some(&prepared),
+                        false,
+                    );
+                    self.set_state(State::Idle, "Empty result from ASR", None::<&RuntimeError>);
+                    return;
+                }
+                let paste = text_input::send_text(&transcription.text, cancellation, config).await;
+                // An upload is only a cacheable segmented attempt once its
+                // single, complete result has actually been delivered.  In
+                // particular, retain neither the original WAV nor generated
+                // segments when output is canceled or fails: Retry restores
+                // and re-exports the authoritative in-memory WAV instead.
+                let delivered = paste.is_ok() && !self.is_stopped() && !cancellation.is_cancelled();
+                clean_up_segmented_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    Some(&prepared),
+                    delivered,
+                );
+                match paste {
+                    Ok(()) if !self.is_stopped() => self.set_state(
+                        State::Idle,
+                        if config.use_sendinput {
+                            "Text input sent"
+                        } else {
+                            "Transcription pasted"
+                        },
+                        None::<&RuntimeError>,
+                    ),
+                    Err(error) if error.canceled_before_output() && !self.is_stopped() => {
+                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
+                    }
+                    Err(error) if !self.is_stopped() => {
+                        let message = error.status();
+                        self.set_retryable_error(message, &error);
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) if error.is_canceled() => {
+                clean_up_segmented_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    Some(&prepared),
+                    false,
+                );
+                if !self.is_stopped() {
+                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                }
+            }
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    clean_up_segmented_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        Some(&prepared),
+                        false,
+                    );
+                    if !self.is_stopped() {
+                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
+                    }
+                    return;
+                }
+                if config.request_failed_notification
+                    && error.is_retry_exhausted()
+                    && let Err(paste_error) =
+                        text_input::send_text("[request failed]", cancellation, config).await
+                    && !self.is_stopped()
+                    && !cancellation.is_cancelled()
+                {
+                    eprintln!("[text input] failed: {paste_error}");
+                }
+                clean_up_segmented_recording_attempt(
+                    config,
+                    cache_attempt,
+                    wav_path,
+                    Some(&prepared),
+                    false,
                 );
                 if !self.is_stopped() {
                     if cancellation.is_cancelled() {
@@ -1591,6 +1909,72 @@ pub async fn run_file_mode(
     .await
 }
 
+/// Runs the formal audio API test workflow against a caller-owned source WAV.
+///
+/// Settings UI code uses this high-level entry point so segmented tests share
+/// the same analysis, export, bounded batch dispatch, and realtime exclusion
+/// as actual transcription.  It never deletes `input_path`; only generated
+/// scratch files are removed before returning.
+pub async fn test_audio_api_with_source(
+    config: Config,
+    converter: &dyn AudioConverter,
+    input_path: &Path,
+    source_rate: i32,
+    scratch_root: &Path,
+    cancellation: CancellationToken,
+) -> Result<(), RuntimeError> {
+    config.validate()?;
+    let client = AudioApiClient::new(config.clone())?;
+    if config.enable_segmented_upload && !client.is_realtime_workflow() {
+        let prepared = prepare_segmented_upload(
+            converter,
+            &cancellation,
+            &config,
+            input_path,
+            scratch_root,
+            None,
+            None,
+        )
+        .await?;
+        let result = match segment_concurrency(config.max_upload_concurrency) {
+            Ok(max_concurrency) => client
+                .test_connection_segments_cancellable(
+                    &cancellation,
+                    &prepared.files,
+                    max_concurrency,
+                )
+                .await
+                .map_err(RuntimeError::from),
+            Err(error) => Err(error.into()),
+        };
+        prepared.remove_files();
+        return result;
+    }
+
+    let preparation_config =
+        file_mode_preparation_config(&config, client.realtime_audio_stream().as_ref());
+    let temporary =
+        cache::temporary_output_path(scratch_root, &preparation_config.container_extension());
+    let result = async {
+        prepare_audio_for_upload(
+            converter,
+            &cancellation,
+            &preparation_config,
+            input_path,
+            &temporary,
+            source_rate,
+        )
+        .await?;
+        client
+            .test_connection_cancellable(&cancellation, &temporary)
+            .await
+            .map_err(RuntimeError::from)
+    }
+    .await;
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
 pub async fn run_file_mode_with_cancellation(
     mut config: Config,
     converter: Arc<dyn AudioConverter>,
@@ -1600,12 +1984,27 @@ pub async fn run_file_mode_with_cancellation(
 ) -> Result<PathBuf, RuntimeError> {
     config.validate()?;
     let temp_dir = cache::initialize_cache_dir(&mut config);
-    cache::cleanup_old_temp_items(&temp_dir);
     std::fs::metadata(input_path).map_err(|source| RuntimeError::InputFile {
         path: input_path.to_path_buf(),
         source,
     })?;
+    // `--file` remains caller-owned even if it was placed in CACHE_DIR and
+    // happens to share the RecordTemp_ prefix used by stale-artifact cleanup.
+    // Verify it first, then protect its resolved identity during cleanup.
+    cache::cleanup_old_temp_items_excluding(&temp_dir, Some(input_path));
     let client = AudioApiClient::new(config.clone())?;
+    if config.enable_segmented_upload && !client.is_realtime_workflow() {
+        return run_segmented_file_mode(
+            &config,
+            converter.as_ref(),
+            input_path,
+            output_path,
+            &temp_dir,
+            &client,
+            &cancellation,
+        )
+        .await;
+    }
     // Recorded realtime replay currently consumes a WAV and converts it into
     // the workflow-declared PCM stream itself. Keep that preparation entirely
     // within the normal --file path so all recognition modes still enter
@@ -1670,6 +2069,66 @@ pub async fn run_file_mode_with_cancellation(
     finish_file_mode_output(&config, &temporary, output, transcription)
 }
 
+async fn run_segmented_file_mode(
+    config: &Config,
+    converter: &dyn AudioConverter,
+    input_path: &Path,
+    output_path: Option<&Path>,
+    temporary_root: &Path,
+    client: &AudioApiClient,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf, RuntimeError> {
+    let prepared = prepare_segmented_upload(
+        converter,
+        cancellation,
+        config,
+        input_path,
+        temporary_root,
+        None,
+        None,
+    )
+    .await?;
+    let max_concurrency = match segment_concurrency(config.max_upload_concurrency) {
+        Ok(value) => value,
+        Err(error) => {
+            prepared.remove_files();
+            return Err(error.into());
+        }
+    };
+    let transcription = match client
+        .transcribe_segments(cancellation, &prepared.files, max_concurrency)
+        .await
+    {
+        Ok(transcription) => transcription,
+        Err(error) => {
+            prepared.remove_files();
+            return Err(error.into());
+        }
+    };
+    if cancellation.is_cancelled() {
+        prepared.remove_files();
+        return Err(ConvertError::Canceled.into());
+    }
+    let output = output_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        PathBuf::from(".").join(format!(
+            "{}.txt",
+            input_path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy())
+                .unwrap_or_default()
+        ))
+    });
+    if let Err(source) = std::fs::write(&output, transcription.text) {
+        prepared.remove_files();
+        return Err(RuntimeError::OutputFile {
+            path: output,
+            source,
+        });
+    }
+    cache::handle_segmented_cache(config, None, &prepared.directory, true);
+    Ok(output)
+}
+
 /// Chooses the file preparation format before the unified AudioApiClient is
 /// invoked. HTTP-style and Legacy workflows retain their existing settings.
 /// A realtime replay is deliberately prepared as a PCM WAV whose shape comes
@@ -1727,6 +2186,55 @@ fn discard_recording(result: &RecordingResult) {
     }
 }
 
+fn retry_upload_mode(config: &Config, client: &AudioApiClient) -> RetryUploadMode {
+    if config.enable_segmented_upload && !client.is_realtime_workflow() {
+        RetryUploadMode::Segmented {
+            plan: None,
+            max_segment_seconds: config.max_upload_segment_seconds,
+            min_pause_ms: config.min_upload_pause_ms,
+            max_concurrency: config.max_upload_concurrency,
+        }
+    } else {
+        RetryUploadMode::Single
+    }
+}
+
+fn segment_concurrency(value: u32) -> Result<usize, ConvertError> {
+    let value = usize::try_from(value).map_err(|_| ConvertError::Failed {
+        message: "segmented upload concurrency is too large for this platform".into(),
+    })?;
+    if value == 0 {
+        return Err(ConvertError::Failed {
+            message: "segmented upload concurrency must be greater than zero".into(),
+        });
+    }
+    Ok(value)
+}
+
+fn clean_up_segmented_recording_attempt(
+    config: &Config,
+    cache_attempt: bool,
+    wav_path: &Path,
+    prepared: Option<&PreparedSegmentedUpload>,
+    upload_succeeded: bool,
+) {
+    let Some(prepared) = prepared else {
+        let _ = std::fs::remove_file(wav_path);
+        return;
+    };
+    if cache_attempt {
+        cache::handle_segmented_cache(
+            config,
+            Some(wav_path),
+            &prepared.directory,
+            upload_succeeded,
+        );
+    } else {
+        let _ = std::fs::remove_file(wav_path);
+        prepared.remove_files();
+    }
+}
+
 fn load_retry_recording(path: &Path) -> Option<Arc<Vec<u8>>> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_RETRY_AUDIO_BYTES {
@@ -1773,7 +2281,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::{SinkExt, StreamExt, future::join_all};
+    use parking_lot::Mutex as ParkingMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Barrier;
     use tokio_tungstenite::accept_async;
@@ -1787,7 +2297,15 @@ mod tests {
         SignerConfig, StreamAction, StreamRule, WorkflowSchemaVersion,
     };
     use crate::audio_devices::{CaptureFormat, test_capture_format};
+    use crate::converter::{SegmentAnalysis, SourceFrameInterval};
     use crate::recorder::{AudioBackend, AudioStream};
+
+    fn retry_recording_for_test(bytes: &[u8]) -> Arc<RetryRecording> {
+        Arc::new(RetryRecording {
+            original_wav: Arc::new(bytes.to_vec()),
+            upload_mode: RetryUploadMode::Single,
+        })
+    }
 
     struct NoopConverter;
 
@@ -1962,6 +2480,501 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SegmentExportCall {
+        segmented_upload_enabled: bool,
+        max_segment_seconds: u32,
+        min_pause_ms: u32,
+        max_concurrency: u32,
+        enable_vad: bool,
+        intervals: Vec<SourceFrameInterval>,
+    }
+
+    #[derive(Default)]
+    struct SegmentedConverterCalls {
+        analyses: usize,
+        analyzed_min_pause_ms: Vec<u32>,
+        exports: Vec<SegmentExportCall>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SegmentExportOutcome {
+        Succeed,
+        Fail,
+        Canceled,
+    }
+
+    struct InstrumentedSegmentConverter {
+        calls: Arc<ParkingMutex<SegmentedConverterCalls>>,
+        outcome: SegmentExportOutcome,
+    }
+
+    #[async_trait]
+    impl AudioConverter for InstrumentedSegmentConverter {
+        async fn convert(
+            &self,
+            _: &CancellationToken,
+            _: &Config,
+            _: &Path,
+            _: &Path,
+            _: i32,
+        ) -> Result<(), ConvertError> {
+            panic!("segmented Runtime paths must not use single-file conversion")
+        }
+
+        async fn analyze_segments(
+            &self,
+            _: &CancellationToken,
+            _: &Config,
+            _: &Path,
+            min_pause_ms: u32,
+        ) -> Result<SegmentAnalysis, ConvertError> {
+            let mut calls = self.calls.lock();
+            calls.analyses += 1;
+            calls.analyzed_min_pause_ms.push(min_pause_ms);
+            Ok(SegmentAnalysis {
+                source_rate: 10,
+                source_frames: 25,
+                silence_intervals: vec![SourceFrameInterval {
+                    start_frame: 8,
+                    end_frame: 10,
+                }],
+            })
+        }
+
+        async fn export_segments(
+            &self,
+            _: &CancellationToken,
+            config: &Config,
+            _: &Path,
+            outputs: &[PathBuf],
+            intervals: &[SourceFrameInterval],
+            _: u32,
+            _: u64,
+        ) -> Result<(), ConvertError> {
+            self.calls.lock().exports.push(SegmentExportCall {
+                segmented_upload_enabled: config.enable_segmented_upload,
+                max_segment_seconds: config.max_upload_segment_seconds,
+                min_pause_ms: config.min_upload_pause_ms,
+                max_concurrency: config.max_upload_concurrency,
+                enable_vad: config.enable_vad,
+                intervals: intervals.to_vec(),
+            });
+            match self.outcome {
+                SegmentExportOutcome::Succeed => {
+                    for output in outputs {
+                        std::fs::write(output, b"segment").map_err(|error| {
+                            ConvertError::Failed {
+                                message: error.to_string(),
+                            }
+                        })?;
+                    }
+                    Ok(())
+                }
+                SegmentExportOutcome::Fail => Err(ConvertError::Failed {
+                    message: "simulated segment export failure".into(),
+                }),
+                SegmentExportOutcome::Canceled => {
+                    if let Some(output) = outputs.first() {
+                        std::fs::write(output, b"partial segment").map_err(|error| {
+                            ConvertError::Failed {
+                                message: error.to_string(),
+                            }
+                        })?;
+                    }
+                    Err(ConvertError::Canceled)
+                }
+            }
+        }
+    }
+
+    fn segmented_runtime_config(cache_dir: &Path, api_endpoint: String) -> Config {
+        Config {
+            api_endpoint,
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            codecs: "pcm".into(),
+            container: "wav".into(),
+            enable_vad: true,
+            enable_segmented_upload: true,
+            max_upload_segment_seconds: 1,
+            min_upload_pause_ms: 700,
+            max_upload_concurrency: 1,
+            max_retry: 1,
+            retry_base_delay: 0.0,
+            ..Config::default()
+        }
+    }
+
+    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "client closed before sending a complete request");
+            request.extend_from_slice(&buffer[..count]);
+            let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            if content_length.is_some_and(|length| request.len() >= headers_end + 4 + length)
+                || request.ends_with(b"0\r\n\r\n")
+            {
+                return;
+            }
+        }
+    }
+
+    async fn legacy_segment_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_complete_http_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (endpoint, worker)
+    }
+
+    async fn legacy_concurrency_failure_server(
+        expected_concurrency: usize,
+        batches: usize,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            for _ in 0..batches {
+                let mut streams = Vec::with_capacity(expected_concurrency);
+                for _ in 0..expected_concurrency {
+                    streams.push(listener.accept().await.unwrap().0);
+                }
+                join_all(streams.iter_mut().map(read_complete_http_request)).await;
+                for stream in &mut streams {
+                    let body = r#"{"error":"simulated failure"}"#;
+                    let response = format!(
+                        "HTTP/1.1 500 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        (endpoint, worker)
+    }
+
+    #[tokio::test]
+    async fn segmented_export_failure_freezes_retry_plan_and_settings_before_export() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: calls.clone(),
+            outcome: SegmentExportOutcome::Fail,
+        });
+        let mut config = segmented_runtime_config(directory.path(), String::new());
+        config.max_upload_concurrency = 2;
+        let runtime = Runtime::new(config, converter).unwrap();
+        runtime.enable_retry_buffer();
+
+        let source = directory.path().join("original.wav");
+        std::fs::write(&source, b"authoritative original recording").unwrap();
+        let recording = RecordingResult {
+            wav_path: Some(source.clone()),
+            canceled: false,
+        };
+        runtime.save_completed_recording_for_retry(&recording);
+        runtime
+            .transcribe_recording(recording, &CancellationToken::new(), true)
+            .await;
+
+        let (plan, max_seconds, min_pause_ms, max_concurrency) = {
+            let inner = runtime.inner.lock();
+            let recording = inner.retry_recording.as_ref().unwrap();
+            match &recording.upload_mode {
+                RetryUploadMode::Segmented {
+                    plan,
+                    max_segment_seconds,
+                    min_pause_ms,
+                    max_concurrency,
+                } => (
+                    plan.clone()
+                        .expect("export failure must retain the planned boundaries"),
+                    *max_segment_seconds,
+                    *min_pause_ms,
+                    *max_concurrency,
+                ),
+                RetryUploadMode::Single => {
+                    panic!("segmented recording selected the single upload mode")
+                }
+            }
+        };
+        assert_eq!(max_seconds, 1);
+        assert_eq!(min_pause_ms, 700);
+        assert_eq!(max_concurrency, 2);
+        assert_eq!(
+            plan.segments,
+            vec![
+                crate::audio_segments::SourceInterval::new(0, 10),
+                crate::audio_segments::SourceInterval::new(10, 20),
+                crate::audio_segments::SourceInterval::new(20, 25),
+            ]
+        );
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert!(runtime.has_retryable_recording());
+        assert!(!source.exists());
+
+        // Settings are mutable while the retry is idle.  The retry must still
+        // use its original segmentation mode, boundaries, and concurrency.
+        {
+            let mut inner = runtime.inner.lock();
+            inner.config.enable_segmented_upload = false;
+            inner.config.max_upload_segment_seconds = 9;
+            inner.config.min_upload_pause_ms = 1;
+            inner.config.max_upload_concurrency = 5;
+        }
+        runtime.retry_recording_locked().await;
+
+        let calls = calls.lock();
+        assert_eq!(calls.analyses, 1, "Retry must not analyze pauses again");
+        assert_eq!(calls.analyzed_min_pause_ms, vec![700]);
+        assert_eq!(calls.exports.len(), 2);
+        assert!(calls.exports.iter().all(|call| {
+            call.segmented_upload_enabled
+                && call.max_segment_seconds == 1
+                && call.min_pause_ms == 700
+                && call.max_concurrency == 2
+                && !call.enable_vad
+                && call.intervals
+                    == vec![
+                        SourceFrameInterval {
+                            start_frame: 0,
+                            end_frame: 10,
+                        },
+                        SourceFrameInterval {
+                            start_frame: 10,
+                            end_frame: 20,
+                        },
+                        SourceFrameInterval {
+                            start_frame: 20,
+                            end_frame: 25,
+                        },
+                    ]
+        }));
+        drop(calls);
+        assert!(runtime.has_retryable_recording());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("RecordTemp_"))
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_retry_dispatches_with_its_frozen_concurrency() {
+        let directory = tempfile::tempdir().unwrap();
+        let (endpoint, server) = legacy_concurrency_failure_server(2, 2).await;
+        let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: calls.clone(),
+            outcome: SegmentExportOutcome::Succeed,
+        });
+        let mut config = segmented_runtime_config(directory.path(), endpoint);
+        config.max_upload_concurrency = 2;
+        let runtime = Runtime::new(config, converter).unwrap();
+        runtime.enable_retry_buffer();
+
+        let source = directory.path().join("original.wav");
+        std::fs::write(&source, b"authoritative original recording").unwrap();
+        let recording = RecordingResult {
+            wav_path: Some(source),
+            canceled: false,
+        };
+        runtime.save_completed_recording_for_retry(&recording);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.transcribe_recording(recording, &CancellationToken::new(), true),
+        )
+        .await
+        .expect("initial batch should start its two configured workflows");
+
+        // If Retry accidentally used this new value, the fake server would
+        // wait forever for a second request in the second batch.
+        {
+            let mut inner = runtime.inner.lock();
+            inner.config.enable_segmented_upload = false;
+            inner.config.max_upload_concurrency = 1;
+        }
+        tokio::time::timeout(Duration::from_secs(2), runtime.retry_recording_locked())
+            .await
+            .expect("Retry must retain and dispatch with concurrency two");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("both bounded batches should finish")
+            .unwrap();
+
+        let calls = calls.lock();
+        assert_eq!(calls.analyses, 1);
+        assert_eq!(calls.exports.len(), 2);
+        assert!(calls.exports.iter().all(|call| call.max_concurrency == 2));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn segmented_paste_failure_discards_attempt_artifacts_even_when_cache_is_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let (endpoint, server) = legacy_segment_server(vec![
+            (200, r#"{"text":"first"}"#),
+            (200, r#"{"text":"second"}"#),
+            (200, r#"{"text":"third"}"#),
+        ])
+        .await;
+        let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: calls.clone(),
+            outcome: SegmentExportOutcome::Succeed,
+        });
+        let mut config = segmented_runtime_config(directory.path(), endpoint);
+        config.keep_cache = true;
+        let runtime = Runtime::new(config, converter).unwrap();
+        runtime.enable_retry_buffer();
+
+        let source = directory.path().join("original.wav");
+        std::fs::write(&source, b"authoritative original recording").unwrap();
+        let recording = RecordingResult {
+            wav_path: Some(source.clone()),
+            canceled: false,
+        };
+        runtime.save_completed_recording_for_retry(&recording);
+        runtime
+            .transcribe_recording(recording, &CancellationToken::new(), true)
+            .await;
+        server.await.unwrap();
+
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(runtime.snapshot().message, "Paste failed");
+        assert!(runtime.has_retryable_recording());
+        assert!(!source.exists());
+        assert_eq!(calls.lock().exports.len(), 1);
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    !name.starts_with("RecordTemp_") && !name.starts_with("audio-")
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_segmented_export_removes_partial_attempt_and_keeps_retry_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: calls.clone(),
+            outcome: SegmentExportOutcome::Canceled,
+        });
+        let mut config = segmented_runtime_config(directory.path(), String::new());
+        config.keep_cache = true;
+        let runtime = Runtime::new(config, converter).unwrap();
+        runtime.enable_retry_buffer();
+
+        let source = directory.path().join("original.wav");
+        std::fs::write(&source, b"authoritative original recording").unwrap();
+        let recording = RecordingResult {
+            wav_path: Some(source.clone()),
+            canceled: false,
+        };
+        runtime.save_completed_recording_for_retry(&recording);
+        runtime
+            .transcribe_recording(recording, &CancellationToken::new(), true)
+            .await;
+
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(runtime.snapshot().message, "Request canceled");
+        assert!(runtime.has_retryable_recording());
+        assert_eq!(calls.lock().exports.len(), 1);
+        assert!(!source.exists());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("RecordTemp_"))
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_file_mode_never_writes_partial_text_or_removes_the_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let (endpoint, server) = legacy_segment_server(vec![
+            (200, r#"{"text":"first"}"#),
+            (500, r#"{"error":"failed"}"#),
+        ])
+        .await;
+        let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: calls.clone(),
+            outcome: SegmentExportOutcome::Succeed,
+        });
+        // This deliberately shares the runtime temporary prefix and lives in
+        // CACHE_DIR.  Startup cleanup must preserve an explicit --file input.
+        let source = directory.path().join("RecordTemp_caller-owned.wav");
+        let output = directory.path().join("transcription.txt");
+        std::fs::write(&source, b"caller-owned original recording").unwrap();
+
+        let error = run_file_mode_with_cancellation(
+            segmented_runtime_config(directory.path(), endpoint),
+            converter,
+            &source,
+            Some(&output),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, RuntimeError::AudioApi(_)));
+        assert!(
+            source.exists(),
+            "--file must never delete caller-owned input"
+        );
+        assert!(
+            !output.exists(),
+            "a failed later segment must not leave partial output text"
+        );
+        assert_eq!(calls.lock().exports.len(), 1);
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| {
+                    let path = entry.path();
+                    path == source
+                        || !entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("RecordTemp_")
+                })
+        );
+    }
+
     struct RealtimeCaptureBackend {
         captured_packets: Arc<AtomicUsize>,
     }
@@ -2080,6 +3093,26 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn segmented_upload_mode_is_explicitly_excluded_for_realtime_workflows() {
+        let config = Config {
+            enable_segmented_upload: true,
+            advanced_audio_api: AdvancedAudioConfig {
+                enabled: true,
+                workflow: Some(realtime_replay_workflow("ws://127.0.0.1:1/realtime".into())),
+                ..AdvancedAudioConfig::default()
+            },
+            ..Config::default()
+        };
+        let client = AudioApiClient::new(config.clone()).unwrap();
+
+        assert!(client.is_realtime_workflow());
+        assert!(matches!(
+            retry_upload_mode(&config, &client),
+            RetryUploadMode::Single
+        ));
     }
 
     #[tokio::test]
@@ -2293,7 +3326,7 @@ mod tests {
                 .lock()
                 .retry_recording
                 .as_deref()
-                .map(Vec::as_slice),
+                .map(|recording| recording.original_wav.as_slice()),
             Some(b"previous".as_slice())
         );
 
@@ -2307,7 +3340,7 @@ mod tests {
                 .lock()
                 .retry_recording
                 .as_deref()
-                .map(Vec::as_slice),
+                .map(|recording| recording.original_wav.as_slice()),
             Some(b"previous".as_slice())
         );
 
@@ -2321,7 +3354,7 @@ mod tests {
                 .lock()
                 .retry_recording
                 .as_deref()
-                .map(Vec::as_slice),
+                .map(|recording| recording.original_wav.as_slice()),
             Some(b"replacement".as_slice())
         );
 
@@ -2361,7 +3394,7 @@ mod tests {
                 .lock()
                 .retry_recording
                 .as_deref()
-                .map(Vec::as_slice),
+                .map(|recording| recording.original_wav.as_slice()),
             Some(b"retry this recording".as_slice())
         );
         assert!(
@@ -2526,7 +3559,7 @@ mod tests {
         };
         let runtime = Runtime::new(config, Arc::new(NoopConverter)).unwrap();
         runtime.enable_retry_buffer();
-        runtime.inner.lock().retry_recording = Some(Arc::new(b"previous audio".to_vec()));
+        runtime.inner.lock().retry_recording = Some(retry_recording_for_test(b"previous audio"));
         for (result, canceled, stopped) in [
             (Err("network failure".into()), false, false),
             (Ok(" \n".into()), false, false),
@@ -2552,6 +3585,7 @@ mod tests {
                     .retry_recording
                     .as_deref()
                     .unwrap()
+                    .original_wav
                     .as_slice(),
                 b"previous audio"
             );
@@ -2563,7 +3597,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
         runtime.enable_retry_buffer();
-        runtime.inner.lock().retry_recording = Some(Arc::new(b"audio".to_vec()));
+        runtime.inner.lock().retry_recording = Some(retry_recording_for_test(b"audio"));
         let calls = AtomicUsize::new(0);
         runtime
             .finish_rewrite_with(
