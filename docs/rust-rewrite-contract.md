@@ -226,9 +226,13 @@ clipboard access, clipboard delays, fallback, or automatic delivery retries.
 This applies to transcriptions, successful Rewrite results, and audio `[request failed]` text in GUI and CLI hotkey
 mode. Rewrite input acquisition still uses clipboard Copy regardless of this
 setting. CLI `--use-sendinput <BOOL>` overrides the setting. GUI Audio Hotkeys
-exposes a checkbox below Restore delay. Both delay controls remain editable with
-SendInput selected because Rewrite input still uses them; saving temporarily
-disables the controls. Unicode scalars stay intact across batches;
+exposes a checkbox below Restore delay. `SENDINPUT_BATCH_SIZE` defaults to 128
+UTF-16 code units and accepts 1 through 4096; CLI
+`--sendinput-batch-size <UNITS>` overrides it. GUI exposes the batch-size field
+alongside the checkbox and enables it only while SendInput is selected. Both
+delay controls remain editable with SendInput selected because Rewrite input
+still uses them; saving temporarily disables the controls. Unicode scalars stay
+intact across batches;
 line endings normalize to CR, and tabs remain Unicode characters. Partial
 delivery and cancellation after delivery report that text may already exist.
 

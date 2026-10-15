@@ -102,7 +102,11 @@ const EDIT_WIDTH: i32 = 378;
 const FIELD_TOP: i32 = 94;
 const FIELD_HEIGHT: i32 = 34;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
-const CLIPBOARD_DELAY_KEYS: [&str; 2] = ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"];
+const HOTKEY_INPUT_KEYS: [&str; 3] = [
+    "CLIPBOARD_WRITE_DELAY",
+    "CLIPBOARD_RESTORE_DELAY",
+    "SENDINPUT_BATCH_SIZE",
+];
 const SEGMENTED_UPLOAD_KEYS: [&str; 3] = [
     "MAX_UPLOAD_SEGMENT_SECONDS",
     "MIN_UPLOAD_PAUSE_MS",
@@ -345,6 +349,12 @@ const FIELDS: &[FieldSpec] = &[
         label: "Use SendInput",
         group: "Hotkeys",
         kind: FieldKind::Boolean,
+    },
+    FieldSpec {
+        key: "SENDINPUT_BATCH_SIZE",
+        label: "Batch size (UTF-16)",
+        group: "Hotkeys",
+        kind: FieldKind::Integer,
     },
     FieldSpec {
         key: "CACHE_DIR",
@@ -889,7 +899,7 @@ unsafe extern "system" fn settings_proc(
                 let color_control = state
                     .localized_controls
                     .iter()
-                    .find(|(label, key)| *label == control && CLIPBOARD_DELAY_KEYS.contains(key))
+                    .find(|(label, key)| *label == control && HOTKEY_INPUT_KEYS.contains(key))
                     .and_then(|(_, key)| state.controls.get(key))
                     .copied()
                     .unwrap_or(control);
@@ -1162,13 +1172,19 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
         .insert(picker.button.0 as usize, "Audio");
     state.microphone = Some(picker);
     group_y.insert("Audio", FIELD_TOP + 42);
+    let hotkey_status_y = FIELD_TOP
+        + FIELDS
+            .iter()
+            .filter(|field| field.group == "Hotkeys")
+            .count() as i32
+            * 42;
     let hotkey_status = create_child(
         state,
         w!("STATIC"),
         state.language.text("hotkey_help"),
         WS_CHILD | WS_VISIBLE,
         CONTENT_LEFT,
-        FIELD_TOP + 7 * 42,
+        hotkey_status_y,
         EDIT_LEFT + EDIT_WIDTH - CONTENT_LEFT,
         72,
         0,
@@ -2862,11 +2878,10 @@ fn update_input_controls(state: &SettingsState) {
             let _ = InvalidateRect(Some(*control), None, true);
         }
     }
-    let enabled = !state.saving;
-    for key in CLIPBOARD_DELAY_KEYS {
+    for key in ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"] {
         if let Some(control) = state.controls.get(key) {
             unsafe {
-                let _ = EnableWindow(*control, enabled);
+                let _ = EnableWindow(*control, !state.saving);
                 let _ = InvalidateRect(Some(*control), None, true);
             }
         }
@@ -2875,6 +2890,25 @@ fn update_input_controls(state: &SettingsState) {
                 unsafe {
                     let _ = InvalidateRect(Some(*label), None, true);
                 }
+            }
+        }
+    }
+    let sendinput_batch_enabled = !state.saving
+        && state
+            .boolean_values
+            .get("USE_SENDINPUT")
+            .copied()
+            .unwrap_or(false);
+    if let Some(control) = state.controls.get("SENDINPUT_BATCH_SIZE") {
+        unsafe {
+            let _ = EnableWindow(*control, sendinput_batch_enabled);
+            let _ = InvalidateRect(Some(*control), None, true);
+        }
+    }
+    for (label, label_key) in &state.localized_controls {
+        if *label_key == "SENDINPUT_BATCH_SIZE" {
+            unsafe {
+                let _ = InvalidateRect(Some(*label), None, true);
             }
         }
     }

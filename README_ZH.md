@@ -309,7 +309,7 @@ stateDiagram-v2
 | Audio Record | 麦克风（第一项）、输出声道数、输出采样率、输出位深、比特率、编码器、容器、VAD 和边界填充 |
 | Rewrite API | Provider、Base URL、API Key、Model、提示词列表、ADD PROMPT 和连接测试 |
 | Network | 旧音频 API、高级 Audio API 与 Rewrite API 共用的超时、重试、HTTP/2、TLS 校验，以及可选的非实时分片上传 |
-| Audio Hotkeys | 三个快捷键、低级键盘钩子开关、两个剪贴板等待时间和使用 SendInput 开关 |
+| Audio Hotkeys | 三个快捷键、低级键盘钩子开关、两个剪贴板等待时间，以及可配置单批大小的 SendInput 输出 |
 | Cache | 缓存目录、缓存保留和旧请求失败占位文本 |
 | Debug | FFmpeg、录音、快捷键和上传调试开关，以及带复制全部、清空功能的实时只读输出框 |
 | About | 项目、作者、许可证和仓库信息 |
@@ -595,6 +595,7 @@ GUI 选择“跟随系统默认”时，即使下拉框同时显示当前默认�
 | `--clipboard-write-delay <MS>` | 设置写入输出后发送 `Ctrl+V` 前，或 Rewrite 清空剪贴板后发送 `Ctrl+C` 前的等待时间 |
 | `--clipboard-restore-delay <MS>` | 设置 `Ctrl+V` 写入或 Rewrite 读取后，恢复原剪贴板前的等待时间 |
 | `--use-sendinput <BOOL>` | 选择 Unicode 直接写入，输出不使用剪贴板且无回退；Rewrite 读取仍使用 `Ctrl+C` |
+| `--sendinput-batch-size <UNITS>` | 设置每次 `SendInput` 调用注入的最大 UTF-16 单元数（`1`–`4096`） |
 
 #### Cache
 
@@ -699,6 +700,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
     ]
   },
   "USE_SENDINPUT": false,
+  "SENDINPUT_BATCH_SIZE": 128,
   "REQUEST_FAILED_NOTIFICATION": false
 }
 ```
@@ -838,6 +840,7 @@ core 通过 WASAPI 共享模式打开所选设备，优先使用 Windows 中配�
 | `CLIPBOARD_WRITE_DELAY` | `80` | 写入输出后发送 `Ctrl+V` 前，或 Rewrite 清空剪贴板后发送 `Ctrl+C` 前的等待时间，单位毫秒 |
 | `CLIPBOARD_RESTORE_DELAY` | `120` | `Ctrl+V` 写入或 Rewrite 读取后，恢复原剪贴板前的等待时间，单位毫秒 |
 | `USE_SENDINPUT` | `false` | GUI 和 CLI 快捷键模式使用 core 的 Unicode 直接写入通道；Rewrite 读取始终使用剪贴板 |
+| `SENDINPUT_BATCH_SIZE` | `128` | 每次 `SendInput` 调用的最大 UTF-16 单元数。允许 `1`–`4096`；不会将一个 Unicode 标量拆到两个批次。 |
 | `CACHE_DIR` | `""` | 非空时尝试创建并转换为绝对路径；失败时回退当前目录并清空设置值 |
 | `KEEP_CACHE` | `false` | 只有 `CACHE_DIR` 非空且可用时才保留缓存 |
 | `REQUEST_FAILED_NOTIFICATION` | `false` | 旧音频 API 重试耗尽后写入 `[request failed]`；高级 Audio API 与 Rewrite 均不输出此占位文本 |
@@ -1058,7 +1061,7 @@ GUI 录入沿用原有字符串字段，修饰键顺序固定为 `ctrl`、`shift
 
 如果粘贴快捷键已经发送，但恢复原剪贴板失败，程序会把它与“粘贴前失败”区分显示。
 
-在 Audio Hotkeys 页面恢复等待项下方开启“使用 SendInput”，或设置 `USE_SENDINPUT=true`、传入 `--use-sendinput true`，即可直接输入 Unicode 文本。旧配置缺少字段时默认关闭。识别结果、音频重试结果、成功的 Rewrite 结果和旧音频 API 的 `[request failed]` 提示均遵守此设置；标准输出和文件输出不受影响。开启 SendInput 后，两个剪贴板等待项仍可编辑，因为 Rewrite 读取仍会使用；仅在保存期间暂时禁用。
+在 Audio Hotkeys 页面恢复等待项下方开启“使用 SendInput”，或设置 `USE_SENDINPUT=true`、传入 `--use-sendinput true`，即可直接输入 Unicode 文本。旧配置缺少字段时默认关闭。识别结果、音频重试结果、成功的 Rewrite 结果和旧音频 API 的 `[request failed]` 提示均遵守此设置；标准输出和文件输出不受影响。开启 SendInput 后，**单批大小（UTF-16）** 控制一次调用最多发送多少个 UTF-16 单元，默认值为 `128`，允许范围是 `1`–`4096`。增大它能减少 API 调用次数，但目标控件仍要逐个处理键盘事件，速度通常无法达到剪贴板粘贴。两个剪贴板等待项仍可编辑，因为 Rewrite 读取仍会使用；单批大小仅在 SendInput 关闭或保存设置期间禁用。
 
 `USE_SENDINPUT` 只控制写入。SendInput 写入通道不读写剪贴板，不自动回退或重发；Rewrite 读取始终执行上文的备份、`Ctrl+C`、读取和恢复流程。文本按 UTF-16 分批发送，批次不会拆开代理对。CRLF 和 LF 统一为 CR；换行和 Tab 发送 Unicode 字符事件，不模拟物理 Enter/Tab 按键，实际效果仍取决于目标控件。修饰键未释放时最多等待两秒；取消停止后续批次，已输入内容无法撤回。部分发送会明确提示可能已有文本。API 成功表示事件已注入，不代表目标控件已接收；输入焦点、控件兼容性和 Windows 权限限制仍然适用。
 

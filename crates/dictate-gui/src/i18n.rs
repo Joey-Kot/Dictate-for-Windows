@@ -309,6 +309,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("CLIPBOARD_WRITE_DELAY", "Paste delay (ms)"),
     ("CLIPBOARD_RESTORE_DELAY", "Restore delay (ms)"),
     ("USE_SENDINPUT", "Use SendInput"),
+    ("SENDINPUT_BATCH_SIZE", "Batch size (UTF-16)"),
     ("Text input sent", "Text input sent"),
     ("Text input failed", "Text input failed"),
     (
@@ -538,6 +539,7 @@ const CHINESE: &[(&str, &str)] = &[
     ("CLIPBOARD_WRITE_DELAY", "粘贴前等待（毫秒）"),
     ("CLIPBOARD_RESTORE_DELAY", "恢复前等待（毫秒）"),
     ("USE_SENDINPUT", "使用 SendInput"),
+    ("SENDINPUT_BATCH_SIZE", "单批大小（UTF-16）"),
     ("Text input sent", "文本输入已发送"),
     ("Text input failed", "文本输入失败"),
     (
@@ -743,6 +745,7 @@ const GERMAN: &[(&str, &str)] = &[
     ("CLIPBOARD_WRITE_DELAY", "Einfügen (ms)"),
     ("CLIPBOARD_RESTORE_DELAY", "Wiederherst. (ms)"),
     ("USE_SENDINPUT", "SendInput verwenden"),
+    ("SENDINPUT_BATCH_SIZE", "Batchgröße (UTF-16)"),
     ("Text input sent", "Texteingabe gesendet"),
     ("Text input failed", "Texteingabe fehlgeschlagen"),
     (
@@ -939,6 +942,7 @@ const JAPANESE: &[(&str, &str)] = &[
     ("CLIPBOARD_WRITE_DELAY", "貼り付け前の待機 (ms)"),
     ("CLIPBOARD_RESTORE_DELAY", "復元前の待機 (ms)"),
     ("USE_SENDINPUT", "SendInput を使用"),
+    ("SENDINPUT_BATCH_SIZE", "バッチサイズ (UTF-16)"),
     ("Text input sent", "テキスト入力を送信しました"),
     ("Text input failed", "テキスト入力に失敗しました"),
     (
@@ -1144,6 +1148,7 @@ const FRENCH: &[(&str, &str)] = &[
     ("CLIPBOARD_WRITE_DELAY", "Collage (ms)"),
     ("CLIPBOARD_RESTORE_DELAY", "Restauration (ms)"),
     ("USE_SENDINPUT", "Utiliser SendInput"),
+    ("SENDINPUT_BATCH_SIZE", "Taille du lot (UTF-16)"),
     ("Text input sent", "Saisie de texte envoyée"),
     ("Text input failed", "Échec de la saisie"),
     (

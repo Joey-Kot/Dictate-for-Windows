@@ -311,7 +311,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
 | Rewrite API | Provider, Base URL, API Key, Model, prompt list, ADD PROMPT, and connectivity test |
 | Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API; optional pause-preserving segmented upload for Audio API transcription |
-| Audio Hotkeys | Three hotkeys, a low-level keyboard hook switch, two clipboard delays, and a SendInput switch |
+| Audio Hotkeys | Three hotkeys, a low-level keyboard hook switch, two clipboard delays, and SendInput output with a configurable batch size |
 | Cache | Cache directory, cache retention, and Legacy request-failure placeholder text |
 | Debug | FFmpeg, recording, hotkey, and upload debug switches, plus a live read-only output box with Copy all and Clear controls |
 | About | Project, author, license, and repository information |
@@ -591,6 +591,7 @@ Segmented-upload settings have no command-line overrides. Configure `ENABLE_SEGM
 | `--clipboard-write-delay <MS>` | Set the delay before sending `Ctrl+V` after writing the output, or before sending `Ctrl+C` after Rewrite clears the clipboard |
 | `--clipboard-restore-delay <MS>` | Set the delay before restoring the original clipboard after inserting text with `Ctrl+V` or reading it for Rewrite |
 | `--use-sendinput <BOOL>` | Select direct Unicode text insertion, which does not use the clipboard for output and has no fallback; Rewrite still reads text using `Ctrl+C` |
+| `--sendinput-batch-size <UNITS>` | Set the maximum UTF-16 code units injected by each `SendInput` call (`1`–`4096`) |
 
 #### Cache
 
@@ -694,6 +695,7 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
     ]
   },
   "USE_SENDINPUT": false,
+  "SENDINPUT_BATCH_SIZE": 128,
   "REQUEST_FAILED_NOTIFICATION": false
 }
 ```
@@ -837,6 +839,7 @@ The three numeric segmented-upload fields are validated and retained even when `
 | `CLIPBOARD_WRITE_DELAY` | `80` | Wait in milliseconds after writing output and before sending `Ctrl+V`, or after Rewrite clears the clipboard and before sending `Ctrl+C` |
 | `CLIPBOARD_RESTORE_DELAY` | `120` | Wait in milliseconds after a `Ctrl+V` write or Rewrite read, before restoring the original clipboard |
 | `USE_SENDINPUT` | `false` | Uses the core's direct Unicode input channel in GUI and CLI hotkey modes; Rewrite always reads through the clipboard |
+| `SENDINPUT_BATCH_SIZE` | `128` | Maximum UTF-16 code units in each `SendInput` call. Accepts `1`–`4096`; a Unicode scalar is never split across batches. |
 | `CACHE_DIR` | `""` | When nonempty, attempts to create the directory and convert it to an absolute path; on failure, falls back to the current directory and clears the setting |
 | `KEEP_CACHE` | `false` | Retains cached files only when `CACHE_DIR` is nonempty and usable |
 | `REQUEST_FAILED_NOTIFICATION` | `false` | Writes `[request failed]` after Legacy Audio API retries are exhausted; Advanced Audio API and Rewrite never output this placeholder text |
@@ -1054,7 +1057,7 @@ Both delays are shared with Rewrite reads and correspond to **Paste delay** and 
 
 If the paste shortcut has been sent but restoring the original clipboard fails, the application reports this separately from a failure before pasting.
 
-Enable “Use SendInput” below the restore delay field on the Audio Hotkeys page, set `USE_SENDINPUT=true`, or pass `--use-sendinput true` to enter Unicode text directly. It defaults to off when the field is missing from an older configuration. Recognition results, audio retry results, successful Rewrite results, and Legacy Audio API `[request failed]` messages all follow this setting; standard output and file output are unaffected. With SendInput enabled, the two clipboard delay fields remain editable because Rewrite reads still use them; they are disabled only temporarily while saving.
+Enable “Use SendInput” below the restore delay field on the Audio Hotkeys page, set `USE_SENDINPUT=true`, or pass `--use-sendinput true` to enter Unicode text directly. It defaults to off when the field is missing from an older configuration. Recognition results, audio retry results, successful Rewrite results, and Legacy Audio API `[request failed]` messages all follow this setting; standard output and file output are unaffected. With SendInput enabled, **Batch size (UTF-16)** controls the maximum UTF-16 code units sent in one call; it defaults to `128` and accepts `1`–`4096`. Larger batches reduce API calls but do not make a target control process its individual keyboard events as quickly as a clipboard paste. The two clipboard delay fields remain editable because Rewrite reads still use them; the batch-size field is disabled only while SendInput is off or settings are being saved.
 
 `USE_SENDINPUT` controls writing only. The SendInput output path does not read or write the clipboard and does not automatically fall back or resend; Rewrite reads always follow the backup, `Ctrl+C`, read, and restore procedure described above. Text is sent in UTF-16 batches without splitting surrogate pairs. CRLF and LF are normalized to CR; newlines and Tabs are sent as Unicode character events, without simulating physical Enter/Tab keypresses, so the actual behavior still depends on the target control. If modifiers have not been released, the application waits up to two seconds. Cancellation stops subsequent batches but cannot undo text already entered. A partial send explicitly warns that some text may already have been entered. API success means that events have been injected, not that the target control has received them; input focus, control compatibility, and Windows permission restrictions still apply.
 

@@ -130,6 +130,9 @@ struct Arguments {
     /// Use Unicode output instead of clipboard paste; Rewrite input still uses Copy.
     #[arg(long, value_name = "BOOL", action = ArgAction::Set, help_heading = "Audio Hotkeys")]
     use_sendinput: Option<bool>,
+    /// Maximum UTF-16 code units to inject in one SendInput call (1..=4096).
+    #[arg(long, value_name = "UNITS", help_heading = "Audio Hotkeys")]
+    sendinput_batch_size: Option<u32>,
     /// Milliseconds to wait before Ctrl+V output or Ctrl+C Rewrite input.
     #[arg(long, value_name = "MS", help_heading = "Audio Hotkeys")]
     clipboard_write_delay: Option<u64>,
@@ -217,6 +220,7 @@ impl Arguments {
             || self.cancel_or_retry_key.is_some()
             || self.hotkey_hook.is_some()
             || self.use_sendinput.is_some()
+            || self.sendinput_batch_size.is_some()
             || self.clipboard_write_delay.is_some()
             || self.clipboard_restore_delay.is_some()
             || self.cache_dir.is_some()
@@ -260,6 +264,7 @@ impl Arguments {
         set(&mut config.cancel_or_retry_key, self.cancel_or_retry_key);
         set(&mut config.hotkey_hook, self.hotkey_hook);
         set(&mut config.use_sendinput, self.use_sendinput);
+        set(&mut config.sendinput_batch_size, self.sendinput_batch_size);
         set(
             &mut config.clipboard_write_delay,
             self.clipboard_write_delay,
@@ -507,6 +512,11 @@ mod tests {
             args.apply(&mut config);
             assert_eq!(config.use_sendinput, value == "true");
         }
+        let args =
+            Arguments::try_parse_from(["dictate-cli", "--sendinput-batch-size", "1024"]).unwrap();
+        assert!(args.has_config_override());
+        args.apply(&mut config);
+        assert_eq!(config.sendinput_batch_size, 1024);
     }
 
     #[test]

@@ -12,6 +12,10 @@ pub const DEFAULT_VAD_START_THRESHOLD: f64 = 0.6;
 pub const DEFAULT_MAX_UPLOAD_SEGMENT_SECONDS: u32 = 300;
 pub const DEFAULT_MIN_UPLOAD_PAUSE_MS: u32 = 700;
 pub const DEFAULT_MAX_UPLOAD_CONCURRENCY: u32 = 1;
+/// The historic SendInput batch size, expressed in UTF-16 code units.
+pub const DEFAULT_SENDINPUT_BATCH_SIZE: u32 = 128;
+/// Keep one injected batch bounded even when a configuration file is edited by hand.
+pub const MAX_SENDINPUT_BATCH_SIZE: u32 = 4_096;
 
 pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
     if !(0.5..=1.0).contains(&value) {
@@ -97,6 +101,9 @@ pub struct Config {
     pub hotkey_hook: bool,
     #[serde(rename = "USE_SENDINPUT")]
     pub use_sendinput: bool,
+    /// Maximum UTF-16 code units per SendInput call. A scalar value is never split.
+    #[serde(rename = "SENDINPUT_BATCH_SIZE")]
+    pub sendinput_batch_size: u32,
     #[serde(rename = "START_KEY")]
     pub start_key: String,
     #[serde(rename = "PAUSE_KEY")]
@@ -159,6 +166,7 @@ impl Default for Config {
             max_upload_concurrency: DEFAULT_MAX_UPLOAD_CONCURRENCY,
             hotkey_hook: true,
             use_sendinput: false,
+            sendinput_batch_size: DEFAULT_SENDINPUT_BATCH_SIZE,
             start_key: "ctrl+alt+q".into(),
             pause_key: "ctrl+alt+s".into(),
             cancel_or_retry_key: "alt+esc".into(),
@@ -275,6 +283,12 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "invalid MAX_UPLOAD_CONCURRENCY (must be > 0)".into(),
             ));
+        }
+        if !(1..=MAX_SENDINPUT_BATCH_SIZE).contains(&self.sendinput_batch_size) {
+            return Err(ConfigError::Invalid(format!(
+                "invalid SENDINPUT_BATCH_SIZE: {} (allowed 1..={MAX_SENDINPUT_BATCH_SIZE} UTF-16 code units)",
+                self.sendinput_batch_size
+            )));
         }
         if !self.opacity.is_finite()
             || !(0.1..=1.0).contains(&self.opacity)
@@ -544,6 +558,41 @@ mod tests {
             assert!(serde_json::from_str::<super::Config>(input).is_err());
         }
     }
+
+    #[test]
+    fn sendinput_batch_size_defaults_roundtrip_and_bounds() {
+        let old: super::Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            old.sendinput_batch_size,
+            super::DEFAULT_SENDINPUT_BATCH_SIZE
+        );
+
+        let config: super::Config = serde_json::from_value(serde_json::json!({
+            "SENDINPUT_BATCH_SIZE": 1024,
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["SENDINPUT_BATCH_SIZE"],
+            1024
+        );
+
+        for value in [0, super::MAX_SENDINPUT_BATCH_SIZE + 1] {
+            let config = super::Config {
+                sendinput_batch_size: value,
+                ..Default::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SENDINPUT_BATCH_SIZE")
+            );
+        }
+        assert!(serde_json::from_str::<super::Config>(r#"{"SENDINPUT_BATCH_SIZE":-1}"#).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -566,6 +615,7 @@ mod tests {
         assert_eq!(cfg.clipboard_write_delay, 80);
         assert_eq!(cfg.clipboard_restore_delay, 120);
         assert!(!cfg.use_sendinput);
+        assert_eq!(cfg.sendinput_batch_size, DEFAULT_SENDINPUT_BATCH_SIZE);
         let enabled: Config = serde_json::from_str(r#"{"USE_SENDINPUT":true}"#).unwrap();
         assert!(enabled.use_sendinput);
         assert_eq!(

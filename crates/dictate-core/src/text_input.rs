@@ -54,7 +54,7 @@ pub async fn send_text(
     config: &Config,
 ) -> Result<(), TextInputError> {
     if config.use_sendinput {
-        send_unicode(text, cancellation).await
+        send_unicode(text, cancellation, config.sendinput_batch_size as usize).await
     } else {
         clipboard::paste_text(
             text,
@@ -69,12 +69,14 @@ pub async fn send_text(
 
 // Keep each scalar, including surrogate pairs, in one batch.
 #[cfg(any(windows, test))]
-fn unicode_batches(text: &str) -> Vec<Vec<u16>> {
+fn unicode_batches(text: &str, batch_size: usize) -> Vec<Vec<u16>> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     let mut batches = Vec::new();
     let mut batch = Vec::new();
     for ch in normalized.chars() {
-        if batch.len() + ch.len_utf16() > 128 {
+        // A scalar can use two UTF-16 units; retain it intact even if the
+        // configured limit is one unit.
+        if !batch.is_empty() && batch.len() + ch.len_utf16() > batch_size {
             batches.push(std::mem::take(&mut batch));
         }
         batch.extend_from_slice(ch.encode_utf16(&mut [0; 2]));
@@ -96,8 +98,9 @@ async fn send_unicode_with(
     text: &str,
     cancellation: &CancellationToken,
     backend: &impl UnicodeBackend,
+    batch_size: usize,
 ) -> Result<(), TextInputError> {
-    let batches = unicode_batches(text);
+    let batches = unicode_batches(text, batch_size.max(1));
     let total = batches.iter().map(|batch| batch.len() * 2).sum();
     let mut sent = 0;
     for batch in batches {
@@ -135,14 +138,24 @@ async fn send_unicode_with(
     Ok(())
 }
 
-async fn send_unicode(text: &str, cancellation: &CancellationToken) -> Result<(), TextInputError> {
+async fn send_unicode(
+    text: &str,
+    cancellation: &CancellationToken,
+    batch_size: usize,
+) -> Result<(), TextInputError> {
     #[cfg(windows)]
     {
-        send_unicode_with(text, cancellation, &crate::keyboard::WindowsUnicode).await
+        send_unicode_with(
+            text,
+            cancellation,
+            &crate::keyboard::WindowsUnicode,
+            batch_size,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
-        let _ = (text, cancellation);
+        let _ = (text, cancellation, batch_size);
         Err(TextInputError::UnsupportedPlatform)
     }
 }
@@ -188,12 +201,22 @@ mod tests {
             cancel: None,
         };
         let token = CancellationToken::new();
-        send_unicode_with("", &token, &backend).await.unwrap();
+        send_unicode_with("", &token, &backend, 128).await.unwrap();
         assert_eq!(backend.calls.get(), 0);
-        send_unicode_with(&"a".repeat(300), &token, &backend)
+        send_unicode_with(&"a".repeat(300), &token, &backend, 128)
             .await
             .unwrap();
         assert_eq!(backend.calls.get(), 3);
+
+        let larger_batch = Backend {
+            calls: Cell::new(0),
+            limit: usize::MAX,
+            cancel: None,
+        };
+        send_unicode_with(&"a".repeat(300), &token, &larger_batch, 1024)
+            .await
+            .unwrap();
+        assert_eq!(larger_batch.calls.get(), 1);
     }
 
     #[tokio::test]
@@ -212,7 +235,7 @@ mod tests {
             tokio::task::yield_now().await;
             token.cancel();
         };
-        let (result, ()) = tokio::join!(send_unicode_with("abc", &token, &Held), cancel);
+        let (result, ()) = tokio::join!(send_unicode_with("abc", &token, &Held, 128), cancel);
         assert!(matches!(result, Err(TextInputError::Canceled { sent: 0 })));
     }
 
@@ -235,9 +258,9 @@ mod tests {
     }
     #[test]
     fn encoding_and_batch_boundaries() {
-        assert!(unicode_batches("").is_empty());
+        assert!(unicode_batches("", 128).is_empty());
         let text = format!("{}😀中\r\n\n\r\t", "a".repeat(127));
-        let batches = unicode_batches(&text);
+        let batches = unicode_batches(&text, 128);
         assert_eq!(batches[0].len(), 127);
         assert_eq!(
             String::from_utf16(&batches.concat()).unwrap(),
@@ -246,6 +269,10 @@ mod tests {
         for batch in batches {
             assert!(String::from_utf16(&batch).is_ok());
         }
+        assert_eq!(
+            unicode_batches("😀", 1),
+            vec!["😀".encode_utf16().collect::<Vec<_>>()]
+        );
     }
     #[tokio::test]
     async fn partial_or_zero_send_stops_without_retry() {
@@ -256,7 +283,7 @@ mod tests {
                 cancel: None,
             };
             assert!(
-                matches!(send_unicode_with(&"中".repeat(300), &CancellationToken::new(), &backend).await, Err(TextInputError::Send { sent, .. }) if sent == limit)
+                matches!(send_unicode_with(&"中".repeat(300), &CancellationToken::new(), &backend, 128).await, Err(TextInputError::Send { sent, .. }) if sent == limit)
             );
             assert_eq!(backend.calls.get(), 1);
         }
@@ -270,12 +297,12 @@ mod tests {
             cancel: Some(token.clone()),
         };
         assert!(matches!(
-            send_unicode_with(&"a".repeat(300), &token, &backend).await,
+            send_unicode_with(&"a".repeat(300), &token, &backend, 128).await,
             Err(TextInputError::Canceled { sent: 256 })
         ));
         assert_eq!(backend.calls.get(), 1);
         assert!(matches!(
-            send_unicode_with("abc", &token, &backend).await,
+            send_unicode_with("abc", &token, &backend, 128).await,
             Err(TextInputError::Canceled { sent: 0 })
         ));
         assert_eq!(backend.calls.get(), 1);

@@ -67,5 +67,6 @@
     ]
   },
   "USE_SENDINPUT": false,
+  "SENDINPUT_BATCH_SIZE": 128,
   "REQUEST_FAILED_NOTIFICATION": false
 }
