@@ -170,6 +170,14 @@ fn two_segments(directory: &tempfile::TempDir) -> Vec<PathBuf> {
     vec![first, second]
 }
 
+fn three_segments(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+    let mut paths = two_segments(directory);
+    let third = directory.path().join("segment-000002.pcm");
+    std::fs::write(&third, b"third").unwrap();
+    paths.push(third);
+    paths
+}
+
 fn transcript_for_audio(body: &[u8]) -> &'static [u8] {
     match body {
         b"first" => b"A",
@@ -212,6 +220,62 @@ async fn batch_runs_every_advanced_request_segment_and_concatenates_source_order
 
     assert_eq!(transcription.text, "AB");
     assert!(transcription.raw_response.is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn interactive_batch_keeps_successes_and_inserts_a_safe_failure_placeholder() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for expected in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/recognize");
+            assert_eq!(request.body, expected);
+            match expected {
+                b"first" => write_response(&mut stream, "200 OK", b"A").await,
+                b"second" => {
+                    write_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        br#"{"error":{"info":"retry later"}}"#,
+                    )
+                    .await;
+                }
+                b"third" => write_response(&mut stream, "200 OK", b"C").await,
+                _ => unreachable!(),
+            }
+        }
+    });
+    let config = advanced_config(
+        AudioDelivery::RawAudio,
+        AdvancedRecognition::Request {
+            request: Box::new(stage(
+                HttpMethod::Post,
+                format!("http://{address}/recognize"),
+                HttpBody::RawAudio,
+            )),
+            final_text: ResponseExtractor::PlainBody,
+        },
+    );
+    let client = AudioApiClient::new(config).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    let transcription = client
+        .transcribe_segments(&CancellationToken::new(), &three_segments(&directory), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        transcription.text,
+        "A[503 Service Unavailable: retry later]C"
+    );
     server.await.unwrap();
 }
 

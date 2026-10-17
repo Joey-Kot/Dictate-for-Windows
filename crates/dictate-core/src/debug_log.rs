@@ -2,12 +2,14 @@
 //! existing configuration gates; without a subscriber, output goes to stderr.
 use std::fmt;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 const MAX_RECORD_BYTES: usize = 8192;
+const TRUNCATION_SUFFIX: &str = "… [truncated]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
@@ -85,22 +87,109 @@ static DISPATCHER: Dispatcher = Dispatcher {
     handler: RwLock::new(None),
 };
 
+#[derive(Clone)]
+struct ActiveOperation {
+    id: String,
+}
+
+static ACTIVE_OPERATIONS: Mutex<Vec<ActiveOperation>> = Mutex::new(Vec::new());
+static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Associates logs from one user-visible operation across recorder, FFmpeg,
+/// hotkey, and network workers.  Runtime serializes user operations, while a
+/// stack also keeps nested helpers from losing their caller's association.
+#[must_use]
+pub(crate) struct OperationScope {
+    id: String,
+}
+
+impl Drop for OperationScope {
+    fn drop(&mut self) {
+        let mut operations = ACTIVE_OPERATIONS.lock();
+        if let Some(index) = operations
+            .iter()
+            .rposition(|operation| operation.id == self.id)
+        {
+            operations.remove(index);
+        }
+    }
+}
+
+pub(crate) fn operation_scope(kind: &str) -> OperationScope {
+    let sequence = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{kind}-{sequence:06}");
+    ACTIVE_OPERATIONS
+        .lock()
+        .push(ActiveOperation { id: id.clone() });
+    OperationScope { id }
+}
+
+/// Starts an operation only when an outer Runtime action has not already
+/// established one.  This lets CLI/file and connectivity entry points work on
+/// their own without splitting a single GUI action into multiple IDs.
+pub(crate) fn operation_scope_if_none(kind: &str) -> Option<OperationScope> {
+    let mut operations = ACTIVE_OPERATIONS.lock();
+    if !operations.is_empty() {
+        return None;
+    }
+    let sequence = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{kind}-{sequence:06}");
+    operations.push(ActiveOperation { id: id.clone() });
+    Some(OperationScope { id })
+}
+
+fn current_operation() -> Option<String> {
+    ACTIVE_OPERATIONS
+        .lock()
+        .last()
+        .map(|operation| operation.id.clone())
+}
+
 /// Installs the application's receiver. The callback should only enqueue logs;
 /// it can run on recording, hotkey, HTTP, or FFmpeg worker threads.
 pub fn subscribe(handler: impl Fn(Record) + Send + Sync + 'static) -> Subscription {
     DISPATCHER.subscribe(Arc::new(handler))
 }
 
+#[allow(dead_code)] // Native FFmpeg forwarding is feature-gated.
 pub(crate) fn forward(category: Category, message: &str) -> bool {
-    DISPATCHER.forward(category, message)
+    let message = decorate_message(message);
+    DISPATCHER.forward(category, &message)
 }
 
 pub(crate) fn write(category: Category, message: fmt::Arguments<'_>) {
-    let message = message.to_string();
-    if !forward(category, &message) {
+    let message = decorate_message(&message.to_string());
+    if !DISPATCHER.forward(category, &message) {
         // A detached GUI or a closed console must not abort a task.
         let _ = writeln!(std::io::stderr().lock(), "{message}");
     }
+}
+
+fn decorate_message(message: &str) -> String {
+    let operation = current_operation();
+    bounded_message(message, operation.as_deref())
+}
+
+fn bounded_message(message: &str, operation: Option<&str>) -> String {
+    let message = message.trim_end();
+    let operation_suffix = operation
+        .map(|operation| format!(" op={operation}"))
+        .unwrap_or_default();
+    if message.len() + operation_suffix.len() <= MAX_RECORD_BYTES {
+        return format!("{message}{operation_suffix}");
+    }
+    let mut end = MAX_RECORD_BYTES
+        .saturating_sub(TRUNCATION_SUFFIX.len())
+        .saturating_sub(operation_suffix.len());
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}{}{}",
+        &message[..end],
+        TRUNCATION_SUFFIX,
+        operation_suffix
+    )
 }
 
 pub(crate) fn safe_url(input: &str) -> String {
@@ -117,7 +206,7 @@ pub(crate) fn safe_url(input: &str) -> String {
 /// Remove credentials before any caller truncates the message. Also cover JSON
 /// escaping and URL encoding when a service echoes credentials in an error.
 pub(crate) fn request_message(message: &str, config: &crate::Config) -> String {
-    redact_request(message, config, None, &[])
+    redact_request(message, config, None, &[], &[])
 }
 
 /// Like [`request_message`], but also removes values captured by a running
@@ -129,7 +218,7 @@ pub(crate) fn request_message_with_sensitive_captures(
     config: &crate::Config,
     sensitive_captures: &[String],
 ) -> String {
-    redact_request(message, config, None, sensitive_captures)
+    redact_request(message, config, None, sensitive_captures, &[])
 }
 
 /// Include an in-flight prompt draft without replacing the saved credentials.
@@ -138,7 +227,32 @@ pub(crate) fn request_message_for_prompt(
     config: &crate::Config,
     prompt: &crate::rewrite::RewritePrompt,
 ) -> String {
-    redact_request(message, config, Some(prompt), &[])
+    redact_request(
+        message,
+        config,
+        Some(prompt),
+        &[],
+        &[prompt.prompt.as_str()],
+    )
+}
+
+/// Like [`request_message_for_prompt`], while also removing the selected text
+/// from an error a service may have echoed back.  Request and response bodies
+/// are never emitted by lifecycle logs; this is an additional boundary for
+/// user-facing errors that may be passed through a caller.
+pub(crate) fn request_message_for_prompt_and_input(
+    message: &str,
+    config: &crate::Config,
+    prompt: &crate::rewrite::RewritePrompt,
+    input: &str,
+) -> String {
+    redact_request(
+        message,
+        config,
+        Some(prompt),
+        &[],
+        &[prompt.prompt.as_str(), input],
+    )
 }
 
 fn redact_request(
@@ -146,6 +260,7 @@ fn redact_request(
     config: &crate::Config,
     prompt: Option<&crate::rewrite::RewritePrompt>,
     sensitive_captures: &[String],
+    additional_sensitive_values: &[&str],
 ) -> String {
     let prompts = || config.rewrite.prompts.iter().chain(prompt);
     let mut keys: Vec<&str> = vec![&config.token, &config.rewrite.api_key];
@@ -158,6 +273,7 @@ fn redact_request(
             .map(String::as_str),
     );
     keys.extend(sensitive_captures.iter().map(String::as_str));
+    keys.extend(additional_sensitive_values.iter().copied());
     let mut urls: Vec<&str> = vec![&config.api_endpoint, &config.rewrite.base_url];
     urls.extend(prompts().map(|prompt| prompt.base_url.as_str()));
     match &config.advanced_audio_api.remote_audio {
@@ -651,5 +767,32 @@ mod tests {
             &[capture],
         );
         assert_eq!(cleaned, "url=[redacted] raw=[redacted]");
+    }
+
+    #[test]
+    fn operation_ids_are_retained_when_messages_are_bounded() {
+        let scope = operation_scope("audio");
+        let message = bounded_message(&"中".repeat(MAX_RECORD_BYTES), Some(&scope.id));
+        assert!(message.ends_with(&format!(" op={}", scope.id)));
+        assert!(message.contains(TRUNCATION_SUFFIX));
+        assert!(message.len() <= MAX_RECORD_BYTES);
+    }
+
+    #[test]
+    fn prompt_and_selected_input_are_redacted_together() {
+        let config = crate::Config::default();
+        let prompt = crate::rewrite::RewritePrompt {
+            prompt: "private prompt".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            request_message_for_prompt_and_input(
+                "provider echoed private prompt and private selected text",
+                &config,
+                &prompt,
+                "private selected text",
+            ),
+            "provider echoed [redacted] and [redacted]"
+        );
     }
 }

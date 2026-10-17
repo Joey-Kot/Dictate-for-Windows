@@ -8,41 +8,129 @@ use tokio_util::sync::CancellationToken;
 use crate::{Config, additional_parameters};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Provider {
     #[default]
+    #[serde(rename = "custom_openai_compatible")]
     OpenaiCompatible,
+    #[serde(rename = "openai_responses")]
     OpenaiResponses,
+    #[serde(rename = "openai_chat_completions")]
     OpenaiCompletions,
-    Google,
+    #[serde(rename = "azure_openai_responses")]
+    AzureOpenaiResponses,
+    #[serde(rename = "azure_openai_chat_completions")]
+    AzureOpenaiChatCompletions,
+    #[serde(rename = "anthropic_claude")]
     Anthropic,
-    Deepseek,
-    Qwen,
+    #[serde(rename = "google_gemini")]
+    Google,
+    #[serde(rename = "google_vertex_ai")]
+    VertexAi,
+    #[serde(rename = "xai_grok")]
+    Xai,
+    #[serde(rename = "alibaba_qwen_text")]
+    QwenText,
+    #[serde(rename = "alibaba_qwen_multimodal")]
+    QwenMultimodal,
+    #[serde(rename = "moonshot_ai_kimi")]
+    Kimi,
+    #[serde(rename = "z_ai_glm")]
     Glm,
+    #[serde(rename = "deepseek_deepseek")]
+    Deepseek,
+    #[serde(rename = "volcengine_ark_chat_completions")]
+    VolcengineArkChatCompletions,
+    #[serde(rename = "volcengine_ark_responses")]
+    VolcengineArkResponses,
+    #[serde(rename = "baidu_qianfan")]
+    BaiduQianfan,
+    #[serde(rename = "tencent_tokenhub")]
+    TencentTokenHub,
+    #[serde(rename = "minimax_chat_completion_v2")]
+    MinimaxChatCompletionV2,
+    #[serde(rename = "mistral_ai_mistral")]
+    Mistral,
+    #[serde(rename = "groq_cloud")]
+    Groq,
+    #[serde(rename = "cohere_compatibility_api")]
+    Cohere,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireFormat {
+    OpenaiChat,
+    OpenaiResponses,
+    Gemini,
+    Anthropic,
+    DashscopeText,
+    DashscopeMultimodal,
+    MinimaxChatCompletionV2,
 }
 
 impl Provider {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 22] = [
         Self::OpenaiCompatible,
         Self::OpenaiResponses,
         Self::OpenaiCompletions,
-        Self::Google,
+        Self::AzureOpenaiResponses,
+        Self::AzureOpenaiChatCompletions,
         Self::Anthropic,
-        Self::Deepseek,
-        Self::Qwen,
+        Self::Google,
+        Self::VertexAi,
+        Self::Xai,
+        Self::QwenText,
+        Self::QwenMultimodal,
+        Self::Kimi,
         Self::Glm,
+        Self::Deepseek,
+        Self::VolcengineArkChatCompletions,
+        Self::VolcengineArkResponses,
+        Self::BaiduQianfan,
+        Self::TencentTokenHub,
+        Self::MinimaxChatCompletionV2,
+        Self::Mistral,
+        Self::Groq,
+        Self::Cohere,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::OpenaiCompatible => "OpenAI-Compatible",
-            Self::OpenaiResponses => "OpenAI Responses",
-            Self::OpenaiCompletions => "OpenAI Completions",
-            Self::Google => "Google",
-            Self::Anthropic => "Anthropic",
-            Self::Deepseek => "DeepSeek",
-            Self::Qwen => "Qwen",
-            Self::Glm => "GLM",
+            Self::OpenaiCompatible => "Custom / OpenAI-Compatible",
+            Self::OpenaiResponses => "OpenAI / Responses",
+            Self::OpenaiCompletions => "OpenAI / Chat Completions",
+            Self::AzureOpenaiResponses => "Azure OpenAI / Responses",
+            Self::AzureOpenaiChatCompletions => "Azure OpenAI / Chat Completions",
+            Self::Anthropic => "Anthropic / Claude",
+            Self::Google => "Google / Gemini",
+            Self::VertexAi => "Google / Vertex AI",
+            Self::Xai => "xAI / Grok",
+            Self::QwenText => "Alibaba / Qwen Text",
+            Self::QwenMultimodal => "Alibaba / Qwen Multimodal",
+            Self::Kimi => "Moonshot AI / Kimi",
+            Self::Glm => "Z.AI / GLM",
+            Self::Deepseek => "DeepSeek / DeepSeek",
+            Self::VolcengineArkChatCompletions => "Volcengine / Ark / Chat Completions",
+            Self::VolcengineArkResponses => "Volcengine / Ark / Responses",
+            Self::BaiduQianfan => "Baidu / Qianfan",
+            Self::TencentTokenHub => "Tencent / TokenHub",
+            Self::MinimaxChatCompletionV2 => "MiniMax / ChatCompletion V2",
+            Self::Mistral => "Mistral AI / Mistral",
+            Self::Groq => "Groq / Cloud",
+            Self::Cohere => "Cohere / Compatibility API",
+        }
+    }
+
+    const fn wire_format(self) -> WireFormat {
+        match self {
+            Self::OpenaiResponses | Self::AzureOpenaiResponses | Self::VolcengineArkResponses => {
+                WireFormat::OpenaiResponses
+            }
+            Self::Google | Self::VertexAi => WireFormat::Gemini,
+            Self::Anthropic => WireFormat::Anthropic,
+            Self::QwenText => WireFormat::DashscopeText,
+            Self::QwenMultimodal => WireFormat::DashscopeMultimodal,
+            Self::MinimaxChatCompletionV2 => WireFormat::MinimaxChatCompletionV2,
+            _ => WireFormat::OpenaiChat,
         }
     }
 }
@@ -174,23 +262,37 @@ pub fn build_request(
         ));
     }
     let mut base = json!({"model":api.model.trim()});
-    match api.provider {
-        Provider::OpenaiResponses => {
+    match api.provider.wire_format() {
+        WireFormat::OpenaiResponses => {
             base["instructions"] = json!(prompt.prompt);
             base["input"] = json!([{"role":"user","content":input}]);
         }
-        Provider::Google => {
+        WireFormat::Gemini => {
             base["systemInstruction"] = json!({"parts":[{"text":prompt.prompt}]});
             base["contents"] = json!([{"role":"user","parts":[{"text":input}]}]);
         }
-        Provider::Anthropic => {
+        WireFormat::Anthropic => {
             base["system"] = json!(prompt.prompt);
             base["max_tokens"] = json!(4096);
             base["messages"] = json!([{"role":"user","content":input}]);
         }
-        _ => {
+        WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => {
             base["messages"] =
                 json!([{"role":"system","content":prompt.prompt},{"role":"user","content":input}])
+        }
+        WireFormat::DashscopeText => {
+            base["input"] = json!({"messages":[
+                {"role":"system","content":prompt.prompt},
+                {"role":"user","content":input}
+            ]});
+            base["parameters"] = json!({"result_format":"message","incremental_output":true});
+        }
+        WireFormat::DashscopeMultimodal => {
+            base["input"] = json!({"messages":[
+                {"role":"system","content":prompt.prompt},
+                {"role":"user","content":[{"text":input}]}
+            ]});
+            base["parameters"] = json!({"result_format":"message","incremental_output":true});
         }
     }
     let extra = additional_parameters::parse(&prompt.extra_config)
@@ -210,9 +312,16 @@ pub fn build_request(
             ("anthropic-version", "2023-06-01".into()),
         ],
         Provider::Google => vec![("x-goog-api-key", api.api_key.to_owned())],
+        Provider::AzureOpenaiResponses | Provider::AzureOpenaiChatCompletions => {
+            vec![("api-key", api.api_key.to_owned())]
+        }
+        Provider::QwenText | Provider::QwenMultimodal => vec![
+            ("Authorization", format!("Bearer {}", api.api_key)),
+            ("X-DashScope-SSE", "enable".into()),
+        ],
         _ => vec![("Authorization", format!("Bearer {}", api.api_key))],
     };
-    if api.provider == Provider::Google {
+    if api.provider.wire_format() == WireFormat::Gemini {
         body.as_object_mut().unwrap().remove("model");
     }
     Ok(Request {
@@ -236,7 +345,7 @@ fn endpoint(base: &str, provider: Provider, model: &str) -> Result<reqwest::Url,
         return Err(invalid());
     }
     let mut path = url.path().trim_end_matches('/').to_owned();
-    if provider == Provider::Google {
+    if provider.wire_format() == WireFormat::Gemini {
         let model = model.strip_prefix("models/").unwrap_or(model);
         if model.is_empty() || model.contains(['/', '?', '#']) {
             return Err(RewriteError::Configuration(
@@ -249,21 +358,40 @@ fn endpoint(base: &str, provider: Provider, model: &str) -> Result<reqwest::Url,
             .unwrap_or("")
             .trim_end_matches('/')
             .to_owned();
-        if path.is_empty() {
+        if provider == Provider::VertexAi {
+            if !is_vertex_publisher_path(&path) {
+                return Err(RewriteError::Configuration(
+                    "Vertex AI Base URL must include /v1/projects/{project}/locations/{location}/publishers/google".into(),
+                ));
+            }
+        } else if path.is_empty() {
             path = "/v1beta".into();
         }
         path.push_str(&format!("/models/{model}:generateContent"));
     } else {
-        let suffix = match provider {
-            Provider::OpenaiResponses => "/responses",
-            Provider::Anthropic => "/messages",
-            _ => "/chat/completions",
+        let suffix = match provider.wire_format() {
+            WireFormat::OpenaiResponses => "/responses",
+            WireFormat::Anthropic => "/messages",
+            WireFormat::OpenaiChat => "/chat/completions",
+            WireFormat::Gemini => unreachable!("Gemini endpoints are handled above"),
+            WireFormat::DashscopeText => "/services/aigc/text-generation/generation",
+            WireFormat::DashscopeMultimodal => "/services/aigc/multimodal-generation/generation",
+            WireFormat::MinimaxChatCompletionV2 => "/text/chatcompletion_v2",
         };
         if path.is_empty() {
             path = match provider {
                 Provider::Deepseek => "",
-                Provider::Qwen => "/compatible-mode/v1",
+                Provider::QwenText | Provider::QwenMultimodal => "/api/v1",
                 Provider::Glm => "/api/paas/v4",
+                Provider::AzureOpenaiResponses | Provider::AzureOpenaiChatCompletions => {
+                    "/openai/v1"
+                }
+                Provider::VolcengineArkChatCompletions | Provider::VolcengineArkResponses => {
+                    "/api/v3"
+                }
+                Provider::BaiduQianfan => "/v2",
+                Provider::Groq => "/openai/v1",
+                Provider::Cohere => "/compatibility/v1",
                 _ => "/v1",
             }
             .into();
@@ -276,6 +404,24 @@ fn endpoint(base: &str, provider: Provider, model: &str) -> Result<reqwest::Url,
     Ok(url)
 }
 
+fn is_vertex_publisher_path(path: &str) -> bool {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 7 {
+        return false;
+    }
+    let tail = &segments[segments.len() - 7..];
+    tail[0] == "v1"
+        && tail[1] == "projects"
+        && !tail[2].is_empty()
+        && tail[3] == "locations"
+        && !tail[4].is_empty()
+        && tail[5] == "publishers"
+        && tail[6] == "google"
+}
+
 fn blocks(value: &Value, allowed: &str) -> String {
     value
         .as_array()
@@ -286,42 +432,31 @@ fn blocks(value: &Value, allowed: &str) -> String {
         .collect()
 }
 
+fn dashscope_text(value: &Value) -> String {
+    value.as_str().map(str::to_owned).unwrap_or_else(|| {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block["text"].as_str())
+            .collect()
+    })
+}
+
 fn validate_finish_reason(provider: Provider, reason: &Value) -> Result<(), RewriteError> {
     let Some(reason) = reason.as_str() else {
         return Ok(());
     };
     // Some compatible services omit the reason or add their own values. Reject the
     // documented nonfinal outcomes without requiring every service to use "stop".
-    let incomplete = match provider {
-        Provider::Anthropic => matches!(
+    let incomplete = match provider.wire_format() {
+        WireFormat::Anthropic => matches!(
             reason,
             "max_tokens" | "tool_use" | "pause_turn" | "refusal" | "model_context_window_exceeded"
         ),
-        Provider::Google => matches!(
-            reason,
-            "MAX_TOKENS"
-                | "SAFETY"
-                | "RECITATION"
-                | "LANGUAGE"
-                | "OTHER"
-                | "BLOCKLIST"
-                | "PROHIBITED_CONTENT"
-                | "SPII"
-                | "MALFORMED_FUNCTION_CALL"
-                | "UNEXPECTED_TOOL_CALL"
-                | "TOO_MANY_TOOL_CALLS"
-                | "MISSING_THOUGHT_SIGNATURE"
-                | "MALFORMED_RESPONSE"
-                | "ESCALATION"
-                | "PUP_LIMITED_DISABLED"
-                | "IMAGE_SAFETY"
-                | "IMAGE_PROHIBITED_CONTENT"
-                | "IMAGE_OTHER"
-                | "NO_IMAGE"
-                | "IMAGE_RECITATION"
-        ),
-        Provider::OpenaiResponses => false,
-        _ => matches!(
+        WireFormat::Gemini => !matches!(reason, "STOP" | "FINISH_REASON_STOP"),
+        WireFormat::OpenaiResponses => false,
+        WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => matches!(
             reason,
             "length"
                 | "content_filter"
@@ -330,6 +465,12 @@ fn validate_finish_reason(provider: Provider, reason: &Value) -> Result<(), Rewr
                 | "insufficient_system_resource"
                 | "aborted"
         ),
+        // DashScope sends the literal string "null" in intermediate SSE
+        // packets. It is not a terminal result, but it is a valid streaming
+        // state while waiting for the final `stop` packet.
+        WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => {
+            !matches!(reason, "stop" | "null")
+        }
     };
     if incomplete {
         Err(RewriteError::Response(format!(
@@ -341,11 +482,32 @@ fn validate_finish_reason(provider: Provider, reason: &Value) -> Result<(), Rewr
     }
 }
 
-pub fn parse_text(provider: Provider, value: &Value) -> Result<String, RewriteError> {
-    if value.get("error").is_some_and(|error| !error.is_null()) || value["type"] == "error" {
-        return Err(stream_error(value));
+fn validate_terminal_finish_reason(provider: Provider, reason: &Value) -> Result<(), RewriteError> {
+    if matches!(
+        provider.wire_format(),
+        WireFormat::Gemini | WireFormat::DashscopeText | WireFormat::DashscopeMultimodal
+    ) && !reason.as_str().is_some_and(|reason| !reason.is_empty())
+    {
+        return Err(RewriteError::Response(format!(
+            "Rewrite response is not complete ({}: missing finishReason)",
+            provider.label()
+        )));
     }
-    if provider == Provider::OpenaiResponses
+    if matches!(
+        provider.wire_format(),
+        WireFormat::DashscopeText | WireFormat::DashscopeMultimodal
+    ) && reason.as_str() == Some("null")
+    {
+        return Err(RewriteError::Response(format!(
+            "Rewrite response is not complete ({}: null)",
+            provider.label()
+        )));
+    }
+    validate_finish_reason(provider, reason)
+}
+
+fn validate_response_status(provider: Provider, value: &Value) -> Result<(), RewriteError> {
+    if provider.wire_format() == WireFormat::OpenaiResponses
         && matches!(
             value["status"].as_str(),
             Some("failed" | "incomplete" | "cancelled" | "in_progress" | "queued")
@@ -355,14 +517,32 @@ pub fn parse_text(provider: Provider, value: &Value) -> Result<String, RewriteEr
             "Rewrite response is not complete".into(),
         ));
     }
-    let reason = match provider {
-        Provider::Anthropic => &value["stop_reason"],
-        Provider::Google => &value["candidates"][0]["finishReason"],
-        _ => &value["choices"][0]["finish_reason"],
-    };
-    validate_finish_reason(provider, reason)?;
-    let text = match provider {
-        Provider::OpenaiResponses => value["output_text"]
+    Ok(())
+}
+
+pub fn parse_text(provider: Provider, value: &Value) -> Result<String, RewriteError> {
+    if value.get("error").is_some_and(|error| !error.is_null()) || value["type"] == "error" {
+        return Err(stream_error(value));
+    }
+    validate_response_status(provider, value)?;
+    match provider.wire_format() {
+        WireFormat::Anthropic => validate_finish_reason(provider, &value["stop_reason"])?,
+        WireFormat::Gemini => {
+            validate_terminal_finish_reason(provider, &value["candidates"][0]["finishReason"])?
+        }
+        WireFormat::OpenaiResponses => {}
+        WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => {
+            validate_finish_reason(provider, &value["choices"][0]["finish_reason"])?
+        }
+        WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => {
+            validate_terminal_finish_reason(
+                provider,
+                &value["output"]["choices"][0]["finish_reason"],
+            )?
+        }
+    }
+    let text = match provider.wire_format() {
+        WireFormat::OpenaiResponses => value["output_text"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| {
@@ -374,20 +554,23 @@ pub fn parse_text(provider: Provider, value: &Value) -> Result<String, RewriteEr
                     .map(|v| blocks(&v["content"], "output_text"))
                     .collect()
             }),
-        Provider::Anthropic => blocks(&value["content"], "text"),
-        Provider::Google => value["candidates"][0]["content"]["parts"]
+        WireFormat::Anthropic => blocks(&value["content"], "text"),
+        WireFormat::Gemini => value["candidates"][0]["content"]["parts"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|v| v["thought"] != true)
             .filter_map(|v| v["text"].as_str())
             .collect(),
-        _ => {
+        WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => {
             let content = &value["choices"][0]["message"]["content"];
             content
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| blocks(content, "text"))
+        }
+        WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => {
+            dashscope_text(&value["output"]["choices"][0]["message"]["content"])
         }
     };
     if text.trim().is_empty() {
@@ -464,35 +647,49 @@ pub fn parse_stream(provider: Provider, response: &str) -> Result<String, Rewrit
             let payload = data.join("\n");
             data.clear();
             if payload == "[DONE]" {
-                completed = true;
+                if !matches!(
+                    provider.wire_format(),
+                    WireFormat::Gemini
+                        | WireFormat::DashscopeText
+                        | WireFormat::DashscopeMultimodal
+                ) {
+                    completed = true;
+                }
                 name.clear();
                 continue;
             }
             let root: Value = serde_json::from_str(&payload)
                 .map_err(|e| RewriteError::Response(format!("Invalid rewrite stream: {e}")))?;
             let kind = root["type"].as_str().unwrap_or(&name);
-            if root.get("error").is_some() || matches!(kind, "error" | "response.failed") {
+            if root.get("error").is_some()
+                || matches!(kind, "error" | "response.failed")
+                || (matches!(
+                    provider.wire_format(),
+                    WireFormat::DashscopeText | WireFormat::DashscopeMultimodal
+                ) && root.get("code").is_some()
+                    && root.get("message").is_some())
+            {
                 return Err(stream_error(&root));
             }
             if kind == "response.incomplete" {
                 return Err(RewriteError::Response("Incomplete rewrite stream".into()));
             }
-            match provider {
-                Provider::OpenaiResponses => match kind {
+            match provider.wire_format() {
+                WireFormat::OpenaiResponses => match kind {
                     "response.output_text.delta" => {
                         text.push_str(root["delta"].as_str().unwrap_or(""))
                     }
                     "response.completed" => {
+                        let result = &root["response"];
+                        validate_response_status(provider, result)?;
                         completed = true;
-                        if root["response"].get("output").is_some()
-                            || root["response"].get("output_text").is_some()
-                        {
-                            final_text = Some(parse_text(provider, &root["response"])?);
+                        if result.get("output").is_some() || result.get("output_text").is_some() {
+                            final_text = Some(parse_text(provider, result)?);
                         }
                     }
                     _ => {}
                 },
-                Provider::Anthropic => match kind {
+                WireFormat::Anthropic => match kind {
                     "content_block_start" if root["content_block"]["type"] == "text" => {
                         text.push_str(root["content_block"]["text"].as_str().unwrap_or(""))
                     }
@@ -505,7 +702,7 @@ pub fn parse_stream(provider: Provider, response: &str) -> Result<String, Rewrit
                     "message_stop" => completed = true,
                     _ => {}
                 },
-                Provider::Google => {
+                WireFormat::Gemini => {
                     let candidate = &root["candidates"][0];
                     validate_finish_reason(provider, &candidate["finishReason"])?;
                     for part in candidate["content"]["parts"]
@@ -517,14 +714,14 @@ pub fn parse_stream(provider: Provider, response: &str) -> Result<String, Rewrit
                             text.push_str(part["text"].as_str().unwrap_or(""));
                         }
                     }
-                    if candidate["finishReason"]
-                        .as_str()
-                        .is_some_and(|s| !s.is_empty() && s != "FINISH_REASON_UNSPECIFIED")
-                    {
+                    if matches!(
+                        candidate["finishReason"].as_str(),
+                        Some("STOP" | "FINISH_REASON_STOP")
+                    ) {
                         completed = true;
                     }
                 }
-                _ => {
+                WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => {
                     for choice in root["choices"].as_array().into_iter().flatten() {
                         if choice["index"].as_u64().unwrap_or(0) != 0 {
                             continue;
@@ -532,6 +729,16 @@ pub fn parse_stream(provider: Provider, response: &str) -> Result<String, Rewrit
                         validate_finish_reason(provider, &choice["finish_reason"])?;
                         text.push_str(choice["delta"]["content"].as_str().unwrap_or(""));
                         if choice.get("finish_reason").is_some_and(|v| !v.is_null()) {
+                            completed = true;
+                        }
+                    }
+                }
+                WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => {
+                    let choice = &root["output"]["choices"][0];
+                    if !choice.is_null() {
+                        validate_finish_reason(provider, &choice["finish_reason"])?;
+                        text.push_str(&dashscope_text(&choice["message"]["content"]));
+                        if choice["finish_reason"] == "stop" {
                             completed = true;
                         }
                     }
@@ -581,10 +788,33 @@ impl RewriteClient {
             model: prompt.model.clone(),
             ..Default::default()
         };
-        self.debug(&probe, format_args!("[upload] Rewrite connectivity test"));
-        self.execute(&probe, "Connection test.", cancel, false)
+        self.debug(
+            &probe,
+            format_args!("[upload] rewrite event=connectivity-start"),
+        );
+        let started = std::time::Instant::now();
+        let result = self
+            .execute(&probe, "Connection test.", cancel, false)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        match &result {
+            Ok(()) => self.debug(
+                &probe,
+                format_args!(
+                    "[upload] rewrite event=connectivity-complete elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
+            ),
+            Err(error) => self.debug(
+                &probe,
+                format_args!(
+                    "[upload] rewrite event=connectivity-failed kind={} elapsed_ms={}",
+                    rewrite_error_kind(error),
+                    started.elapsed().as_millis()
+                ),
+            ),
+        }
+        result
     }
 
     pub async fn execute(
@@ -597,17 +827,17 @@ impl RewriteClient {
         if cancel.is_cancelled() {
             self.debug(
                 prompt,
-                format_args!("[upload] Rewrite canceled before request"),
+                format_args!("[upload] rewrite event=canceled phase=before-request"),
             );
             return Err(RewriteError::Canceled);
         }
         let request = match build_request(&self.config.rewrite, prompt, input) {
             Ok(request) => request,
             Err(error) => {
-                let error = self.redact(error, prompt);
+                let error = self.redact(error, prompt, input);
                 self.debug(
                     prompt,
-                    format_args!("[upload] Rewrite configuration error: {error}"),
+                    format_args!("[upload] rewrite event=failed kind=configuration"),
                 );
                 return Err(error);
             }
@@ -622,7 +852,7 @@ impl RewriteClient {
             if cancel.is_cancelled() {
                 self.debug(
                     prompt,
-                    format_args!("[upload] Rewrite canceled before request"),
+                    format_args!("[upload] rewrite event=canceled phase=before-request"),
                 );
                 return Err(RewriteError::Canceled);
             }
@@ -630,20 +860,21 @@ impl RewriteClient {
             self.debug(
                 prompt,
                 format_args!(
-                    "[upload] Rewrite {} attempt {attempt}/{attempts}: POST {}",
+                    "[upload] rewrite event=request-start provider={} attempt={attempt} total={attempts} method=POST endpoint={} request_bytes={}",
                     request.provider.label(),
                     crate::debug_log::safe_url(request.url.as_str()),
+                    request.body.to_string().len(),
                 ),
             );
             let result = self
                 .once(&request, prompt, cancel)
                 .await
-                .map_err(|error| self.redact(error, prompt));
+                .map_err(|error| self.redact(error, prompt, input));
             match &result {
                 Ok(text) => self.debug(
                     prompt,
                     format_args!(
-                        "[upload] Rewrite completed, characters={}, elapsed={}ms",
+                        "[upload] rewrite event=completed characters={} elapsed_ms={}",
                         text.chars().count(),
                         started.elapsed().as_millis()
                     ),
@@ -651,8 +882,9 @@ impl RewriteClient {
                 Err(error) => self.debug(
                     prompt,
                     format_args!(
-                        "[upload] Rewrite attempt {attempt} failed, elapsed={}ms: {error}",
-                        started.elapsed().as_millis()
+                        "[upload] rewrite event=attempt-failed attempt={attempt} kind={} elapsed_ms={}",
+                        rewrite_error_kind(error),
+                        started.elapsed().as_millis(),
                     ),
                 ),
             }
@@ -662,11 +894,14 @@ impl RewriteClient {
                 }) if attempt < attempts => {
                     self.debug(
                         prompt,
-                        format_args!("[upload] Rewrite retry in {:.3}s", delay.min(86400.0)),
+                        format_args!(
+                            "[upload] rewrite event=retry delay_ms={}",
+                            Duration::from_secs_f64(delay.min(86400.0)).as_millis()
+                        ),
                     );
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            self.debug(prompt, format_args!("[upload] Rewrite canceled during retry wait"));
+                            self.debug(prompt, format_args!("[upload] rewrite event=canceled phase=retry-wait"));
                             return Err(RewriteError::Canceled);
                         },
                         _ = tokio::time::sleep(Duration::from_secs_f64(delay.min(86400.0))) => {}
@@ -686,6 +921,7 @@ impl RewriteClient {
         cancel: &CancellationToken,
     ) -> Result<String, RewriteError> {
         let operation = async {
+            let started = std::time::Instant::now();
             let mut builder = self
                 .client
                 .post(request.url.clone())
@@ -695,7 +931,19 @@ impl RewriteClient {
             for (key, value) in &request.headers {
                 builder = builder.header(*key, value);
             }
-            let mut response = builder.send().await.map_err(|e| self.network_error(e))?;
+            let mut response = match builder.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    self.debug(
+                        prompt,
+                        format_args!(
+                            "[upload] rewrite event=request-failed kind=network elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                    return Err(self.network_error(error));
+                }
+            };
             let status = response.status();
             let stream = response
                 .headers()
@@ -704,40 +952,103 @@ impl RewriteClient {
                 .is_some_and(|h| h.to_ascii_lowercase().contains("text/event-stream"));
             self.debug(
                 prompt,
-                format_args!("[upload] Rewrite HTTP {status}, SSE={stream}"),
+                format_args!(
+                    "[upload] rewrite event=response-headers status={} stream={} elapsed_ms={}",
+                    status.as_u16(),
+                    stream,
+                    started.elapsed().as_millis()
+                ),
             );
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|e| self.network_error(e))? {
+            let mut chunks = 0usize;
+            while let Some(chunk) = match response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.debug(
+                        prompt,
+                        format_args!(
+                            "[upload] rewrite event=response-read-failed kind=network elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                    return Err(self.network_error(error));
+                }
+            } {
                 if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                    self.debug(
+                        prompt,
+                        format_args!("[upload] rewrite event=response-read-failed kind=too-large"),
+                    );
                     return Err(RewriteError::Response(
                         "Rewrite response exceeds 2 MiB".into(),
                     ));
                 }
                 bytes.extend_from_slice(&chunk);
+                chunks += 1;
             }
-            let body = String::from_utf8(bytes)
-                .map_err(|_| RewriteError::Response("Rewrite response is not UTF-8".into()))?;
+            self.debug(
+                prompt,
+                format_args!(
+                    "[upload] rewrite event=response-complete status={} bytes={} chunks={} elapsed_ms={}",
+                    status.as_u16(),
+                    bytes.len(),
+                    chunks,
+                    started.elapsed().as_millis()
+                ),
+            );
+            let body = match String::from_utf8(bytes) {
+                Ok(body) => body,
+                Err(_) => {
+                    self.debug(
+                        prompt,
+                        format_args!("[upload] rewrite event=parse-failed kind=encoding"),
+                    );
+                    return Err(RewriteError::Response(
+                        "Rewrite response is not UTF-8".into(),
+                    ));
+                }
+            };
             if !status.is_success() {
-                let summary: String =
-                    crate::debug_log::request_message_for_prompt(&body, &self.config, prompt)
-                        .chars()
-                        .take(500)
-                        .collect();
+                self.debug(
+                    prompt,
+                    format_args!(
+                        "[upload] rewrite event=response-rejected status={} response_bytes={}",
+                        status.as_u16(),
+                        body.len()
+                    ),
+                );
                 return Err(RewriteError::Request {
-                    message: format!("HTTP {status}: {summary}"),
+                    message: format!("HTTP {status}: {body}"),
                     retryable: matches!(status.as_u16(), 408 | 429 | 500..=599),
                 });
             }
-            if stream {
+            let result = if stream {
                 parse_stream(request.provider, &body)
             } else {
-                parse_text(
-                    request.provider,
-                    &serde_json::from_str(&body).map_err(|e| {
-                        RewriteError::Response(format!("Invalid rewrite JSON: {e}"))
-                    })?,
-                )
+                match serde_json::from_str(&body) {
+                    Ok(response) => parse_text(request.provider, &response),
+                    Err(error) => Err(RewriteError::Response(format!(
+                        "Invalid rewrite JSON: {error}"
+                    ))),
+                }
+            };
+            match &result {
+                Ok(text) => self.debug(
+                    prompt,
+                    format_args!(
+                        "[upload] rewrite event=parse-complete characters={}",
+                        text.chars().count()
+                    ),
+                ),
+                Err(error) => self.debug(
+                    prompt,
+                    format_args!(
+                        "[upload] rewrite event=parse-failed kind={}",
+                        rewrite_error_kind(error)
+                    ),
+                ),
             }
+            result
         };
         tokio::select! { biased;
             _ = cancel.cancelled() => Err(RewriteError::Canceled),
@@ -745,12 +1056,17 @@ impl RewriteClient {
         }
     }
 
-    fn redact(&self, error: RewriteError, prompt: &RewritePrompt) -> RewriteError {
+    fn redact(&self, error: RewriteError, prompt: &RewritePrompt, input: &str) -> RewriteError {
         let clean = |message: String| {
-            crate::debug_log::request_message_for_prompt(&message, &self.config, prompt)
-                .chars()
-                .take(800)
-                .collect()
+            crate::debug_log::request_message_for_prompt_and_input(
+                &message,
+                &self.config,
+                prompt,
+                input,
+            )
+            .chars()
+            .take(800)
+            .collect()
         };
         match error {
             RewriteError::Request { message, retryable } => RewriteError::Request {
@@ -785,6 +1101,16 @@ impl RewriteClient {
     }
 }
 
+fn rewrite_error_kind(error: &RewriteError) -> &'static str {
+    match error {
+        RewriteError::Canceled => "canceled",
+        RewriteError::Configuration(_) => "configuration",
+        RewriteError::Response(_) => "response",
+        RewriteError::Request { message, .. } if message.starts_with("HTTP ") => "http",
+        RewriteError::Request { .. } => "network",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +1123,110 @@ mod tests {
             model: "default".into(),
             prompts: vec![],
         }
+    }
+
+    #[test]
+    fn provider_catalog_uses_confirmed_ids_labels_and_order() {
+        let expected = [
+            (
+                Provider::OpenaiCompatible,
+                "custom_openai_compatible",
+                "Custom / OpenAI-Compatible",
+            ),
+            (
+                Provider::OpenaiResponses,
+                "openai_responses",
+                "OpenAI / Responses",
+            ),
+            (
+                Provider::OpenaiCompletions,
+                "openai_chat_completions",
+                "OpenAI / Chat Completions",
+            ),
+            (
+                Provider::AzureOpenaiResponses,
+                "azure_openai_responses",
+                "Azure OpenAI / Responses",
+            ),
+            (
+                Provider::AzureOpenaiChatCompletions,
+                "azure_openai_chat_completions",
+                "Azure OpenAI / Chat Completions",
+            ),
+            (
+                Provider::Anthropic,
+                "anthropic_claude",
+                "Anthropic / Claude",
+            ),
+            (Provider::Google, "google_gemini", "Google / Gemini"),
+            (Provider::VertexAi, "google_vertex_ai", "Google / Vertex AI"),
+            (Provider::Xai, "xai_grok", "xAI / Grok"),
+            (
+                Provider::QwenText,
+                "alibaba_qwen_text",
+                "Alibaba / Qwen Text",
+            ),
+            (
+                Provider::QwenMultimodal,
+                "alibaba_qwen_multimodal",
+                "Alibaba / Qwen Multimodal",
+            ),
+            (Provider::Kimi, "moonshot_ai_kimi", "Moonshot AI / Kimi"),
+            (Provider::Glm, "z_ai_glm", "Z.AI / GLM"),
+            (
+                Provider::Deepseek,
+                "deepseek_deepseek",
+                "DeepSeek / DeepSeek",
+            ),
+            (
+                Provider::VolcengineArkChatCompletions,
+                "volcengine_ark_chat_completions",
+                "Volcengine / Ark / Chat Completions",
+            ),
+            (
+                Provider::VolcengineArkResponses,
+                "volcengine_ark_responses",
+                "Volcengine / Ark / Responses",
+            ),
+            (Provider::BaiduQianfan, "baidu_qianfan", "Baidu / Qianfan"),
+            (
+                Provider::TencentTokenHub,
+                "tencent_tokenhub",
+                "Tencent / TokenHub",
+            ),
+            (
+                Provider::MinimaxChatCompletionV2,
+                "minimax_chat_completion_v2",
+                "MiniMax / ChatCompletion V2",
+            ),
+            (
+                Provider::Mistral,
+                "mistral_ai_mistral",
+                "Mistral AI / Mistral",
+            ),
+            (Provider::Groq, "groq_cloud", "Groq / Cloud"),
+            (
+                Provider::Cohere,
+                "cohere_compatibility_api",
+                "Cohere / Compatibility API",
+            ),
+        ];
+        assert_eq!(Provider::ALL.len(), expected.len());
+        for (index, (provider, id, label)) in expected.into_iter().enumerate() {
+            assert_eq!(Provider::ALL[index], provider);
+            assert_eq!(provider.label(), label);
+            assert_eq!(
+                serde_json::to_value(provider).unwrap(),
+                Value::String(id.into())
+            );
+            assert_eq!(
+                serde_json::from_value::<Provider>(Value::String(id.into())).unwrap(),
+                provider
+            );
+        }
+        assert!(
+            serde_json::from_value::<Provider>(Value::String("openai_compatible".into())).is_err()
+        );
     }
 
     #[test]
@@ -821,8 +1251,13 @@ mod tests {
             ),
             (Provider::Deepseek, "/chat/completions", "Authorization"),
             (
-                Provider::Qwen,
-                "/compatible-mode/v1/chat/completions",
+                Provider::QwenText,
+                "/api/v1/services/aigc/text-generation/generation",
+                "Authorization",
+            ),
+            (
+                Provider::QwenMultimodal,
+                "/api/v1/services/aigc/multimodal-generation/generation",
                 "Authorization",
             ),
             (
@@ -830,20 +1265,80 @@ mod tests {
                 "/api/paas/v4/chat/completions",
                 "Authorization",
             ),
+            (
+                Provider::AzureOpenaiResponses,
+                "/openai/v1/responses",
+                "api-key",
+            ),
+            (
+                Provider::AzureOpenaiChatCompletions,
+                "/openai/v1/chat/completions",
+                "api-key",
+            ),
+            (
+                Provider::VertexAi,
+                "/v1/projects/project/locations/global/publishers/google/models/override:generateContent",
+                "Authorization",
+            ),
+            (Provider::Kimi, "/v1/chat/completions", "Authorization"),
+            (
+                Provider::VolcengineArkChatCompletions,
+                "/api/v3/chat/completions",
+                "Authorization",
+            ),
+            (
+                Provider::VolcengineArkResponses,
+                "/api/v3/responses",
+                "Authorization",
+            ),
+            (
+                Provider::BaiduQianfan,
+                "/v2/chat/completions",
+                "Authorization",
+            ),
+            (
+                Provider::TencentTokenHub,
+                "/v1/chat/completions",
+                "Authorization",
+            ),
+            (
+                Provider::MinimaxChatCompletionV2,
+                "/v1/text/chatcompletion_v2",
+                "Authorization",
+            ),
+            (Provider::Mistral, "/v1/chat/completions", "Authorization"),
+            (Provider::Xai, "/v1/chat/completions", "Authorization"),
+            (
+                Provider::Groq,
+                "/openai/v1/chat/completions",
+                "Authorization",
+            ),
+            (
+                Provider::Cohere,
+                "/compatibility/v1/chat/completions",
+                "Authorization",
+            ),
         ] {
             let prompt = RewritePrompt {
                 prompt: "Translate".into(),
-                extra_config: r#"{"model":"override"}"#.into(),
+                extra_config: r#"{"model":"override","metadata":{"source":"test"}}"#.into(),
                 ..Default::default()
             };
-            let request = build_request(&config(provider), &prompt, "hello").unwrap();
+            let mut api = config(provider);
+            if provider == Provider::VertexAi {
+                api.base_url =
+                    "https://example.com/v1/projects/project/locations/global/publishers/google"
+                        .into();
+            }
+            let request = build_request(&api, &prompt, "hello").unwrap();
             assert_eq!(request.url.path(), path);
             assert_eq!(request.headers[0].0, header);
-            if provider == Provider::Google {
+            if provider.wire_format() == WireFormat::Gemini {
                 assert!(request.body.get("model").is_none());
             } else {
                 assert_eq!(request.body["model"], "override");
             }
+            assert_eq!(request.body["metadata"]["source"], "test");
             assert!(request.body.to_string().contains("hello"));
             assert!(request.body.to_string().contains("Translate"));
         }
@@ -952,11 +1447,12 @@ mod tests {
             "/custom/chat/completions"
         );
         assert!(endpoint("https://example.com?token=x", Provider::Google, "m").is_err());
+        assert!(endpoint("https://example.com", Provider::VertexAi, "m").is_err());
     }
 
     #[test]
     fn provider_text_parsing_excludes_reasoning_and_empty_results() {
-        assert_eq!(parse_text(Provider::Google, &json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"private"},{"text":"output"}]}}]})).unwrap(), "output");
+        assert_eq!(parse_text(Provider::Google, &json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"private"},{"text":"output"}]},"finishReason":"STOP"}]})).unwrap(), "output");
         assert_eq!(parse_text(Provider::OpenaiResponses, &json!({"output":[{"type":"message","content":[{"type":"output_text","text":"out"}]}]})).unwrap(), "out");
         assert_eq!(parse_text(Provider::Anthropic, &json!({"content":[{"type":"thinking","text":"private"},{"type":"text","text":"out"}]})).unwrap(), "out");
         assert!(
@@ -971,15 +1467,15 @@ mod tests {
     // Include a final transport marker even after a failed finish reason: neither
     // [DONE] nor message_stop is evidence that earlier text was a complete result.
     fn completion_fixture(provider: Provider, reason: Value) -> (Value, String) {
-        let (response, events) = match provider {
-            Provider::OpenaiResponses => (
+        let (response, events) = match provider.wire_format() {
+            WireFormat::OpenaiResponses => (
                 json!({"status":"completed","output_text":"rewritten"}),
                 vec![
                     json!({"type":"response.output_text.delta","delta":"rewritten"}),
                     json!({"type":"response.completed","response":{"status":"completed","output_text":"rewritten"}}),
                 ],
             ),
-            Provider::Anthropic => (
+            WireFormat::Anthropic => (
                 json!({"content":[{"type":"text","text":"rewritten"}],"stop_reason":reason}),
                 vec![
                     json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"rewritten"}}),
@@ -987,18 +1483,25 @@ mod tests {
                     json!({"type":"message_stop"}),
                 ],
             ),
-            Provider::Google => (
+            WireFormat::Gemini => (
                 json!({"candidates":[{"content":{"parts":[{"text":"rewritten"}]},"finishReason":reason}]}),
                 vec![
                     json!({"candidates":[{"content":{"parts":[{"text":"rewritten"}]}}]}),
                     json!({"candidates":[{"finishReason":reason}]}),
                 ],
             ),
-            _ => (
+            WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => (
                 json!({"choices":[{"message":{"content":"rewritten"},"finish_reason":reason}]}),
                 vec![
                     json!({"choices":[{"index":0,"delta":{"content":"rewritten"}}]}),
                     json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]}),
+                ],
+            ),
+            WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => (
+                json!({"output":{"choices":[{"message":{"content":"rewritten"},"finish_reason":reason}]}}),
+                vec![
+                    json!({"output":{"choices":[{"message":{"content":"rewritten"}}]}}),
+                    json!({"output":{"choices":[{"finish_reason":reason}]}}),
                 ],
             ),
         };
@@ -1013,20 +1516,32 @@ mod tests {
     #[test]
     fn json_and_streams_accept_complete_and_compatible_finish_reasons() {
         for provider in Provider::ALL {
-            if provider == Provider::OpenaiResponses {
+            if provider.wire_format() == WireFormat::OpenaiResponses {
                 continue;
             }
-            let complete = match provider {
-                Provider::Anthropic => "end_turn",
-                Provider::Google => "STOP",
-                _ => "stop",
+            let complete = match provider.wire_format() {
+                WireFormat::Anthropic => "end_turn",
+                WireFormat::Gemini => "STOP",
+                WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => "stop",
+                WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => "stop",
+                WireFormat::OpenaiResponses => unreachable!("skipped above"),
             };
-            for reason in [
-                json!(complete),
-                Value::Null,
-                json!(""),
-                json!("vendor_complete"),
-            ] {
+            let reasons = if provider.wire_format() == WireFormat::Gemini {
+                vec![json!(complete), json!("FINISH_REASON_STOP")]
+            } else if matches!(
+                provider.wire_format(),
+                WireFormat::DashscopeText | WireFormat::DashscopeMultimodal
+            ) {
+                vec![json!(complete)]
+            } else {
+                vec![
+                    json!(complete),
+                    Value::Null,
+                    json!(""),
+                    json!("vendor_complete"),
+                ]
+            };
+            for reason in reasons {
                 let (response, stream) = completion_fixture(provider, reason);
                 assert_eq!(parse_text(provider, &response).unwrap(), "rewritten");
                 assert_eq!(parse_stream(provider, &stream).unwrap(), "rewritten");
@@ -1051,11 +1566,21 @@ mod tests {
                 &["length", "content_filter", "tool_calls", "function_call"][..],
             ),
             (Provider::OpenaiCompletions, &["length"][..]),
+            (Provider::Kimi, &["length"][..]),
+            (Provider::VolcengineArkChatCompletions, &["length"][..]),
+            (Provider::BaiduQianfan, &["length"][..]),
+            (Provider::TencentTokenHub, &["length"][..]),
+            (Provider::MinimaxChatCompletionV2, &["length"][..]),
+            (Provider::Mistral, &["length"][..]),
+            (Provider::Xai, &["length"][..]),
+            (Provider::Groq, &["length"][..]),
+            (Provider::Cohere, &["length"][..]),
             (
                 Provider::Deepseek,
                 &["length", "insufficient_system_resource", "aborted"][..],
             ),
-            (Provider::Qwen, &["length"][..]),
+            (Provider::QwenText, &["length"][..]),
+            (Provider::QwenMultimodal, &["length"][..]),
             (Provider::Glm, &["length"][..]),
             (
                 Provider::Anthropic,
@@ -1071,6 +1596,7 @@ mod tests {
                 Provider::Google,
                 &[
                     "MAX_TOKENS",
+                    "CONTINUATION",
                     "SAFETY",
                     "RECITATION",
                     "LANGUAGE",
@@ -1090,6 +1616,17 @@ mod tests {
                     "IMAGE_OTHER",
                     "NO_IMAGE",
                     "IMAGE_RECITATION",
+                    "FINISH_REASON_UNSPECIFIED",
+                    "vendor_complete",
+                ][..],
+            ),
+            (
+                Provider::VertexAi,
+                &[
+                    "MAX_TOKENS",
+                    "CONTINUATION",
+                    "FINISH_REASON_UNSPECIFIED",
+                    "vendor_complete",
                 ][..],
             ),
         ] {
@@ -1109,15 +1646,37 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_google_finish_reason_does_not_complete_a_stream() {
-        let (_, stream) = completion_fixture(Provider::Google, json!("FINISH_REASON_UNSPECIFIED"));
-        assert!(matches!(
-            parse_stream(
-                Provider::Google,
-                stream.trim_end_matches("data: [DONE]\n\n")
-            ),
-            Err(RewriteError::Response(_))
-        ));
+    fn gemini_results_require_an_explicit_stop_reason() {
+        for provider in [Provider::Google, Provider::VertexAi] {
+            for reason in [Value::Null, json!("")] {
+                let (response, _) = completion_fixture(provider, reason);
+                assert!(parse_text(provider, &response).is_err(), "{provider:?}");
+            }
+            for reason in [Value::Null, json!("FINISH_REASON_UNSPECIFIED")] {
+                let (_, stream) = completion_fixture(provider, reason);
+                assert!(parse_stream(provider, &stream).is_err(), "{provider:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dashscope_streams_allow_null_intermediate_reason_but_require_terminal_stop() {
+        for provider in [Provider::QwenText, Provider::QwenMultimodal] {
+            let stream = concat!(
+                "data: {\"output\":{\"choices\":[{\"message\":{\"content\":\"answer\"},\"finish_reason\":\"null\"}]}}\n\n",
+                "data: {\"output\":{\"choices\":[{\"finish_reason\":\"stop\"}]}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            assert_eq!(parse_stream(provider, stream).unwrap(), "answer");
+
+            let response = json!({
+                "output": {"choices": [{
+                    "message": {"content": "partial"},
+                    "finish_reason": "null"
+                }]}
+            });
+            assert!(parse_text(provider, &response).is_err(), "{provider:?}");
+        }
     }
 
     #[test]
@@ -1139,6 +1698,8 @@ mod tests {
             )
             .is_err()
         );
+        let responses_partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\"}}\n\n";
+        assert!(parse_stream(Provider::OpenaiResponses, responses_partial).is_err());
     }
 
     #[test]
@@ -1146,7 +1707,7 @@ mod tests {
         for (provider, body, expected) in [
             (
                 Provider::OpenaiResponses,
-                "event: response.output_text.delta\r\ndata: {\"delta\":\"old\"}\r\n\r\nevent: response.completed\r\ndata: {\"response\":{\"output_text\":\"final\"}}\r\n\r\n",
+                "event: response.output_text.delta\r\ndata: {\"delta\":\"old\"}\r\n\r\nevent: response.completed\r\ndata: {\"response\":{\"status\":\"completed\",\"output_text\":\"final\"}}\r\n\r\n",
                 "final",
             ),
             (
@@ -1228,6 +1789,11 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let base_url = if provider == Provider::VertexAi {
+            format!("{url}/v1/projects/project/locations/global/publishers/google")
+        } else {
+            url.clone()
+        };
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let server = tokio::spawn(async move {
@@ -1251,25 +1817,51 @@ mod tests {
                             .unwrap();
                         if request.len() >= end + 4 + length {
                             let body: Value = serde_json::from_slice(&request[end + 4..]).unwrap();
-                            let (input, instruction, key_header) = match provider {
-                                Provider::Anthropic => (
+                            let (input, instruction, key_header) = match provider.wire_format() {
+                                WireFormat::Anthropic => (
                                     &body["messages"][0]["content"],
                                     &body["system"],
                                     format!("x-api-key: {api_key}"),
                                 ),
-                                Provider::Google => (
+                                WireFormat::Gemini => (
                                     &body["contents"][0]["parts"][0]["text"],
                                     &body["systemInstruction"]["parts"][0]["text"],
-                                    format!("x-goog-api-key: {api_key}"),
+                                    if provider == Provider::Google {
+                                        format!("x-goog-api-key: {api_key}")
+                                    } else {
+                                        format!("authorization: bearer {api_key}")
+                                    },
                                 ),
-                                Provider::OpenaiResponses => (
+                                WireFormat::OpenaiResponses => (
                                     &body["input"][0]["content"],
                                     &body["instructions"],
-                                    format!("authorization: bearer {api_key}"),
+                                    if matches!(
+                                        provider,
+                                        Provider::AzureOpenaiResponses
+                                            | Provider::AzureOpenaiChatCompletions
+                                    ) {
+                                        format!("api-key: {api_key}")
+                                    } else {
+                                        format!("authorization: bearer {api_key}")
+                                    },
                                 ),
-                                _ => (
+                                WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => (
                                     &body["messages"][1]["content"],
                                     &body["messages"][0]["content"],
+                                    if provider == Provider::AzureOpenaiChatCompletions {
+                                        format!("api-key: {api_key}")
+                                    } else {
+                                        format!("authorization: bearer {api_key}")
+                                    },
+                                ),
+                                WireFormat::DashscopeText => (
+                                    &body["input"]["messages"][1]["content"],
+                                    &body["input"]["messages"][0]["content"],
+                                    format!("authorization: bearer {api_key}"),
+                                ),
+                                WireFormat::DashscopeMultimodal => (
+                                    &body["input"]["messages"][1]["content"][0]["text"],
+                                    &body["input"]["messages"][0]["content"],
                                     format!("authorization: bearer {api_key}"),
                                 ),
                             };
@@ -1278,15 +1870,29 @@ mod tests {
                                 assert_eq!(instruction, expected_prompt);
                                 assert!(body.get("draft-only").is_none());
                             }
-                            if provider != Provider::Google {
+                            if provider.wire_format() != WireFormat::Gemini {
                                 assert_eq!(body["model"], model);
                             }
-                            let endpoint = endpoint("http://localhost", provider, model).unwrap();
+                            let endpoint_base = if provider == Provider::VertexAi {
+                                "http://localhost/v1/projects/project/locations/global/publishers/google"
+                            } else {
+                                "http://localhost"
+                            };
+                            let endpoint = endpoint(endpoint_base, provider, model).unwrap();
                             assert!(headers.starts_with(
                                 &format!("post {} ", endpoint.path()).to_ascii_lowercase()
                             ));
                             assert!(headers.contains(&key_header));
-                            if matches!(provider, Provider::Google | Provider::Anthropic) {
+                            if matches!(provider, Provider::QwenText | Provider::QwenMultimodal) {
+                                assert!(headers.contains("x-dashscope-sse: enable"));
+                            }
+                            if matches!(
+                                provider,
+                                Provider::Google
+                                    | Provider::Anthropic
+                                    | Provider::AzureOpenaiResponses
+                                    | Provider::AzureOpenaiChatCompletions
+                            ) {
                                 assert!(!headers.contains("authorization:"));
                             }
                             break;
@@ -1302,7 +1908,7 @@ mod tests {
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
-        (url, calls, server)
+        (base_url, calls, server)
     }
 
     fn http_config(url: String) -> Config {
@@ -1321,10 +1927,12 @@ mod tests {
     async fn prompt_provider_controls_http_authentication_routing_and_response_parsing() {
         use std::sync::atomic::Ordering;
         for provider in Provider::ALL {
-            let reason = match provider {
-                Provider::Anthropic => "end_turn",
-                Provider::Google => "STOP",
-                _ => "stop",
+            let reason = match provider.wire_format() {
+                WireFormat::Anthropic => "end_turn",
+                WireFormat::Gemini => "STOP",
+                WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => "stop",
+                WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => "stop",
+                WireFormat::OpenaiResponses => "completed",
             };
             let (response, stream) = completion_fixture(provider, json!(reason));
             for (content_type, body) in [
@@ -1342,7 +1950,7 @@ mod tests {
                 .await;
                 // An unusable main API must not affect an independent prompt.
                 let mut config = http_config("not a URL".into());
-                config.rewrite.provider = if provider == Provider::OpenaiResponses {
+                config.rewrite.provider = if provider.wire_format() == WireFormat::OpenaiResponses {
                     Provider::Anthropic
                 } else {
                     Provider::OpenaiResponses
@@ -1566,15 +2174,22 @@ mod tests {
     async fn incomplete_results_are_not_returned_or_retried() {
         use std::sync::atomic::Ordering;
         for provider in Provider::ALL {
-            if provider == Provider::OpenaiResponses {
-                continue;
-            }
-            let reason = match provider {
-                Provider::Anthropic => "max_tokens",
-                Provider::Google => "MAX_TOKENS",
-                _ => "length",
+            let (response, stream) = match provider.wire_format() {
+                WireFormat::OpenaiResponses => (
+                    json!({"status":"incomplete","output_text":"partial"}),
+                    "data: {\"type\":\"response.incomplete\"}\n\n".into(),
+                ),
+                format => {
+                    let reason = match format {
+                        WireFormat::Anthropic => "max_tokens",
+                        WireFormat::Gemini => "MAX_TOKENS",
+                        WireFormat::OpenaiChat | WireFormat::MinimaxChatCompletionV2 => "length",
+                        WireFormat::DashscopeText | WireFormat::DashscopeMultimodal => "length",
+                        WireFormat::OpenaiResponses => unreachable!("handled above"),
+                    };
+                    completion_fixture(provider, json!(reason))
+                }
             };
-            let (response, stream) = completion_fixture(provider, json!(reason));
             for (content_type, body) in [
                 ("application/json", response.to_string()),
                 ("text/event-stream", stream),

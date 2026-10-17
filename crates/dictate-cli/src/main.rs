@@ -151,15 +151,6 @@ struct Arguments {
         help_heading = "Cache"
     )]
     keep_cache: Option<bool>,
-    /// Write [request failed] after all audio request attempts fail.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        action = ArgAction::Set,
-        help_heading = "Cache"
-    )]
-    request_failed_notification: Option<bool>,
-
     /// Enable FFmpeg conversion diagnostics.
     #[arg(
         long,
@@ -225,7 +216,6 @@ impl Arguments {
             || self.clipboard_restore_delay.is_some()
             || self.cache_dir.is_some()
             || self.keep_cache.is_some()
-            || self.request_failed_notification.is_some()
             || self.ffmpeg_debug.is_some()
             || self.enable_vad.is_some()
             || self.vad_padding_ms.is_some()
@@ -275,10 +265,6 @@ impl Arguments {
         );
         set(&mut config.cache_dir, self.cache_dir);
         set(&mut config.keep_cache, self.keep_cache);
-        set(
-            &mut config.request_failed_notification,
-            self.request_failed_notification,
-        );
         set(&mut config.ffmpeg_debug, self.ffmpeg_debug);
         set(&mut config.enable_vad, self.enable_vad);
         set(&mut config.vad_padding_ms, self.vad_padding_ms);

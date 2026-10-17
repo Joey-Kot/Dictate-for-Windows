@@ -135,6 +135,9 @@ struct RuntimeInner {
     event_handler: Option<Arc<dyn Fn(Event) + Send + Sync>>,
     next_session: u64,
     active_session: u64,
+    // Kept alive from microphone start through conversion and upload so every
+    // enabled debug category can be tied to one user-visible operation.
+    active_debug_operation: Option<crate::debug_log::OperationScope>,
     active_request_cancellation: Option<CancellationToken>,
     retry_buffer_enabled: bool,
     retry_recording: Option<Arc<RetryRecording>>,
@@ -208,6 +211,7 @@ impl Runtime {
                 event_handler: None,
                 next_session: 0,
                 active_session: 0,
+                active_debug_operation: None,
                 active_request_cancellation: None,
                 retry_buffer_enabled: false,
                 retry_recording: None,
@@ -340,6 +344,13 @@ impl Runtime {
         let runtime = self.clone();
         self.executor.spawn(async move {
             let _guard = guard;
+            let _debug_operation = crate::debug_log::operation_scope("rewrite");
+            if config.hotkey_debug {
+                crate::debug_log::write(
+                    crate::debug_log::Category::Hotkey,
+                    format_args!("[hotkey] action=rewrite accepted"),
+                );
+            }
             let input = match crate::selection::read(
                 &cancellation,
                 Duration::from_millis(config.clipboard_write_delay),
@@ -439,6 +450,11 @@ impl Runtime {
         if self.is_stopped() || !self.can_reload() {
             return Err("A task is already running".into());
         }
+        let _debug_operation = crate::debug_log::operation_scope(if rewrite {
+            "rewrite-test"
+        } else {
+            "audio-test"
+        });
         let cancellation = self.begin_active_request();
         self.set_state(
             if rewrite {
@@ -657,13 +673,14 @@ impl Runtime {
         }
         self.lifecycle.cancel();
         self.cancel_live_realtime();
-        let (recorder, hotkeys, request_cancellation) = {
+        let (recorder, hotkeys, request_cancellation, _debug_operation) = {
             let mut inner = self.inner.lock();
             inner.retry_recording = None;
             (
                 inner.recorder.clone(),
                 inner.hotkeys.take(),
                 inner.active_request_cancellation.take(),
+                inner.active_debug_operation.take(),
             )
         };
         recorder.set_capture_packet_sink(None);
@@ -674,7 +691,6 @@ impl Runtime {
         if let Some(hotkeys) = hotkeys {
             hotkeys.stop();
         }
-
         // Copy may already be queued in another application. The native worker
         // restores the clipboard independently of the async task/executor.
         crate::selection::wait_for_cleanup();
@@ -693,11 +709,14 @@ impl Runtime {
         let state = self.snapshot().state;
         if matches!(state, State::Idle | State::Error) {
             let (recorder, session) = self.begin_recording_session();
+            self.begin_recording_debug_operation();
+            self.debug_hotkey_action("record-start");
             self.reset_live_realtime(&recorder);
             let live_receiver = self.prepare_live_realtime(&recorder);
             if let Err(error) = recorder.start(self.lifecycle.child_token()).await {
                 recorder.set_capture_packet_sink(None);
                 self.clear_recording_session(&recorder, session);
+                self.clear_recording_debug_operation();
                 if !self.is_stopped() {
                     self.set_retryable_error("Recording start failed", &error);
                 }
@@ -708,6 +727,7 @@ impl Runtime {
                 self.cancel_live_realtime();
                 recorder.request_cancel();
                 self.clear_recording_session(&recorder, session);
+                self.clear_recording_debug_operation();
                 return;
             }
             if let Some(receiver) = live_receiver {
@@ -731,11 +751,13 @@ impl Runtime {
                 self.clear_recording_session(&recorder, session);
                 if self.is_stopped() {
                     discard_recording(&result);
+                    self.clear_recording_debug_operation();
                     return;
                 }
                 if result.canceled {
                     self.cancel_live_realtime();
                     self.set_state(State::Idle, "Recording canceled", None::<&RuntimeError>);
+                    self.clear_recording_debug_operation();
                     return;
                 }
                 self.save_completed_recording_for_retry(&result);
@@ -747,6 +769,7 @@ impl Runtime {
                 );
                 self.transcribe_recording(result, &cancellation, true).await;
                 self.clear_active_request();
+                self.clear_recording_debug_operation();
             }
             Err(error) => {
                 if !matches!(
@@ -755,6 +778,7 @@ impl Runtime {
                 ) {
                     self.clear_recording_session(&recorder, session);
                 }
+                self.clear_recording_debug_operation();
                 if !self.is_stopped() {
                     self.set_retryable_error("Recording stop failed", &error);
                 }
@@ -791,6 +815,26 @@ impl Runtime {
         let mut inner = self.inner.lock();
         if Arc::ptr_eq(&inner.recorder, recorder) && inner.active_session == session {
             inner.active_session = 0;
+        }
+    }
+
+    fn begin_recording_debug_operation(&self) {
+        let operation = crate::debug_log::operation_scope("audio");
+        let previous = self.inner.lock().active_debug_operation.replace(operation);
+        drop(previous);
+    }
+
+    fn clear_recording_debug_operation(&self) {
+        let operation = self.inner.lock().active_debug_operation.take();
+        drop(operation);
+    }
+
+    fn debug_hotkey_action(&self, action: &str) {
+        if self.inner.lock().config.hotkey_debug {
+            crate::debug_log::write(
+                crate::debug_log::Category::Hotkey,
+                format_args!("[hotkey] action={action} accepted"),
+            );
         }
     }
 
@@ -991,6 +1035,7 @@ impl Runtime {
         if should_report {
             recorder.set_capture_packet_sink(None);
             self.cancel_live_realtime();
+            self.clear_recording_debug_operation();
             self.set_retryable_error("Recording failed", &error);
         }
     }
@@ -1055,9 +1100,11 @@ impl Runtime {
             return;
         }
         self.cancel_live_realtime();
+        self.debug_hotkey_action("record-cancel");
         match recorder.cancel().await {
             Ok(_) => {
                 self.clear_recording_session(&recorder, session);
+                self.clear_recording_debug_operation();
                 if !self.is_stopped() {
                     self.set_state(State::Idle, "Recording canceled", None::<&RuntimeError>);
                 }
@@ -1069,6 +1116,7 @@ impl Runtime {
                 ) {
                     self.clear_recording_session(&recorder, session);
                 }
+                self.clear_recording_debug_operation();
                 if !self.is_stopped() {
                     self.set_retryable_error("Cancel failed", &error);
                 }
@@ -1101,6 +1149,8 @@ impl Runtime {
         let Some(recording) = recording else {
             return;
         };
+        let _debug_operation = crate::debug_log::operation_scope_if_none("audio-retry");
+        self.debug_hotkey_action("audio-retry");
 
         // Enter the cancelable request state before restoring the bounded in-memory WAV. The
         // restoration can still take noticeable time for a 100 MB recording.
@@ -1442,14 +1492,32 @@ impl Runtime {
                     return;
                 }
                 let raw = error.last_response().to_vec();
-                if config.request_failed_notification
-                    && error.is_retry_exhausted()
-                    && let Err(paste_error) =
-                        text_input::send_text("[request failed]", cancellation, &config).await
-                    && !self.is_stopped()
-                    && !cancellation.is_cancelled()
-                {
-                    eprintln!("[text input] failed: {paste_error}");
+                if let Some(placeholder) = client.terminal_failure_placeholder(&error) {
+                    let paste = text_input::send_text(&placeholder, cancellation, &config).await;
+                    clean_up_recording_attempt(
+                        &config,
+                        cache_attempt,
+                        &wav_path,
+                        &output_path,
+                        false,
+                        &raw,
+                    );
+                    if !self.is_stopped() {
+                        match paste {
+                            Ok(()) => self.set_state(
+                                State::Idle,
+                                "ASR failed; placeholder inserted",
+                                None::<&RuntimeError>,
+                            ),
+                            Err(error) if error.canceled_before_output() => self.set_state(
+                                State::Idle,
+                                "Request canceled",
+                                None::<&RuntimeError>,
+                            ),
+                            Err(error) => self.set_retryable_error(error.status(), &error),
+                        }
+                    }
+                    return;
                 }
                 clean_up_recording_attempt(
                     &config,
@@ -1661,15 +1729,6 @@ impl Runtime {
                     }
                     return;
                 }
-                if config.request_failed_notification
-                    && error.is_retry_exhausted()
-                    && let Err(paste_error) =
-                        text_input::send_text("[request failed]", cancellation, config).await
-                    && !self.is_stopped()
-                    && !cancellation.is_cancelled()
-                {
-                    eprintln!("[text input] failed: {paste_error}");
-                }
                 clean_up_segmented_recording_attempt(
                     config,
                     cache_attempt,
@@ -1851,6 +1910,33 @@ impl Runtime {
             }
             Err(error) => {
                 let raw = error.last_response().to_vec();
+                if let Some(placeholder) = client.terminal_failure_placeholder(&error) {
+                    let paste = text_input::send_text(&placeholder, cancellation, config).await;
+                    clean_up_recording_attempt(
+                        config,
+                        cache_attempt,
+                        wav_path,
+                        &cache_path,
+                        false,
+                        &raw,
+                    );
+                    if !self.is_stopped() {
+                        match paste {
+                            Ok(()) => self.set_state(
+                                State::Idle,
+                                "ASR failed; placeholder inserted",
+                                None::<&RuntimeError>,
+                            ),
+                            Err(error) if error.canceled_before_output() => self.set_state(
+                                State::Idle,
+                                "Request canceled",
+                                None::<&RuntimeError>,
+                            ),
+                            Err(error) => self.set_retryable_error(error.status(), &error),
+                        }
+                    }
+                    return;
+                }
                 clean_up_recording_attempt(
                     config,
                     cache_attempt,
@@ -1924,6 +2010,7 @@ pub async fn test_audio_api_with_source(
     cancellation: CancellationToken,
 ) -> Result<(), RuntimeError> {
     config.validate()?;
+    let _debug_operation = crate::debug_log::operation_scope_if_none("audio-test");
     let client = AudioApiClient::new(config.clone())?;
     if config.enable_segmented_upload && !client.is_realtime_workflow() {
         let prepared = prepare_segmented_upload(
@@ -1983,6 +2070,7 @@ pub async fn run_file_mode_with_cancellation(
     cancellation: CancellationToken,
 ) -> Result<PathBuf, RuntimeError> {
     config.validate()?;
+    let _debug_operation = crate::debug_log::operation_scope_if_none("file");
     let temp_dir = cache::initialize_cache_dir(&mut config);
     std::fs::metadata(input_path).map_err(|source| RuntimeError::InputFile {
         path: input_path.to_path_buf(),
@@ -2096,7 +2184,7 @@ async fn run_segmented_file_mode(
         }
     };
     let transcription = match client
-        .transcribe_segments(cancellation, &prepared.files, max_concurrency)
+        .transcribe_segments_strict(cancellation, &prepared.files, max_concurrency)
         .await
     {
         Ok(transcription) => transcription,
@@ -2644,24 +2732,30 @@ mod tests {
 
     async fn legacy_concurrency_failure_server(
         expected_concurrency: usize,
+        segments_per_batch: usize,
         batches: usize,
     ) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let worker = tokio::spawn(async move {
             for _ in 0..batches {
-                let mut streams = Vec::with_capacity(expected_concurrency);
-                for _ in 0..expected_concurrency {
-                    streams.push(listener.accept().await.unwrap().0);
-                }
-                join_all(streams.iter_mut().map(read_complete_http_request)).await;
-                for stream in &mut streams {
-                    let body = r#"{"error":"simulated failure"}"#;
-                    let response = format!(
-                        "HTTP/1.1 500 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).await.unwrap();
+                let mut remaining = segments_per_batch;
+                while remaining > 0 {
+                    let wave = remaining.min(expected_concurrency);
+                    let mut streams = Vec::with_capacity(wave);
+                    for _ in 0..wave {
+                        streams.push(listener.accept().await.unwrap().0);
+                    }
+                    join_all(streams.iter_mut().map(read_complete_http_request)).await;
+                    for stream in &mut streams {
+                        let body = r#"{"error":"simulated failure"}"#;
+                        let response = format!(
+                            "HTTP/1.1 500 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                    remaining -= wave;
                 }
             }
         });
@@ -2781,7 +2875,7 @@ mod tests {
     #[tokio::test]
     async fn segmented_retry_dispatches_with_its_frozen_concurrency() {
         let directory = tempfile::tempdir().unwrap();
-        let (endpoint, server) = legacy_concurrency_failure_server(2, 2).await;
+        let (endpoint, server) = legacy_concurrency_failure_server(2, 3, 2).await;
         let calls = Arc::new(ParkingMutex::new(SegmentedConverterCalls::default()));
         let converter = Arc::new(InstrumentedSegmentConverter {
             calls: calls.clone(),
@@ -3548,10 +3642,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_empty_canceled_and_late_rewrites_never_deliver_or_replace_retry_audio() {
-        let config = Config {
-            request_failed_notification: true,
-            ..Default::default()
-        };
+        let config = Config::default();
         let runtime = Runtime::new(config, Arc::new(NoopConverter)).unwrap();
         runtime.enable_retry_buffer();
         runtime.inner.lock().retry_recording = Some(retry_recording_for_test(b"previous audio"));

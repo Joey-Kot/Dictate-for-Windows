@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -21,6 +22,8 @@ use dictate_core::advanced_audio::{
     AdvancedAudioClient, AdvancedAudioConfig, AdvancedAudioError, AdvancedAudioWorkflow,
     AdvancedRecognition, AudioDelivery, HttpBody, HttpMethod, HttpStage, WorkflowSchemaVersion,
 };
+use dictate_core::debug_log::{self, Category, Record};
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -230,6 +233,16 @@ fn advanced_client(
     mime: &str,
     recognition: AdvancedRecognition,
 ) -> AdvancedAudioClient {
+    advanced_client_with_upload_debug(name, delivery, mime, recognition, false)
+}
+
+fn advanced_client_with_upload_debug(
+    name: &str,
+    delivery: AudioDelivery,
+    mime: &str,
+    recognition: AdvancedRecognition,
+    upload_debug: bool,
+) -> AdvancedAudioClient {
     let workflow = AdvancedAudioWorkflow {
         schema_version: WorkflowSchemaVersion::default(),
         name: name.into(),
@@ -245,6 +258,7 @@ fn advanced_client(
         request_timeout: 5,
         max_retry: 3,
         retry_base_delay: 0.0,
+        upload_debug,
         enable_http2: false,
         advanced_audio_api: AdvancedAudioConfig {
             enabled: true,
@@ -435,6 +449,75 @@ async fn request_raw_audio_streams_exact_bytes_and_mime() {
         .unwrap();
     assert_eq!(transcription.text, "raw transcript");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_debug_reports_advanced_lifecycle_without_request_or_response_bodies() {
+    let records: Arc<Mutex<Vec<Record>>> = Arc::default();
+    let output = records.clone();
+    let _subscription = debug_log::subscribe(move |record| output.lock().push(record));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert_eq!(request.body, b"private advanced audio");
+        write_response(
+            &mut stream,
+            "200 OK",
+            &[("Content-Type", "text/plain")],
+            b"private advanced transcript",
+        )
+        .await;
+    });
+
+    let client = advanced_client_with_upload_debug(
+        "advanced debug lifecycle fixture",
+        AudioDelivery::RawAudio,
+        "audio/pcm",
+        AdvancedRecognition::Request {
+            request: Box::new(stage(
+                HttpMethod::Post,
+                format!("http://{address}/recognize?token=private-query"),
+                HttpBody::RawAudio,
+            )),
+            final_text: ResponseExtractor::PlainBody,
+        },
+        true,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let audio = audio_file(&directory, "private-audio.pcm", b"private advanced audio");
+
+    let transcription = client
+        .transcribe(&CancellationToken::new(), &audio)
+        .await
+        .unwrap();
+    assert_eq!(transcription.text, "private advanced transcript");
+    server.await.unwrap();
+
+    let output = records
+        .lock()
+        .iter()
+        .filter(|record| record.category == Category::Upload)
+        .map(|record| record.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for event in [
+        "event=request-start",
+        "event=response-headers status=200",
+        "event=response-complete status=200",
+        "event=parse-complete",
+        "event=completed",
+    ] {
+        assert!(output.contains(event), "missing {event}: {output}");
+    }
+    for private in [
+        "private advanced audio",
+        "private advanced transcript",
+        "private-query",
+    ] {
+        assert!(!output.contains(private), "leaked {private}: {output}");
+    }
 }
 
 #[tokio::test]

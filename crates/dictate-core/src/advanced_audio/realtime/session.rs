@@ -538,6 +538,38 @@ impl RealtimeSessionError {
                 | Self::WebSocket(WebSocketError::Canceled)
         )
     }
+
+    /// Maps only remote, response, and protocol failures to a concise
+    /// foreground placeholder. Rendering, local audio, and websocket setup
+    /// failures are configuration/local errors and must remain task failures.
+    pub(crate) fn terminal_failure_placeholder_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::WebSocket(WebSocketError::Connect) => Some("Network connection failed"),
+            Self::WebSocket(WebSocketError::Send | WebSocketError::Receive) => {
+                Some("Network request failed")
+            }
+            Self::InvalidIncomingText
+            | Self::ClosedBeforeComplete
+            | Self::ProtocolEvent
+            | Self::Accumulator(_) => Some("Invalid ASR response"),
+            Self::FinalizationTimeout => Some("Network timeout"),
+            Self::ResponseTooLarge => Some("ASR response is too large"),
+            Self::Source(_)
+            | Self::WebSocket(
+                WebSocketError::InvalidUrl
+                | WebSocketError::InvalidHeaderName
+                | WebSocketError::InvalidHeaderValue
+                | WebSocketError::Signing
+                | WebSocketError::Canceled
+                | WebSocketError::Template(_)
+                | WebSocketError::TypedTemplate(_),
+            )
+            | Self::Template(_)
+            | Self::TypedTemplate(_)
+            | Self::InvalidBinaryTemplate
+            | Self::Canceled => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +592,38 @@ mod tests {
         RealtimeTransport, SignerConfig, StreamAction, StreamRule,
     };
     use crate::advanced_audio::{CURRENT_SCHEMA_VERSION, LEGACY_SCHEMA_VERSION};
+
+    #[test]
+    fn placeholder_reasons_exclude_local_realtime_failures() {
+        assert_eq!(
+            RealtimeSessionError::WebSocket(WebSocketError::Connect)
+                .terminal_failure_placeholder_reason(),
+            Some("Network connection failed"),
+        );
+        assert_eq!(
+            RealtimeSessionError::WebSocket(WebSocketError::Send)
+                .terminal_failure_placeholder_reason(),
+            Some("Network request failed"),
+        );
+        assert_eq!(
+            RealtimeSessionError::ClosedBeforeComplete.terminal_failure_placeholder_reason(),
+            Some("Invalid ASR response"),
+        );
+        assert_eq!(
+            RealtimeSessionError::FinalizationTimeout.terminal_failure_placeholder_reason(),
+            Some("Network timeout"),
+        );
+        assert_eq!(
+            RealtimeSessionError::Source(RealtimeSourceError::InvalidWav)
+                .terminal_failure_placeholder_reason(),
+            None,
+        );
+        assert_eq!(
+            RealtimeSessionError::WebSocket(WebSocketError::InvalidUrl)
+                .terminal_failure_placeholder_reason(),
+            None,
+        );
+    }
 
     struct FixedChunkSource {
         chunks: VecDeque<AudioChunk>,

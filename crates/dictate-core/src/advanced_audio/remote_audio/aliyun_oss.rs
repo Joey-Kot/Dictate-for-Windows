@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha1::Sha1;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -41,6 +42,7 @@ impl AliyunOssPublisher {
         audio: &PreparedAudio,
         delivery: AudioDeliveryType,
         cancellation: &CancellationToken,
+        upload_debug: bool,
     ) -> Result<PublishedRemoteAudio, RemoteAudioError> {
         let key = object_key(&self.settings.prefix, audio.filename());
         let object_url = object_url(&self.settings, &key)?;
@@ -82,7 +84,15 @@ impl AliyunOssPublisher {
             settings: self.settings.clone(),
             key: key.clone(),
         });
-        upload(
+        let started = Instant::now();
+        super::debug(
+            upload_debug,
+            format_args!(
+                "[upload] remote-audio provider=aliyun-oss event=upload-start method=PUT bytes={}",
+                audio.size()
+            ),
+        );
+        match upload(
             &self.client,
             &self.settings,
             &object_url,
@@ -90,8 +100,29 @@ impl AliyunOssPublisher {
             audio,
             cancellation,
             &cleanup,
+            upload_debug,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => super::debug(
+                upload_debug,
+                format_args!(
+                    "[upload] remote-audio provider=aliyun-oss event=upload-complete elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
+            ),
+            Err(error) => {
+                super::debug(
+                    upload_debug,
+                    format_args!(
+                        "[upload] remote-audio provider=aliyun-oss event=upload-failed kind={} elapsed_ms={}",
+                        remote_error_kind(&error),
+                        started.elapsed().as_millis()
+                    ),
+                );
+                return Err(error);
+            }
+        }
         Ok(published(reference, cleanup))
     }
 }
@@ -103,11 +134,12 @@ impl RemoteAudioPublisher for AliyunOssPublisher {
         audio: &PreparedAudio,
         cancellation: &CancellationToken,
     ) -> Result<PublishedRemoteAudio, RemoteAudioError> {
-        self.publish_for_delivery(audio, AudioDeliveryType::CloudUri, cancellation)
+        self.publish_for_delivery(audio, AudioDeliveryType::CloudUri, cancellation, false)
             .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload(
     client: &reqwest::Client,
     settings: &AliyunOssRemoteAudioConfig,
@@ -116,6 +148,7 @@ async fn upload(
     audio: &PreparedAudio,
     cancellation: &CancellationToken,
     cleanup: &super::RemoteCleanup,
+    upload_debug: bool,
 ) -> Result<(), RemoteAudioError> {
     let body = streaming_body(audio).await?;
     let now = Utc::now();
@@ -131,18 +164,40 @@ async fn upload(
     let result = tokio::select! {
         _ = cancellation.cancelled() => Err(RemoteAudioError::Canceled),
         response = request.send() => match response {
-            Ok(response) if response.status().is_success() => Ok(()),
-            Ok(response) => Err(RemoteAudioError::UnexpectedStatus {
-                operation: "OSS upload",
-                status: response.status().as_u16(),
-            }),
+            Ok(response) => {
+                let status = response.status();
+                super::debug(
+                    upload_debug,
+                    format_args!(
+                        "[upload] remote-audio provider=aliyun-oss event=response-headers status={}",
+                        status.as_u16()
+                    ),
+                );
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    Err(RemoteAudioError::UnexpectedStatus {
+                        operation: "OSS upload",
+                        status: status.as_u16(),
+                    })
+                }
+            }
             Err(_) => Err(RemoteAudioError::Request),
         },
     };
     if result.is_err() {
-        super::cleanup_after_upload_failure(client, cleanup).await;
+        super::cleanup_after_upload_failure(client, cleanup, upload_debug).await;
     }
     result
+}
+
+fn remote_error_kind(error: &RemoteAudioError) -> &'static str {
+    match error {
+        RemoteAudioError::Canceled => "canceled",
+        RemoteAudioError::UnexpectedStatus { .. } => "http",
+        RemoteAudioError::Request => "network",
+        _ => "configuration",
+    }
 }
 
 pub(super) async fn cleanup(

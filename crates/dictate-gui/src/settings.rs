@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, EM_SETMARGINS, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED,
-    SetWindowTheme,
+    DRAWITEMSTRUCT, EM_GETLINECOUNT, EM_SCROLLCARET, EM_SETMARGINS, EM_SETSEL, ODS_DISABLED,
+    ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED, SetWindowTheme,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -81,6 +81,7 @@ const ID_CANCEL: usize = 0x6102;
 const ID_LANGUAGE: usize = 0x6103;
 const ID_CLOSE: usize = 0x6104;
 const ID_TEST_CONNECTIVITY: usize = 0x6105;
+const ID_CONNECTIVITY_RESULT: usize = 0x6106;
 const ID_PAGE_BASE: usize = 0x6110;
 const ID_LANGUAGE_ITEM_BASE: usize = 0x6180;
 const ID_FIELD_BASE: usize = 0x6200;
@@ -91,7 +92,7 @@ pub const WM_OPACITY_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_
 pub const WM_WINDOW_SCALE_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
 
 const WINDOW_WIDTH: i32 = 760;
-const WINDOW_HEIGHT: i32 = 662;
+const WINDOW_HEIGHT: i32 = 724;
 const HEADER_HEIGHT: i32 = 72;
 const FOOTER_HEIGHT: i32 = 58;
 const SIDEBAR_WIDTH: i32 = 170;
@@ -101,6 +102,11 @@ const EDIT_LEFT: i32 = 354;
 const EDIT_WIDTH: i32 = 378;
 const FIELD_TOP: i32 = 94;
 const FIELD_HEIGHT: i32 = 34;
+pub(super) const TEST_RESULT_MIN_HEIGHT: i32 = 34;
+pub(super) const TEST_RESULT_LINE_HEIGHT: i32 = 20;
+pub(super) const TEST_RESULT_MAX_HEIGHT: i32 = TEST_RESULT_MIN_HEIGHT + TEST_RESULT_LINE_HEIGHT * 2;
+const API_TEST_RESULT_TOP: i32 = 506;
+const REWRITE_TEST_RESULT_TOP: i32 = 492;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const HOTKEY_INPUT_KEYS: [&str; 3] = [
     "CLIPBOARD_WRITE_DELAY",
@@ -369,12 +375,6 @@ const FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Boolean,
     },
     FieldSpec {
-        key: "REQUEST_FAILED_NOTIFICATION",
-        label: "Request failed placeholder",
-        group: "Cache",
-        kind: FieldKind::Boolean,
-    },
-    FieldSpec {
         key: "FFMPEG_DEBUG",
         label: "FFmpeg debug",
         group: "Debug",
@@ -414,6 +414,7 @@ struct SettingsState {
     connectivity_receiver: Option<std::sync::mpsc::Receiver<(Result<(), String>, u128)>>,
     rewrite_test: bool,
     connectivity_elapsed: u128,
+    connectivity_result: TestResultView,
     advanced_audio: advanced_audio::Page,
     rewrite: rewrite::Page,
     debug: debug::Page,
@@ -451,6 +452,26 @@ enum ConnectivityStatus {
     Testing,
     Succeeded,
     Failed(String),
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct TestResultView {
+    pub(super) editor: HWND,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TestResultState {
+    Idle,
+    Testing,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TestResultLayout {
+    pub(super) icon: RECT,
+    pub(super) frame: RECT,
+    pub(super) editor: RECT,
 }
 
 #[derive(Clone, Copy)]
@@ -565,6 +586,7 @@ impl SettingsWindow {
             connectivity_receiver: None,
             rewrite_test: false,
             connectivity_elapsed: 0,
+            connectivity_result: TestResultView::default(),
             advanced_audio: advanced_audio::Page::new(&runtime.config()),
             rewrite: rewrite::Page::new(runtime.config().rewrite),
             debug: debug::Page::default(),
@@ -888,6 +910,22 @@ unsafe extern "system" fn settings_proc(
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
                 let control = HWND(lparam.0 as *mut c_void);
+                // A read-only multiline EDIT sends WM_CTLCOLORSTATIC rather than
+                // WM_CTLCOLOREDIT. Keep its background and status color aligned
+                // with the shared test-result frame.
+                let test_result = if control == state.connectivity_result.editor {
+                    Some(connectivity_result_state(state))
+                } else if advanced_audio::is_test_result_control(state, control) {
+                    Some(advanced_audio::workflow_test_result_state(state))
+                } else {
+                    None
+                };
+                if let Some(status) = test_result {
+                    SetBkMode(hdc, windows::Win32::Graphics::Gdi::OPAQUE);
+                    SetBkColor(hdc, rgb(26, 35, 39));
+                    SetTextColor(hdc, test_result_text_color(status));
+                    return LRESULT(state.input_brush.0 as isize);
+                }
                 if advanced_audio::is_generation_status_control(state, control) {
                     SetBkMode(hdc, windows::Win32::Graphics::Gdi::OPAQUE);
                     SetBkColor(hdc, rgb(26, 35, 39));
@@ -929,7 +967,11 @@ unsafe extern "system" fn settings_proc(
                 SetBkColor(hdc, rgb(26, 35, 39));
                 SetTextColor(
                     hdc,
-                    if advanced_audio::is_generation_status_control(state, control) {
+                    if control == state.connectivity_result.editor {
+                        test_result_text_color(connectivity_result_state(state))
+                    } else if advanced_audio::is_test_result_control(state, control) {
+                        test_result_text_color(advanced_audio::workflow_test_result_state(state))
+                    } else if advanced_audio::is_generation_status_control(state, control) {
                         rgb(221, 183, 105)
                     } else {
                         rgb(235, 242, 243)
@@ -1352,6 +1394,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
     state
         .localized_controls
         .push((test_connectivity, "test_connectivity"));
+    state.connectivity_result = create_test_result_view(state, ID_CONNECTIVITY_RESULT, instance)?;
 
     let cancel = create_child(
         state,
@@ -1458,6 +1501,41 @@ fn create_child(
     Ok(hwnd)
 }
 
+fn create_test_result_view(
+    state: &SettingsState,
+    id: usize,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<TestResultView, String> {
+    let editor = create_child(
+        state,
+        w!("EDIT"),
+        "",
+        WS_CHILD
+            | WS_TABSTOP
+            | WINDOW_STYLE(
+                (ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY) as u32 | WS_CLIPCHILDREN.0,
+            ),
+        0,
+        0,
+        1,
+        1,
+        id,
+        instance,
+    )?;
+    apply_dark_theme(editor);
+    let margin = platform::scale(7, state.dpi) as u32;
+    unsafe {
+        SendMessageW(
+            editor,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM((margin | (margin << 16)) as isize)),
+        );
+    }
+    dropdown_scrollbar::attach_edit(editor, state.dpi)?;
+    Ok(TestResultView { editor })
+}
+
 fn resize_controls(state: &mut SettingsState) {
     use windows::Win32::UI::WindowsAndMessaging::GetParent;
     let old = [state.font, state.title_font, state.small_font];
@@ -1483,6 +1561,7 @@ fn resize_controls(state: &mut SettingsState) {
     }
     rewrite::resize_list(state);
     debug::resize(&mut state.debug, state.dpi);
+    sync_connectivity_result(state);
     unsafe {
         for font in old {
             let _ = DeleteObject(HGDIOBJ(font.0));
@@ -2177,115 +2256,322 @@ unsafe fn paint_about(state: &SettingsState, hdc: HDC) {
     }
 }
 
-unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
-    let s = |value| platform::scale(value, state.dpi);
+pub(super) fn test_result_layout(
+    editor: HWND,
+    left: i32,
+    top: i32,
+    right: i32,
+) -> TestResultLayout {
+    test_result_layout_with_height(left, top, right, test_result_height(editor))
+}
+
+pub(super) fn test_result_layout_with_height(
+    left: i32,
+    top: i32,
+    right: i32,
+    height: i32,
+) -> TestResultLayout {
+    let frame = RECT {
+        left: left + 30,
+        top,
+        right,
+        bottom: top + height,
+    };
+    let icon_size = 20;
+    let icon_top = top + (height - icon_size) / 2;
+    TestResultLayout {
+        icon: RECT {
+            left,
+            top: icon_top,
+            right: left + icon_size,
+            bottom: icon_top + icon_size,
+        },
+        editor: RECT {
+            left: frame.left + 6,
+            top: frame.top + 5,
+            right: frame.right - 6,
+            bottom: frame.bottom - 5,
+        },
+        frame,
+    }
+}
+
+pub(super) fn test_result_height(editor: HWND) -> i32 {
+    if editor.is_invalid() {
+        return TEST_RESULT_MIN_HEIGHT;
+    }
+    let lines = unsafe { SendMessageW(editor, EM_GETLINECOUNT, None, None).0 as i32 }.clamp(1, 3);
+    TEST_RESULT_MIN_HEIGHT + (lines - 1) * TEST_RESULT_LINE_HEIGHT
+}
+
+pub(super) fn sync_test_result_view(
+    view: TestResultView,
+    dpi: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    message: &str,
+) {
+    if view.editor.is_invalid() {
+        return;
+    }
+    let maximum = test_result_layout_with_height(left, top, right, TEST_RESULT_MAX_HEIGHT);
+    unsafe {
+        let rect = scaled_rect(maximum.editor, dpi);
+        let _ = SetWindowPos(
+            view.editor,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        let _ = ShowWindow(view.editor, SW_SHOW);
+        let _ = SetWindowTextW(view.editor, PCWSTR(wide(message).as_ptr()));
+        SendMessageW(view.editor, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+        SendMessageW(view.editor, EM_SCROLLCARET, None, None);
+    }
+    let layout = test_result_layout(view.editor, left, top, right);
+    unsafe {
+        let rect = scaled_rect(layout.editor, dpi);
+        let _ = SetWindowPos(
+            view.editor,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+    }
+}
+
+pub(super) fn hide_test_result_view(view: TestResultView) {
+    if !view.editor.is_invalid() {
+        unsafe {
+            let _ = ShowWindow(view.editor, SW_HIDE);
+        }
+    }
+}
+
+pub(super) fn paint_test_result(
+    hdc: HDC,
+    dpi: u32,
+    status: TestResultState,
+    layout: TestResultLayout,
+    focused: bool,
+) {
+    let scale = |value| platform::scale(value, dpi);
+    unsafe {
+        rounded_box(
+            hdc,
+            layout.frame,
+            rgb(26, 35, 39),
+            if focused {
+                rgb(92, 192, 176)
+            } else {
+                rgb(54, 68, 74)
+            },
+            scale(7),
+        );
+        match status {
+            TestResultState::Idle => {}
+            TestResultState::Testing => {
+                rounded_box(
+                    hdc,
+                    layout.icon,
+                    rgb(75, 99, 103),
+                    rgb(75, 99, 103),
+                    scale(10),
+                );
+                // Rendering the ellipsis glyph inherits font-side bearings and a
+                // baseline, so it is visibly off-centre inside the circular icon.
+                // Draw the three dots from the icon geometry instead.
+                let dot = scale(3).max(2);
+                let gap = scale(1).max(1);
+                let total_width = dot * 3 + gap * 2;
+                let left =
+                    layout.icon.left + (layout.icon.right - layout.icon.left - total_width) / 2;
+                let top = layout.icon.top + (layout.icon.bottom - layout.icon.top - dot) / 2;
+                for index in 0..3 {
+                    let dot_left = left + index * (dot + gap);
+                    rounded_box(
+                        hdc,
+                        RECT {
+                            left: dot_left,
+                            top,
+                            right: dot_left + dot,
+                            bottom: top + dot,
+                        },
+                        rgb(16, 28, 30),
+                        rgb(16, 28, 30),
+                        (dot / 2).max(1),
+                    );
+                }
+            }
+            TestResultState::Succeeded => {
+                rounded_box(
+                    hdc,
+                    layout.icon,
+                    rgb(104, 201, 88),
+                    rgb(104, 201, 88),
+                    scale(10),
+                );
+                let center_x = (layout.icon.left + layout.icon.right) / 2;
+                let center_y = (layout.icon.top + layout.icon.bottom) / 2;
+                stroke_polyline(
+                    hdc,
+                    &[
+                        POINT {
+                            x: center_x - scale(5),
+                            y: center_y,
+                        },
+                        POINT {
+                            x: center_x - scale(1),
+                            y: center_y + scale(4),
+                        },
+                        POINT {
+                            x: center_x + scale(6),
+                            y: center_y - scale(5),
+                        },
+                    ],
+                    rgb(8, 49, 35),
+                    scale(2).max(1),
+                );
+            }
+            TestResultState::Failed => {
+                rounded_box(
+                    hdc,
+                    layout.icon,
+                    rgb(239, 86, 91),
+                    rgb(239, 86, 91),
+                    scale(10),
+                );
+                let center_x = (layout.icon.left + layout.icon.right) / 2;
+                let center_y = (layout.icon.top + layout.icon.bottom) / 2;
+                let radius = scale(4);
+                stroke_polyline(
+                    hdc,
+                    &[
+                        POINT {
+                            x: center_x - radius,
+                            y: center_y - radius,
+                        },
+                        POINT {
+                            x: center_x + radius,
+                            y: center_y + radius,
+                        },
+                    ],
+                    rgb(57, 19, 23),
+                    scale(2).max(1),
+                );
+                stroke_polyline(
+                    hdc,
+                    &[
+                        POINT {
+                            x: center_x + radius,
+                            y: center_y - radius,
+                        },
+                        POINT {
+                            x: center_x - radius,
+                            y: center_y + radius,
+                        },
+                    ],
+                    rgb(57, 19, 23),
+                    scale(2).max(1),
+                );
+            }
+        }
+    }
+}
+
+pub(super) fn test_result_text_color(status: TestResultState) -> COLORREF {
+    match status {
+        TestResultState::Idle => rgb(235, 242, 243),
+        TestResultState::Testing => rgb(174, 193, 196),
+        TestResultState::Succeeded => rgb(108, 207, 94),
+        TestResultState::Failed => rgb(255, 112, 116),
+    }
+}
+
+fn connectivity_result_state(state: &SettingsState) -> TestResultState {
+    match state.connectivity_status {
+        ConnectivityStatus::Idle => TestResultState::Idle,
+        ConnectivityStatus::Testing => TestResultState::Testing,
+        ConnectivityStatus::Succeeded => TestResultState::Succeeded,
+        ConnectivityStatus::Failed(_) => TestResultState::Failed,
+    }
+}
+
+fn connectivity_result_message(state: &SettingsState) -> String {
+    match &state.connectivity_status {
+        ConnectivityStatus::Idle => String::new(),
+        ConnectivityStatus::Testing => state.language.text("testing_connectivity").into(),
+        ConnectivityStatus::Succeeded => format!(
+            "{} ({} ms)",
+            state.language.text("connectivity_success"),
+            state.connectivity_elapsed
+        ),
+        ConnectivityStatus::Failed(error) => {
+            format!("{}{}", state.language.text("connectivity_failed"), error)
+        }
+    }
+}
+
+fn connectivity_result_bounds(state: &SettingsState) -> Option<(i32, i32, i32)> {
+    if matches!(state.connectivity_status, ConnectivityStatus::Idle)
+        || advanced_audio::workflow_test_requested(state)
+    {
+        return None;
+    }
     let active = GROUPS
         .get(state.active_group)
         .map(|group| group.0)
         .unwrap_or("Display");
-    if (active == "Rewrite") != state.rewrite_test {
+    match (active, state.rewrite_test) {
+        ("API", false) => Some((EDIT_LEFT, API_TEST_RESULT_TOP, EDIT_LEFT + EDIT_WIDTH)),
+        ("Rewrite", true) => Some((
+            CONTENT_LEFT,
+            REWRITE_TEST_RESULT_TOP,
+            EDIT_LEFT + EDIT_WIDTH,
+        )),
+        _ => None,
+    }
+}
+
+fn sync_connectivity_result(state: &SettingsState) {
+    let Some((left, top, right)) = connectivity_result_bounds(state) else {
+        hide_test_result_view(state.connectivity_result);
         return;
-    }
-    let left = if state.rewrite_test {
-        CONTENT_LEFT
-    } else {
-        EDIT_LEFT
     };
-    match &state.connectivity_status {
-        ConnectivityStatus::Idle => {}
-        ConnectivityStatus::Testing => unsafe {
-            draw_text_line(
-                hdc,
-                state.font,
-                state.language.text("testing_connectivity"),
-                rgb(230, 240, 240),
-                RECT {
-                    left: s(left),
-                    top: s(507),
-                    right: s(EDIT_LEFT + EDIT_WIDTH),
-                    bottom: s(541),
-                },
-                DT_LEFT,
-            );
-        },
-        ConnectivityStatus::Succeeded => unsafe {
-            let icon = RECT {
-                left: s(left),
-                top: s(514),
-                right: s(left + 20),
-                bottom: s(534),
-            };
-            rounded_box(hdc, icon, rgb(104, 201, 88), rgb(104, 201, 88), s(10));
-            let center_x = (icon.left + icon.right) / 2;
-            let center_y = (icon.top + icon.bottom) / 2;
-            stroke_polyline(
-                hdc,
-                &[
-                    POINT {
-                        x: center_x - s(5),
-                        y: center_y,
-                    },
-                    POINT {
-                        x: center_x - s(1),
-                        y: center_y + s(4),
-                    },
-                    POINT {
-                        x: center_x + s(6),
-                        y: center_y - s(5),
-                    },
-                ],
-                rgb(8, 49, 35),
-                s(2).max(1),
-            );
-            draw_text_line(
-                hdc,
-                state.font,
-                &format!(
-                    "{} ({} ms)",
-                    state.language.text("connectivity_success"),
-                    state.connectivity_elapsed
-                ),
-                rgb(108, 207, 94),
-                RECT {
-                    left: s(left + 30),
-                    top: s(507),
-                    right: s(EDIT_LEFT + EDIT_WIDTH),
-                    bottom: s(541),
-                },
-                DT_LEFT,
-            );
-        },
-        ConnectivityStatus::Failed(error) => unsafe {
-            let card = RECT {
-                left: s(left),
-                top: s(506),
-                right: s(EDIT_LEFT + EDIT_WIDTH),
-                bottom: s(554),
-            };
-            rounded_box(hdc, card, rgb(47, 27, 30), rgb(226, 67, 74), s(7));
-            let icon = RECT {
-                left: s(left + 11),
-                top: s(519),
-                right: s(left + 31),
-                bottom: s(539),
-            };
-            rounded_box(hdc, icon, rgb(239, 86, 91), rgb(239, 86, 91), s(4));
-            draw_text_line(hdc, state.title_font, "!", rgb(41, 22, 24), icon, DT_CENTER);
-            let message = format!("{}{}", state.language.text("connectivity_failed"), error);
-            draw_text_wrapped(
-                hdc,
-                state.small_font,
-                &message,
-                rgb(255, 112, 116),
-                RECT {
-                    left: s(left + 42),
-                    top: s(512),
-                    right: s(EDIT_LEFT + EDIT_WIDTH - 10),
-                    bottom: s(548),
-                },
-            );
-        },
-    }
+    sync_test_result_view(
+        state.connectivity_result,
+        state.dpi,
+        left,
+        top,
+        right,
+        &connectivity_result_message(state),
+    );
+}
+
+unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
+    let Some((left, top, right)) = connectivity_result_bounds(state) else {
+        return;
+    };
+    let layout = test_result_layout(state.connectivity_result.editor, left, top, right);
+    let layout = TestResultLayout {
+        icon: scaled_rect(layout.icon, state.dpi),
+        frame: scaled_rect(layout.frame, state.dpi),
+        editor: scaled_rect(layout.editor, state.dpi),
+    };
+    paint_test_result(
+        hdc,
+        state.dpi,
+        connectivity_result_state(state),
+        layout,
+        unsafe { GetFocus() } == state.connectivity_result.editor,
+    );
 }
 
 fn refresh_language(state: &SettingsState) {
@@ -2297,6 +2583,7 @@ fn refresh_language(state: &SettingsState) {
     }
     rewrite::refresh_labels(state);
     advanced_audio::sync_visibility(state);
+    sync_connectivity_result(state);
     for (hwnd, key) in &state.localized_controls {
         let text = if *key == "API" {
             "API"
@@ -2331,6 +2618,7 @@ fn update_page_visibility(state: &SettingsState) {
         }
     }
     advanced_audio::sync_visibility(state);
+    sync_connectivity_result(state);
     if active != "Display" || !state.language_open {
         unsafe {
             let _ = ShowWindow(state.language_panel, SW_HIDE);
@@ -2426,6 +2714,7 @@ fn select_language(state: &mut SettingsState, index: usize) {
 }
 
 fn test_connectivity(state: &mut SettingsState) {
+    advanced_audio::clear_workflow_test(state);
     start_connectivity(state, false);
 }
 
@@ -2442,6 +2731,8 @@ fn start_connectivity(state: &mut SettingsState, rewrite: bool) {
         Ok(config) => config,
         Err(error) => {
             state.connectivity_status = ConnectivityStatus::Failed(error);
+            advanced_audio::sync_visibility(state);
+            sync_connectivity_result(state);
             unsafe {
                 let _ = InvalidateRect(Some(state.hwnd), None, true);
             }
@@ -2467,6 +2758,7 @@ fn start_connectivity(state: &mut SettingsState, rewrite: bool) {
         }
     }
     advanced_audio::update_controls(state);
+    sync_connectivity_result(state);
     unsafe {
         let _ = InvalidateRect(Some(state.hwnd), None, true);
     }
@@ -2530,6 +2822,7 @@ fn poll_connectivity(state: &mut SettingsState) {
         }
     }
     advanced_audio::update_controls(state);
+    sync_connectivity_result(state);
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
             Some(state.hwnd),

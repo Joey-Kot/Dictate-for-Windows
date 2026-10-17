@@ -115,22 +115,23 @@ pub async fn publish_remote_audio(
     delivery: AudioDeliveryType,
     audio: &PreparedAudio,
     cancellation: &CancellationToken,
+    upload_debug: bool,
 ) -> Result<PublishedRemoteAudio, RemoteAudioError> {
     match config {
         RemoteAudioConfig::None => Err(RemoteAudioError::NotConfigured),
         RemoteAudioConfig::Webdav(settings) => {
             WebDavPublisher::new(client.clone(), settings.clone())
-                .publish_for_delivery(audio, delivery, cancellation)
+                .publish_for_delivery(audio, delivery, cancellation, upload_debug)
                 .await
         }
         RemoteAudioConfig::S3Compatible(settings) => {
             S3CompatiblePublisher::new(client.clone(), settings.clone())
-                .publish_for_delivery(audio, delivery, cancellation)
+                .publish_for_delivery(audio, delivery, cancellation, upload_debug)
                 .await
         }
         RemoteAudioConfig::AliyunOss(settings) => {
             AliyunOssPublisher::new(client.clone(), settings.clone())
-                .publish_for_delivery(audio, delivery, cancellation)
+                .publish_for_delivery(audio, delivery, cancellation, upload_debug)
                 .await
         }
     }
@@ -145,38 +146,43 @@ pub async fn cleanup_remote_audio(
     client: &reqwest::Client,
     published: &PublishedRemoteAudio,
     force: bool,
+    upload_debug: bool,
 ) {
     cleanup_best_effort(
         client,
         &published.cleanup,
         force,
-        "[remote-audio] cleanup failed",
+        upload_debug,
+        "recognition",
     )
     .await;
 }
 
 /// A failed or canceled upload may still have created the object remotely.
 /// The caller retains its original upload error regardless of this cleanup.
-async fn cleanup_after_upload_failure(client: &reqwest::Client, cleanup: &RemoteCleanup) {
+async fn cleanup_after_upload_failure(
+    client: &reqwest::Client,
+    cleanup: &RemoteCleanup,
+    upload_debug: bool,
+) {
     // `delete_after_recognition` governs retention after a completed
     // recognition workflow. An upload that failed or was canceled never
     // reached recognition, so always try to remove its possibly-created
     // object.
-    cleanup_best_effort(
-        client,
-        cleanup,
-        true,
-        "[remote-audio] upload cleanup failed",
-    )
-    .await;
+    cleanup_best_effort(client, cleanup, true, upload_debug, "upload").await;
 }
 
 async fn cleanup_best_effort(
     client: &reqwest::Client,
     cleanup: &RemoteCleanup,
     force: bool,
-    failure_message: &'static str,
+    upload_debug: bool,
+    phase: &'static str,
 ) {
+    debug(
+        upload_debug,
+        format_args!("[upload] remote-audio event=cleanup-start force={force}"),
+    );
     let result = match cleanup {
         RemoteCleanup::WebDav(object) => webdav::cleanup(client, object, force).await,
         RemoteCleanup::S3(object) => s3::cleanup(client, object, force).await,
@@ -187,10 +193,23 @@ async fn cleanup_best_effort(
         // presigned query string.  Do not format the error here: this helper
         // has no Config available for central redaction, and cleanup is
         // intentionally best-effort anyway.
-        crate::debug_log::write(
-            crate::debug_log::Category::Upload,
-            format_args!("{failure_message}"),
+        debug(
+            upload_debug,
+            format_args!(
+                "[upload] remote-audio event=cleanup-failed phase={phase} kind=remote-cleanup"
+            ),
         );
+    } else {
+        debug(
+            upload_debug,
+            format_args!("[upload] remote-audio event=cleanup-complete"),
+        );
+    }
+}
+
+pub(super) fn debug(upload_debug: bool, message: fmt::Arguments<'_>) {
+    if upload_debug {
+        crate::debug_log::write(crate::debug_log::Category::Upload, message);
     }
 }
 
@@ -449,11 +468,12 @@ mod tests {
             AudioDeliveryType::PublicHttpsUrl,
             &audio,
             &CancellationToken::new(),
+            false,
         )
         .await
         .unwrap();
         let public_url = published.reference().public_https_url().unwrap().to_owned();
-        cleanup_remote_audio(&client, &published, false).await;
+        cleanup_remote_audio(&client, &published, false, false).await;
 
         let (upload_request, delete_request) = server.await.unwrap();
         let (upload_target, upload_headers, upload_body) = request_parts(&upload_request);
@@ -513,6 +533,7 @@ mod tests {
             AudioDeliveryType::PublicHttpsUrl,
             &audio,
             &CancellationToken::new(),
+            false,
         )
         .await
         .unwrap_err();
@@ -569,6 +590,7 @@ mod tests {
                 AudioDeliveryType::PublicHttpsUrl,
                 &audio,
                 &publish_cancellation,
+                false,
             )
             .await
         });
@@ -616,6 +638,7 @@ mod tests {
             AudioDeliveryType::CloudUri,
             &audio,
             &CancellationToken::new(),
+            false,
         )
         .await
         .unwrap_err();
@@ -656,6 +679,7 @@ mod tests {
             AudioDeliveryType::CloudUri,
             &audio,
             &CancellationToken::new(),
+            false,
         )
         .await
         .unwrap_err();

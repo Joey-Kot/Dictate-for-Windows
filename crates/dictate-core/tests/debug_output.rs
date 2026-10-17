@@ -242,7 +242,7 @@ async fn exercise() {
         let (endpoint, task) = server(vec![
             (
                 503,
-                r#"{"error":"audio-secret query-secret other-prompt-secret"}"#,
+                r#"{"error":"audio-error-body-echo audio-secret query-secret other-prompt-secret"}"#,
             ),
             (200, r#"{"text":"private audio output"}"#),
         ])
@@ -320,7 +320,10 @@ async fn exercise() {
         prompt_credential_requests(&config, &cancel).await;
 
         let (endpoint, task) = server(vec![
-            (429, r#"{"error":"rewrite-secret"}"#),
+            (
+                429,
+                r#"{"error":"rewrite-error-body-echo rewrite-secret private prompt private input"}"#,
+            ),
             (
                 200,
                 r#"{"choices":[{"message":{"content":"private rewrite output"}}]}"#,
@@ -364,17 +367,17 @@ async fn exercise() {
                 .collect::<Vec<_>>()
                 .join("\n");
             for expected in [
-                "Audio attempt 2/2",
-                "HTTP 503",
-                "HTTP 429",
-                "Rewrite retry",
-                "Audio connectivity",
-                "Audio request failed",
-                "Rewrite connectivity",
-                "elapsed=",
-                "[redacted]",
-                "basic-auth-echo",
-                "prompt-credentials-echo",
+                "audio event=attempt-start attempt=2",
+                "status=503",
+                "status=429",
+                "rewrite event=retry",
+                "audio event=connectivity-start",
+                "rewrite event=connectivity-start",
+                "event=request-start",
+                "event=response-headers",
+                "event=response-complete",
+                "event=parse-complete",
+                "elapsed_ms=",
             ] {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }
@@ -405,6 +408,10 @@ async fn exercise() {
                 "private input",
                 "private audio output",
                 "private rewrite output",
+                "audio-error-body-echo",
+                "rewrite-error-body-echo",
+                "basic-auth-echo",
+                "prompt-credentials-echo",
             ] {
                 assert!(!text.contains(private), "leaked {private}: {text}");
             }

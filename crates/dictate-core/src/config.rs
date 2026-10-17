@@ -118,8 +118,6 @@ pub struct Config {
     pub cache_dir: String,
     #[serde(rename = "KEEP_CACHE")]
     pub keep_cache: bool,
-    #[serde(rename = "REQUEST_FAILED_NOTIFICATION")]
-    pub request_failed_notification: bool,
     #[serde(rename = "FFMPEG_DEBUG")]
     pub ffmpeg_debug: bool,
     #[serde(rename = "RECORD_DEBUG")]
@@ -174,7 +172,6 @@ impl Default for Config {
             clipboard_restore_delay: 120,
             cache_dir: String::new(),
             keep_cache: false,
-            request_failed_notification: false,
             ffmpeg_debug: false,
             record_debug: false,
             hotkey_debug: true,
@@ -603,7 +600,7 @@ mod tests {
         let output: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert!(!output.contains_key("NOTIFICATION"));
-        assert!(output.contains_key("REQUEST_FAILED_NOTIFICATION"));
+        assert!(!output.contains_key("REQUEST_FAILED_NOTIFICATION"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod additional_parameters;
 pub mod advanced_audio;
 pub mod asr;
 pub mod audio_api;
+pub(crate) mod audio_failure;
 pub mod cache;
 pub mod clipboard;
 pub mod config;

@@ -211,13 +211,15 @@ ranges. If analysis finds that the entire source is silent, preparation returns
 Each exported file runs one complete existing `AudioApiClient` workflow. The
 concurrency setting limits complete workflows, not merely upload HTTP requests:
 for Advanced remote or asynchronous paths it includes publishing, submit,
-polling, result retrieval, and the workflow's cleanup. On the first segment
-failure or user cancellation, no additional segment is scheduled; already
-started workflows receive cancellation and are allowed to finish their normal
-cleanup before the batch returns. A batch produces text only when every segment
-succeeds, then concatenates the segment texts in original source order without
-inserting spaces, punctuation, or another separator. Failure or cancellation
-does not produce a partial transcript.
+polling, result retrieval, and the workflow's cleanup. A terminal request
+failure remains at its source position while other segments continue. For
+interactive transcription, a retry-exhausted service or response failure is
+represented by a concise, redacted placeholder; successful segment text is
+otherwise concatenated in original source order without separators. User
+cancellation stops dispatch, cancels started work, and produces no placeholder.
+Local configuration or media failures remain ordinary batch errors rather than
+transcript text. Connection tests and CLI `--file` keep strict error behavior
+and never produce a degraded transcript.
 
 For an interactive retryable recording, Dictate retains the original WAV under
 the existing in-memory retry limit and freezes its upload mode, `SegmentPlan`,
@@ -293,9 +295,11 @@ setting, while retaining the original error.
 
 In a segmented non-realtime batch, every started segment has its own remote
 publication, recognition, and cleanup lifecycle. A batch never turns several
-segments into one shared remote object. If a batch fails or is canceled, it
-stops launching later segments, cancels the started workflows, and waits for
-their existing per-object cleanup paths before returning.
+segments into one shared remote object. A terminal request failure completes
+its own cleanup and stays at that segment's source position while later
+segments continue. User cancellation stops launches, cancels started
+workflows, and waits for their existing per-object cleanup paths before
+returning.
 
 ## Realtime behavior
 
@@ -346,15 +350,16 @@ request or token limits.
 
 ## Privacy, diagnostics, and limits
 
-With `UPLOAD_DEBUG`, Advanced operations log only fixed phase labels. They do
-not log rendered URLs, query strings, headers, bodies, audio, captures, or
-transcripts. Workflow secrets, remote-storage credentials, URL userinfo/query
-credentials, presigned URLs, AWS/TC3 signatures, and values from sensitive
-captures are redacted before diagnostic or error-response paths. Debug output
-for Advanced config and remote references also redacts credentials and cleanup
-details. Before sending GUI workflow-generation input to Rewrite, the GUI
-applies best-effort credential redaction to both user requirements and vendor
-material.
+With `UPLOAD_DEBUG`, Advanced operations log fixed lifecycle metadata: phase,
+attempt, method, status, response size/timing, retry, cancellation, and
+terminal state. They do not log rendered URLs, query strings, raw headers,
+bodies, audio, captures, or transcripts. Workflow secrets, remote-storage
+credentials, URL userinfo/query credentials, presigned URLs, AWS/TC3
+signatures, and values from sensitive captures are redacted before diagnostic
+or error-response paths. Debug output for Advanced config and remote
+references also redacts credentials and cleanup details. Before sending GUI
+workflow-generation input to Rewrite, the GUI applies best-effort credential
+redaction to both user requirements and vendor material.
 
 The bounded limits are: workflow JSON 256 KiB; one template 32 KiB; at most
 64 parameters, secrets, headers, query entries, captures, or stream rules; at

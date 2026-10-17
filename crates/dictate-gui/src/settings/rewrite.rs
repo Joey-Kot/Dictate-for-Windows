@@ -17,13 +17,15 @@ const ID_DOWN: usize = 0x6806;
 pub const ID_TEST: usize = 0x6807;
 const ID_OPTION: usize = 0x6820;
 const WM_PROVIDER_ACTION: u32 = WM_APP + 86;
+const PROVIDER_PANEL_SUBCLASS_ID: usize = 10;
 const EDITOR_WIDTH: i32 = 700;
 const EDITOR_HEADER: i32 = 38;
 const EDITOR_BODY_HEIGHT: i32 = 598;
 const EDITOR_API_HEIGHT: i32 = 126;
-const EDITOR_TEST_HEIGHT: i32 = 54;
+const EDITOR_TEST_BOTTOM_GAP: i32 = 10;
 const ID_EDITOR_PROVIDER: usize = 0x69f0;
 const ID_EDITOR_TEST: usize = 0x69f1;
+const ID_EDITOR_TEST_STATUS: usize = 0x69f3;
 const ID_EDITOR_API: usize = 0x6920;
 const ID_EDITOR_OPTION: usize = 0x6a00;
 const WM_EDITOR_REVEAL: u32 = WM_APP + 87;
@@ -156,6 +158,7 @@ pub fn handle_message(
                 1
             })
             % Provider::ALL.len();
+        reveal_provider_option(state, next);
         unsafe {
             let _ = SetFocus(Some(state.rewrite.provider_items[next]));
         }
@@ -168,6 +171,8 @@ pub struct Page {
     pub provider_open: bool,
     pub provider_items: Vec<HWND>,
     panel: HWND,
+    provider_scrollbar: HWND,
+    provider_offset: i32,
     list: HWND,
     scrollbar: HWND,
 }
@@ -179,6 +184,8 @@ impl Page {
             provider_open: false,
             provider_items: vec![],
             panel: HWND::default(),
+            provider_scrollbar: HWND::default(),
+            provider_offset: 0,
             list: HWND::default(),
             scrollbar: HWND::default(),
         }
@@ -342,6 +349,23 @@ pub fn create(
     state.controls.insert("__rewrite_scrollbar", scrollbar);
     state.control_groups.insert(scrollbar.0 as usize, "Rewrite");
     state.rewrite.panel = dropdown::create_panel(state, instance)?;
+    if !unsafe {
+        windows::Win32::UI::Shell::SetWindowSubclass(
+            state.rewrite.panel,
+            Some(provider_menu_scroll_proc),
+            PROVIDER_PANEL_SUBCLASS_ID,
+            state.hwnd.0 as usize,
+        )
+    }
+    .as_bool()
+    {
+        return Err("Unable to initialize provider dropdown scrolling".into());
+    }
+    state.rewrite.provider_scrollbar = dropdown_scrollbar::attach_viewport_with_background(
+        state.rewrite.panel,
+        state.dpi,
+        dropdown::background(),
+    )?;
     for (index, provider) in Provider::ALL.iter().enumerate() {
         let item = create_child(
             state,
@@ -367,7 +391,7 @@ pub fn create(
         state.language.text("rewrite_network_hint"),
         WS_CHILD | WS_VISIBLE,
         CONTENT_LEFT,
-        564,
+        576,
         536,
         36,
         0,
@@ -426,34 +450,162 @@ fn provider_menu(state: &mut SettingsState) {
         close_provider(state);
         return;
     }
-    let width = dropdown::position(
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(state.hwnd, &mut client);
+    }
+    // The provider list can exceed a short settings window. Bound it to the
+    // visible content area and use the menu's viewport for the remaining rows.
+    let available = (client.bottom
+        - platform::scale(
+            HEADER_HEIGHT + FOOTER_HEIGHT + dropdown::PADDING * 2,
+            state.dpi,
+        ))
+    .max(1);
+    let content_height =
+        platform::scale(state.rewrite.provider_items.len() as i32 * 32, state.dpi).min(available);
+    dropdown::position_pixels(
         state.rewrite.panel,
         state.controls["rewrite_provider"],
-        Provider::ALL.len() as i32 * 32,
+        content_height,
         state.dpi,
     );
+    state.rewrite.provider_offset = 0;
+    state.rewrite.provider_open = true;
+    let index = Provider::ALL
+        .iter()
+        .position(|p| *p == state.rewrite.config.provider)
+        .unwrap_or(0);
+    reveal_provider_option(state, index);
+    for item in &state.rewrite.provider_items {
+        unsafe {
+            let _ = ShowWindow(*item, SW_SHOW);
+        }
+    }
+    unsafe {
+        let _ = ShowWindow(state.rewrite.panel, SW_SHOW);
+        let _ = SetFocus(Some(state.rewrite.provider_items[index]));
+    }
+}
+
+fn layout_provider_menu(state: &SettingsState) {
+    let panel = state.rewrite.panel;
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(panel, &mut client);
+    }
+    let padding = platform::scale(dropdown::PADDING, state.dpi);
+    let extent = platform::scale(
+        state.rewrite.provider_items.len() as i32 * 32 + dropdown::PADDING * 2,
+        state.dpi,
+    );
+    let scrolling = extent > client.bottom;
+    let gutter = if scrolling {
+        dropdown_scrollbar::thickness(state.dpi)
+    } else {
+        0
+    };
     for (index, item) in state.rewrite.provider_items.iter().enumerate() {
+        let top =
+            padding + platform::scale(index as i32 * 32, state.dpi) - state.rewrite.provider_offset;
         unsafe {
             let _ = SetWindowPos(
                 *item,
                 None,
-                platform::scale(8, state.dpi),
-                platform::scale(8 + index as i32 * 32, state.dpi),
-                width,
+                padding,
+                top,
+                (client.right - padding * 2 - gutter).max(1),
                 platform::scale(32, state.dpi),
                 SWP_NOACTIVATE,
             );
-            let _ = ShowWindow(*item, SW_SHOW);
         }
     }
-    state.rewrite.provider_open = true;
+    dropdown_scrollbar::position_rect(
+        state.rewrite.provider_scrollbar,
+        RECT {
+            left: client.right - padding - gutter,
+            top: padding,
+            right: client.right - padding,
+            bottom: client.bottom - padding,
+        },
+        state.dpi,
+    );
     unsafe {
-        let _ = ShowWindow(state.rewrite.panel, SW_SHOW);
-        let index = Provider::ALL
-            .iter()
-            .position(|p| *p == state.rewrite.config.provider)
-            .unwrap_or(0);
-        let _ = SetFocus(Some(state.rewrite.provider_items[index]));
+        let _ = ShowWindow(
+            state.rewrite.provider_scrollbar,
+            if scrolling { SW_SHOW } else { SW_HIDE },
+        );
+        let _ = InvalidateRect(Some(panel), None, true);
+    }
+}
+
+fn reveal_provider_option(state: &mut SettingsState, index: usize) {
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(state.rewrite.panel, &mut client);
+    }
+    let padding = platform::scale(dropdown::PADDING, state.dpi);
+    let top = platform::scale(index as i32 * 32, state.dpi);
+    let bottom = platform::scale((index as i32 + 1) * 32, state.dpi);
+    let page = (client.bottom - padding * 2).max(1);
+    let extent = platform::scale(state.rewrite.provider_items.len() as i32 * 32, state.dpi);
+    let target = if top < state.rewrite.provider_offset {
+        top
+    } else if bottom > state.rewrite.provider_offset + page {
+        bottom - page
+    } else {
+        state.rewrite.provider_offset
+    };
+    state.rewrite.provider_offset = target.clamp(0, (extent - page).max(0));
+    layout_provider_menu(state);
+}
+
+unsafe extern "system" fn provider_menu_scroll_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    let root = HWND(data as *mut std::ffi::c_void);
+    let pointer = unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *mut SettingsState;
+    if pointer.is_null() {
+        if message == WM_NCDESTROY {
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(provider_menu_scroll_proc), id);
+            }
+        }
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    let state = unsafe { &mut *pointer };
+    match message {
+        dropdown_scrollbar::VIEWPORT_GET_EXTENT => LRESULT(platform::scale(
+            state.rewrite.provider_items.len() as i32 * 32 + dropdown::PADDING * 2,
+            state.dpi,
+        ) as isize),
+        dropdown_scrollbar::VIEWPORT_GET_OFFSET => LRESULT(state.rewrite.provider_offset as isize),
+        dropdown_scrollbar::VIEWPORT_SET_OFFSET => {
+            if state.rewrite.provider_offset != wparam.0 as i32 {
+                state.rewrite.provider_offset = wparam.0 as i32;
+                layout_provider_menu(state);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => unsafe {
+            SendMessageW(
+                state.rewrite.provider_scrollbar,
+                message,
+                Some(wparam),
+                Some(lparam),
+            )
+        },
+        WM_NCDESTROY => unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(provider_menu_scroll_proc), id);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        },
+        _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
     }
 }
 
@@ -530,6 +682,7 @@ pub fn command(state: &mut SettingsState, id: usize, notification: u32) -> bool 
     }
     close_provider(state);
     if id == ID_TEST {
+        advanced_audio::clear_workflow_test(state);
         start_connectivity(state, true);
         return true;
     }
@@ -694,6 +847,8 @@ struct Editor {
     buttons: [HWND; 3],
     status: HWND,
     test_status: HWND,
+    test_result_state: TestResultState,
+    test_result_height: i32,
     test_cancel: tokio_util::sync::CancellationToken,
     test_receiver: Option<std::sync::mpsc::Receiver<(Result<(), String>, u128)>>,
     runtime: Arc<Runtime>,
@@ -712,7 +867,12 @@ impl Editor {
     fn content_height(&self) -> i32 {
         EDITOR_BODY_HEIGHT
             + if self.independent() {
-                EDITOR_API_HEIGHT + EDITOR_TEST_HEIGHT
+                EDITOR_API_HEIGHT
+                    + if self.test_result_state != TestResultState::Idle {
+                        self.test_result_height + EDITOR_TEST_BOTTOM_GAP
+                    } else {
+                        0
+                    }
             } else {
                 0
             }
@@ -788,6 +948,8 @@ fn edit_prompt(
         buttons: [HWND::default(); 3],
         status: HWND::default(),
         test_status: HWND::default(),
+        test_result_state: TestResultState::Idle,
+        test_result_height: 0,
         test_cancel: tokio_util::sync::CancellationToken::new(),
         test_receiver: None,
         runtime,
@@ -1225,20 +1387,34 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
     )?;
     editor.test_status = editor_body_child(
         editor,
-        w!("STATIC"),
+        w!("EDIT"),
         "",
-        WINDOW_STYLE(0),
+        WS_TABSTOP
+            | WINDOW_STYLE(
+                (ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY) as u32 | WS_CLIPCHILDREN.0,
+            ),
         RECT {
-            left: 24,
-            top: 598,
-            right: 660,
-            bottom: 642,
+            left: 60,
+            top: 603,
+            right: 654,
+            bottom: 667,
         },
-        0,
+        ID_EDITOR_TEST_STATUS,
         true,
         true,
         None,
     )?;
+    apply_dark_theme(editor.test_status);
+    let margin = platform::scale(7, editor.dpi) as u32;
+    unsafe {
+        SendMessageW(
+            editor.test_status,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM((margin | (margin << 16)) as isize)),
+        );
+    }
+    dropdown_scrollbar::attach_edit(editor.test_status, editor.dpi)?;
     let mut context = vec![
         ("Start".into(), editor.config.start_key.clone()),
         ("Pause".into(), editor.config.pause_key.clone()),
@@ -1483,16 +1659,45 @@ fn redraw_editor_controls(parent: HWND) {
     }
 }
 
+fn editor_test_result_visible(editor: &Editor) -> bool {
+    editor.independent() && editor.test_result_state != TestResultState::Idle
+}
+
+fn editor_test_result_layout(editor: &Editor) -> TestResultLayout {
+    test_result_layout_with_height(
+        24,
+        EDITOR_BODY_HEIGHT,
+        660,
+        editor.test_result_height.max(TEST_RESULT_MIN_HEIGHT),
+    )
+}
+
+fn editor_test_result_layout_in_body(editor: &Editor) -> TestResultLayout {
+    let layout = editor_test_result_layout(editor);
+    let translate = |rect| editor.content_rect(rect, true);
+    TestResultLayout {
+        icon: translate(layout.icon),
+        frame: translate(layout.frame),
+        editor: translate(layout.editor),
+    }
+}
+
 fn layout_editor_body(editor: &Editor) {
     position_editor_controls(editor.layouts.iter().map(|item| {
-        let mut rect = editor.content_rect(item.rect, item.after_api);
+        let (mut rect, visible) = if item.hwnd == editor.test_status {
+            (
+                editor_test_result_layout_in_body(editor).editor,
+                editor_test_result_visible(editor),
+            )
+        } else {
+            (
+                editor.content_rect(item.rect, item.after_api),
+                !item.independent_only || editor.independent(),
+            )
+        };
         rect.top -= editor.offset;
         rect.bottom -= editor.offset;
-        (
-            item.hwnd,
-            rect,
-            !item.independent_only || editor.independent(),
-        )
+        (item.hwnd, rect, visible)
     }));
     redraw_editor_controls(editor.body);
 }
@@ -1504,7 +1709,12 @@ fn reveal_editor_control(editor: &mut Editor, hwnd: HWND) {
     if item.independent_only && !editor.independent() {
         return;
     }
-    let mut rect = editor.content_rect(item.frame.unwrap_or(item.rect), item.after_api);
+    let mut rect = if hwnd == editor.test_status {
+        editor_test_result_layout(editor).frame
+    } else {
+        item.frame.unwrap_or(item.rect)
+    };
+    rect = editor.content_rect(rect, item.after_api);
     rect.top = (rect.top - platform::scale(28, editor.dpi)).max(0);
     rect.bottom += platform::scale(8, editor.dpi);
     let mut client = RECT::default();
@@ -1790,15 +2000,49 @@ fn read_editor_prompt(editor: &Editor) -> RewritePrompt {
     prompt
 }
 
+fn set_editor_test_result(editor: &mut Editor, status: TestResultState, message: &str) {
+    editor.test_result_state = status;
+    // Lay out at the maximum height first so the native EDIT control computes
+    // wrapped line count against its final width even when it was hidden.
+    editor.test_result_height = TEST_RESULT_MAX_HEIGHT;
+    resize_editor(editor, None);
+    unsafe {
+        let _ = SetWindowTextW(editor.test_status, PCWSTR(wide(message).as_ptr()));
+        SendMessageW(
+            editor.test_status,
+            windows::Win32::UI::Controls::EM_SETSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+        SendMessageW(
+            editor.test_status,
+            windows::Win32::UI::Controls::EM_SCROLLCARET,
+            None,
+            None,
+        );
+    }
+    editor.test_result_height = test_result_height(editor.test_status);
+    resize_editor(editor, None);
+}
+
+fn clear_editor_test_result(editor: &mut Editor) {
+    editor.test_result_state = TestResultState::Idle;
+    editor.test_result_height = 0;
+    unsafe {
+        let _ = SetWindowTextW(editor.test_status, w!(""));
+    }
+    resize_editor(editor, None);
+}
+
 fn cancel_editor_test(editor: &mut Editor) {
     editor.test_cancel.cancel();
     editor.test_receiver = None;
     unsafe {
         let _ = KillTimer(Some(editor.hwnd), EDITOR_TEST_TIMER);
-        let _ = SetWindowTextW(editor.test_status, w!(""));
         let _ = EnableWindow(editor.buttons[0], true);
         let _ = EnableWindow(editor.buttons[2], true);
     }
+    clear_editor_test_result(editor);
 }
 
 fn start_editor_test(editor: &mut Editor) {
@@ -1817,11 +2061,9 @@ fn start_editor_test(editor: &mut Editor) {
     editor.test_receiver = Some(rx);
     let external = editor.test_cancel.clone();
     let runtime = editor.runtime.clone();
+    let testing_message = editor.language.text("testing_connectivity").to_owned();
+    set_editor_test_result(editor, TestResultState::Testing, &testing_message);
     unsafe {
-        let _ = SetWindowTextW(
-            editor.test_status,
-            PCWSTR(wide(editor.language.text("testing_connectivity")).as_ptr()),
-        );
         let _ = EnableWindow(editor.buttons[0], false);
         let _ = EnableWindow(editor.buttons[2], false);
         SetTimer(Some(editor.hwnd), EDITOR_TEST_TIMER, 50, None);
@@ -1861,24 +2103,30 @@ fn poll_editor_test(editor: &mut Editor) {
         }
     };
     editor.test_receiver = None;
-    let message = match result.0 {
-        Ok(()) => format!(
-            "{} ({} ms)",
-            editor.language.text("connectivity_success"),
-            result.1
+    let (status, message) = match result.0 {
+        Ok(()) => (
+            TestResultState::Succeeded,
+            format!(
+                "{} ({} ms)",
+                editor.language.text("connectivity_success"),
+                result.1
+            ),
         ),
-        Err(error) => format!(
-            "{}{}",
-            editor.language.text("connectivity_failed"),
-            editor.language.text(&error)
+        Err(error) => (
+            TestResultState::Failed,
+            format!(
+                "{}{}",
+                editor.language.text("connectivity_failed"),
+                editor.language.text(&error)
+            ),
         ),
     };
     unsafe {
         let _ = KillTimer(Some(editor.hwnd), EDITOR_TEST_TIMER);
         let _ = EnableWindow(editor.buttons[0], true);
         let _ = EnableWindow(editor.buttons[2], true);
-        let _ = SetWindowTextW(editor.test_status, PCWSTR(wide(&message).as_ptr()));
     }
+    set_editor_test_result(editor, status, &message);
 }
 
 unsafe extern "system" fn editor_focus_proc(
@@ -1949,6 +2197,23 @@ unsafe extern "system" fn editor_body_proc(
             FillRect(dc, &client, editor.background);
             for item in &editor.layouts {
                 if item.independent_only && !editor.independent() {
+                    continue;
+                }
+                if item.hwnd == editor.test_status {
+                    if editor_test_result_visible(editor) {
+                        let mut layout = editor_test_result_layout_in_body(editor);
+                        for rect in [&mut layout.icon, &mut layout.frame, &mut layout.editor] {
+                            rect.top -= editor.offset;
+                            rect.bottom -= editor.offset;
+                        }
+                        paint_test_result(
+                            dc,
+                            editor.dpi,
+                            editor.test_result_state,
+                            layout,
+                            GetFocus() == editor.test_status,
+                        );
+                    }
                     continue;
                 }
                 let Some(frame) = item.frame else {
@@ -2254,9 +2519,18 @@ unsafe extern "system" fn editor_proc(
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
             let dc = HDC(wparam.0 as *mut c_void);
-            SetTextColor(dc, rgb(230, 240, 240));
             let child = HWND(lparam.0 as *mut c_void);
-            let edit = editor.fields.contains(&child) || editor.api_fields.contains(&child);
+            SetTextColor(
+                dc,
+                if child == editor.test_status {
+                    test_result_text_color(editor.test_result_state)
+                } else {
+                    rgb(230, 240, 240)
+                },
+            );
+            let edit = editor.fields.contains(&child)
+                || editor.api_fields.contains(&child)
+                || child == editor.test_status;
             SetBkColor(
                 dc,
                 if edit {

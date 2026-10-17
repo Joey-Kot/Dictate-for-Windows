@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -20,7 +20,9 @@ use super::realtime::{
     LiveChunkSource, RealtimeRenderContext, run_realtime_session_with_parameters,
     run_recorded_replay_with_parameters,
 };
-use super::remote_audio::{PublishedRemoteAudio, cleanup_remote_audio, publish_remote_audio};
+use super::remote_audio::{
+    PublishedRemoteAudio, RemoteAudioError, cleanup_remote_audio, publish_remote_audio,
+};
 use super::request_stream::{JsonChunksDecoder, NdjsonDecoder, SseDecoder, StreamFrameError};
 use super::schema::*;
 use super::template::RuntimeTemplateValues;
@@ -87,6 +89,82 @@ impl AdvancedAudioClient {
         )
     }
 
+    /// Returns a concise text fragment that is safe to insert after a
+    /// terminal request failure. Configuration and local-media failures stay
+    /// ordinary task failures so they are not mistaken for a transcript.
+    pub(crate) fn terminal_failure_placeholder(
+        &self,
+        error: &AdvancedAudioError,
+    ) -> Option<String> {
+        match error {
+            AdvancedAudioError::UnexpectedStatus { status, response } => Some(
+                crate::audio_failure::http_placeholder(*status, response, &self.config),
+            ),
+            AdvancedAudioError::Http(HttpEngineError::Request(_))
+            | AdvancedAudioError::ReadResponse(ResponseReadError::Body(_))
+            | AdvancedAudioError::StreamResponse(_) => {
+                Some(crate::audio_failure::placeholder("Network request failed"))
+            }
+            AdvancedAudioError::ReadResponse(ResponseReadError::TooLarge { .. })
+            | AdvancedAudioError::StreamTooLarge => Some(crate::audio_failure::placeholder(
+                "ASR response is too large",
+            )),
+            AdvancedAudioError::Extraction(_)
+            | AdvancedAudioError::StreamFrame(_)
+            | AdvancedAudioError::Accumulator(_) => {
+                Some(crate::audio_failure::placeholder("Invalid ASR response"))
+            }
+            AdvancedAudioError::RemoteAudio(RemoteAudioError::UnexpectedStatus {
+                status, ..
+            }) => Some(crate::audio_failure::http_placeholder(
+                *status,
+                &[],
+                &self.config,
+            )),
+            AdvancedAudioError::RemoteAudio(RemoteAudioError::Request) => Some(
+                crate::audio_failure::placeholder("Remote audio upload failed"),
+            ),
+            AdvancedAudioError::Realtime(error) => error
+                .terminal_failure_placeholder_reason()
+                .map(crate::audio_failure::placeholder),
+            AdvancedAudioError::PollFailure => {
+                Some(crate::audio_failure::placeholder("ASR task failed"))
+            }
+            AdvancedAudioError::PollUnexpectedState => {
+                Some(crate::audio_failure::placeholder("Invalid ASR task state"))
+            }
+            AdvancedAudioError::PollTimeout { .. } => {
+                Some(crate::audio_failure::placeholder("ASR task timed out"))
+            }
+            AdvancedAudioError::Disabled
+            | AdvancedAudioError::MissingWorkflow
+            | AdvancedAudioError::InvalidConfig(_)
+            | AdvancedAudioError::Client(_)
+            | AdvancedAudioError::Audio(_)
+            | AdvancedAudioError::Http(
+                HttpEngineError::Canceled
+                | HttpEngineError::InvalidUrl
+                | HttpEngineError::Body(_)
+                | HttpEngineError::Template(_)
+                | HttpEngineError::SignerRequiresMaterializedBody
+                | HttpEngineError::Signing(_),
+            )
+            | AdvancedAudioError::ReadResponse(ResponseReadError::Canceled)
+            | AdvancedAudioError::Canceled
+            | AdvancedAudioError::RemoteAudio(
+                RemoteAudioError::Canceled
+                | RemoteAudioError::NotConfigured
+                | RemoteAudioError::InvalidUrl
+                | RemoteAudioError::OpenAudio(_)
+                | RemoteAudioError::Signing(_),
+            )
+            | AdvancedAudioError::RemoteAudioUnavailable
+            | AdvancedAudioError::RealtimeUnavailable
+            | AdvancedAudioError::NotRealtimeWorkflow
+            | AdvancedAudioError::Execution(_) => None,
+        }
+    }
+
     pub fn realtime_audio_stream(&self) -> Option<RealtimeAudioStream> {
         match &self.workflow.recognition {
             AdvancedRecognition::RealtimeSession { realtime } => {
@@ -96,12 +174,52 @@ impl AdvancedAudioClient {
         }
     }
 
-    /// Advanced workflow diagnostics intentionally identify only the stable
-    /// protocol phase.  Rendered URLs, headers, bodies, captures, audio, and
-    /// transcripts must never enter the upload debug stream.
-    fn debug_stage(&self, label: &'static str) {
+    /// Advanced workflow diagnostics contain lifecycle metadata only.
+    /// Rendered URLs, headers, bodies, captures, audio, and transcripts must
+    /// never enter the upload debug stream.
+    fn debug(&self, message: std::fmt::Arguments<'_>) {
         if self.config.upload_debug {
-            crate::debug_log::write(crate::debug_log::Category::Upload, format_args!("{label}"));
+            crate::debug_log::write(crate::debug_log::Category::Upload, message);
+        }
+    }
+
+    fn debug_stage(&self, stage: &'static str) {
+        self.debug(format_args!("[upload] advanced stage={stage} event=start"));
+    }
+
+    fn debug_terminal_result(&self, result: &Result<Transcription, AdvancedAudioError>) {
+        match result {
+            Ok(transcription) => self.debug(format_args!(
+                "[upload] advanced event=completed characters={}",
+                transcription.text.chars().count()
+            )),
+            Err(error) => self.debug(format_args!(
+                "[upload] advanced event=failed kind={}",
+                advanced_error_kind(error)
+            )),
+        }
+    }
+
+    fn extract_final(
+        &self,
+        response: &HttpResponseData,
+        extractor: &ResponseExtractor,
+    ) -> Result<String, AdvancedAudioError> {
+        match extract_final(response, extractor) {
+            Ok(text) => {
+                self.debug(format_args!(
+                    "[upload] advanced event=parse-complete characters={}",
+                    text.chars().count()
+                ));
+                Ok(text)
+            }
+            Err(error) => {
+                self.debug(format_args!(
+                    "[upload] advanced event=parse-failed kind={}",
+                    advanced_error_kind(&error)
+                ));
+                Err(error)
+            }
         }
     }
 
@@ -144,7 +262,7 @@ impl AdvancedAudioClient {
         let AdvancedRecognition::RealtimeSession { realtime } = &self.workflow.recognition else {
             return Err(AdvancedAudioError::NotRealtimeWorkflow);
         };
-        self.debug_stage("[asr-stream] realtime");
+        self.debug_stage("realtime-live");
         let runtime = runtime_values();
         let render_context = RealtimeRenderContext::new(
             &self.values,
@@ -153,9 +271,12 @@ impl AdvancedAudioClient {
             &self.workflow.parameters,
             self.workflow.schema_version,
         );
-        run_realtime_session_with_parameters(realtime, &render_context, source, cancellation)
-            .await
-            .map_err(AdvancedAudioError::Realtime)
+        let result =
+            run_realtime_session_with_parameters(realtime, &render_context, source, cancellation)
+                .await
+                .map_err(AdvancedAudioError::Realtime);
+        self.debug_terminal_result(&result);
+        result
     }
 
     /// Runs the workflow for a prepared audio file and returns one final
@@ -166,23 +287,48 @@ impl AdvancedAudioClient {
         file_path: &Path,
     ) -> Result<Transcription, AdvancedAudioError> {
         if cancellation.is_cancelled() {
+            self.debug(format_args!(
+                "[upload] advanced event=canceled phase=before-request"
+            ));
             return Err(AdvancedAudioError::Canceled);
         }
         let runtime = runtime_values();
         if let AdvancedRecognition::RealtimeSession { realtime } = &self.workflow.recognition {
-            return self
+            self.debug_stage("realtime-replay");
+            let result = self
                 .execute_realtime_replay(realtime, &runtime, file_path, cancellation)
                 .await;
+            self.debug_terminal_result(&result);
+            return result;
         }
         let audio =
-            PreparedAudio::from_path(file_path, self.workflow.audio.mime.as_deref()).await?;
+            match PreparedAudio::from_path(file_path, self.workflow.audio.mime.as_deref()).await {
+                Ok(audio) => audio,
+                Err(error) => {
+                    let error = AdvancedAudioError::Audio(error);
+                    self.debug(format_args!(
+                        "[upload] advanced event=failed kind={}",
+                        advanced_error_kind(&error)
+                    ));
+                    return Err(error);
+                }
+            };
         if matches!(
             &self.workflow.audio.delivery,
             AudioDelivery::PublicHttpsUrl | AudioDelivery::CloudUri
         ) {
-            self.debug_stage("[remote-audio] upload");
+            self.debug_stage("remote-audio-upload");
         }
-        let (audio, published) = self.prepare_audio_delivery(audio, cancellation).await?;
+        let (audio, published) = match self.prepare_audio_delivery(audio, cancellation).await {
+            Ok(audio) => audio,
+            Err(error) => {
+                self.debug(format_args!(
+                    "[upload] advanced event=failed kind={}",
+                    advanced_error_kind(&error)
+                ));
+                return Err(error);
+            }
+        };
         // Keep all fallible workflow work inside a nested result.  A `?` in
         // this scope must not bypass the remote object's end-of-workflow
         // cleanup: recognition errors and cancellation are both terminal
@@ -193,18 +339,18 @@ impl AdvancedAudioClient {
                     request,
                     final_text,
                 } => {
-                    self.debug_stage("[advanced-audio] request");
+                    self.debug_stage("request");
                     let response = self
                         .execute_retryable_stage(request, &audio, &runtime, cancellation)
                         .await?;
-                    let text = extract_final(&response, final_text)?;
+                    let text = self.extract_final(&response, final_text)?;
                     Ok(Transcription {
                         text,
                         raw_response: response.body,
                     })
                 }
                 AdvancedRecognition::RequestStream { request, stream } => {
-                    self.debug_stage("[asr-stream] stream");
+                    self.debug_stage("request-stream");
                     self.execute_request_stream(request, stream, &audio, &runtime, cancellation)
                         .await
                 }
@@ -238,8 +384,15 @@ impl AdvancedAudioClient {
             // completed workflow. An error or cancellation after a successful
             // upload still requires best-effort cleanup so a failed ASR task
             // cannot leave an orphaned remote recording behind.
-            cleanup_remote_audio(&self.network_client, &published, result.is_err()).await;
+            cleanup_remote_audio(
+                &self.network_client,
+                &published,
+                result.is_err(),
+                self.config.upload_debug,
+            )
+            .await;
         }
+        self.debug_terminal_result(&result);
         result
     }
 
@@ -257,7 +410,11 @@ impl AdvancedAudioClient {
         let max_attempts = self.config.max_retry.max(1) as usize;
         let mut delay = self.config.retry_base_delay.max(0.0);
         for attempt in 0..max_attempts {
-            self.debug_stage("[asr-stream] replay");
+            self.debug_stage("realtime-replay");
+            self.debug(format_args!(
+                "[upload] advanced event=attempt-start attempt={} total={max_attempts}",
+                attempt + 1
+            ));
             let render_context = RealtimeRenderContext::new(
                 &self.values,
                 &self.secrets,
@@ -274,8 +431,17 @@ impl AdvancedAudioClient {
             .await
             {
                 Ok(transcription) => return Ok(transcription),
-                Err(_) if cancellation.is_cancelled() => return Err(AdvancedAudioError::Canceled),
+                Err(_) if cancellation.is_cancelled() => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=canceled phase=realtime"
+                    ));
+                    return Err(AdvancedAudioError::Canceled);
+                }
                 Err(_error) if attempt + 1 < max_attempts => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=retry delay_ms={}",
+                        Duration::from_secs_f64(delay).as_millis()
+                    ));
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AdvancedAudioError::Canceled),
                         _ = tokio::time::sleep(Duration::from_secs_f64(delay)) => {}
@@ -314,6 +480,7 @@ impl AdvancedAudioClient {
                     self.workflow.audio.delivery.kind(),
                     &audio,
                     cancellation,
+                    self.config.upload_debug,
                 )
                 .await
                 .map_err(AdvancedAudioError::RemoteAudio)?;
@@ -339,15 +506,25 @@ impl AdvancedAudioClient {
         let mut delay = self.config.retry_base_delay.max(0.0);
         let mut last_error = None;
         for attempt in 0..max_attempts {
+            self.debug(format_args!(
+                "[upload] advanced event=attempt-start attempt={} total={max_attempts}",
+                attempt + 1
+            ));
             match self
                 .execute_stage(stage, audio, runtime, cancellation, &mut BTreeMap::new())
                 .await
             {
                 Ok(response) => return Ok(response),
                 Err(_error) if cancellation.is_cancelled() => {
+                    self.debug(format_args!("[upload] advanced event=canceled phase=retry"));
                     return Err(AdvancedAudioError::Canceled);
                 }
                 Err(error) if is_retryable(&error) && attempt + 1 < max_attempts => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=retry delay_ms={} kind={}",
+                        Duration::from_secs_f64(delay).as_millis(),
+                        advanced_error_kind(&error)
+                    ));
                     last_error = Some(error);
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AdvancedAudioError::Canceled),
@@ -373,7 +550,17 @@ impl AdvancedAudioClient {
         let response = self
             .execute_stage_response(stage, audio, runtime, cancellation, captures)
             .await?;
-        self.store_captures(stage, &response, captures)?;
+        if let Err(error) = self.store_captures(stage, &response, captures) {
+            self.debug(format_args!(
+                "[upload] advanced event=capture-failed kind={}",
+                advanced_error_kind(&error)
+            ));
+            return Err(error);
+        }
+        self.debug(format_args!(
+            "[upload] advanced event=capture-complete configured={}",
+            stage.captures.len()
+        ));
         Ok(response)
     }
 
@@ -392,10 +579,31 @@ impl AdvancedAudioClient {
         let response = self
             .send_stage(stage, audio, runtime, cancellation, captures)
             .await?;
-        let response = read_response_limited(response, cancellation)
-            .await
-            .map_err(AdvancedAudioError::ReadResponse)?;
+        let started = Instant::now();
+        let response = match read_response_limited(response, cancellation).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = AdvancedAudioError::ReadResponse(error);
+                self.debug(format_args!(
+                    "[upload] advanced event=response-read-failed kind={} elapsed_ms={}",
+                    advanced_error_kind(&error),
+                    started.elapsed().as_millis()
+                ));
+                return Err(error);
+            }
+        };
+        self.debug(format_args!(
+            "[upload] advanced event=response-complete status={} bytes={} elapsed_ms={}",
+            response.status.as_u16(),
+            response.body.len(),
+            started.elapsed().as_millis()
+        ));
         if !response.is_accepted(&stage.accepted_statuses) {
+            self.debug(format_args!(
+                "[upload] advanced event=response-rejected status={} response_bytes={}",
+                response.status.as_u16(),
+                response.body.len()
+            ));
             return Err(AdvancedAudioError::UnexpectedStatus {
                 status: response.status.as_u16(),
                 response: self.redact_sensitive_capture_response(&response.body, captures),
@@ -412,7 +620,12 @@ impl AdvancedAudioClient {
         cancellation: &CancellationToken,
         captures: &BTreeMap<String, String>,
     ) -> Result<reqwest::Response, AdvancedAudioError> {
-        let context = StageContext::new(StageContextInputs {
+        let started = Instant::now();
+        self.debug(format_args!(
+            "[upload] advanced event=request-start method={:?}",
+            stage.method
+        ));
+        let context = match StageContext::new(StageContextInputs {
             values: &self.values,
             secrets: &self.secrets,
             captures,
@@ -425,11 +638,38 @@ impl AdvancedAudioClient {
                 AudioDelivery::Base64 | AudioDelivery::DataUri
             ),
         })
-        .await?;
-        self.http
-            .send(stage, &context, cancellation)
-            .await
-            .map_err(AdvancedAudioError::Http)
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let error = AdvancedAudioError::from(error);
+                self.debug(format_args!(
+                    "[upload] advanced event=request-failed kind={} elapsed_ms={}",
+                    advanced_error_kind(&error),
+                    started.elapsed().as_millis()
+                ));
+                return Err(error);
+            }
+        };
+        match self.http.send(stage, &context, cancellation).await {
+            Ok(response) => {
+                self.debug(format_args!(
+                    "[upload] advanced event=response-headers status={} elapsed_ms={}",
+                    response.status().as_u16(),
+                    started.elapsed().as_millis()
+                ));
+                Ok(response)
+            }
+            Err(error) => {
+                let error = AdvancedAudioError::Http(error);
+                self.debug(format_args!(
+                    "[upload] advanced event=request-failed kind={} elapsed_ms={}",
+                    advanced_error_kind(&error),
+                    started.elapsed().as_millis()
+                ));
+                Err(error)
+            }
+        }
     }
 
     fn store_captures(
@@ -465,13 +705,13 @@ impl AdvancedAudioClient {
     ) -> Result<Transcription, AdvancedAudioError> {
         let mut captures = BTreeMap::new();
         if let Some(prepare) = prepare {
-            self.debug_stage("[advanced-audio] prepare");
+            self.debug_stage("prepare");
             self.execute_stage(prepare, audio, runtime, cancellation, &mut captures)
                 .await?;
         }
         // Never route a failed submit through the request retry loop. The
         // server may have created a paid task even when its response was lost.
-        self.debug_stage("[advanced-audio] submit");
+        self.debug_stage("submit");
         let mut response = self
             .execute_stage(submit, audio, runtime, cancellation, &mut captures)
             .await?;
@@ -481,7 +721,7 @@ impl AdvancedAudioClient {
                 .await?;
         }
         for stage in result_steps {
-            self.debug_stage("[advanced-audio] result");
+            self.debug_stage("result");
             if stage.method.is_read_only() {
                 response = self
                     .execute_retryable_stage_with_captures(
@@ -498,7 +738,7 @@ impl AdvancedAudioClient {
                     .await?;
             }
         }
-        let text = extract_final(&response, final_text)?;
+        let text = self.extract_final(&response, final_text)?;
         Ok(Transcription {
             text,
             // The final response is retained by the cache layer. It can echo
@@ -519,15 +759,25 @@ impl AdvancedAudioClient {
         let max_attempts = self.config.max_retry.max(1) as usize;
         let mut delay = self.config.retry_base_delay.max(0.0);
         for attempt in 0..max_attempts {
+            self.debug(format_args!(
+                "[upload] advanced event=attempt-start attempt={} total={max_attempts}",
+                attempt + 1
+            ));
             match self
                 .execute_stage(stage, audio, runtime, cancellation, captures)
                 .await
             {
                 Ok(response) => return Ok(response),
                 Err(_error) if cancellation.is_cancelled() => {
+                    self.debug(format_args!("[upload] advanced event=canceled phase=retry"));
                     return Err(AdvancedAudioError::Canceled);
                 }
                 Err(error) if is_retryable(&error) && attempt + 1 < max_attempts => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=retry delay_ms={} kind={}",
+                        Duration::from_secs_f64(delay).as_millis(),
+                        advanced_error_kind(&error)
+                    ));
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AdvancedAudioError::Canceled),
                         _ = tokio::time::sleep(Duration::from_secs_f64(delay)) => {}
@@ -556,15 +806,25 @@ impl AdvancedAudioClient {
         let max_attempts = self.config.max_retry.max(1) as usize;
         let mut delay = self.config.retry_base_delay.max(0.0);
         for attempt in 0..max_attempts {
+            self.debug(format_args!(
+                "[upload] advanced event=attempt-start attempt={} total={max_attempts}",
+                attempt + 1
+            ));
             match self
                 .execute_stage_response(stage, audio, runtime, cancellation, captures)
                 .await
             {
                 Ok(response) => return Ok(response),
                 Err(_error) if cancellation.is_cancelled() => {
+                    self.debug(format_args!("[upload] advanced event=canceled phase=poll"));
                     return Err(AdvancedAudioError::Canceled);
                 }
                 Err(error) if is_poll_retryable(&error) && attempt + 1 < max_attempts => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=retry delay_ms={} kind={}",
+                        Duration::from_secs_f64(delay).as_millis(),
+                        advanced_error_kind(&error)
+                    ));
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AdvancedAudioError::Canceled),
                         _ = tokio::time::sleep(Duration::from_secs_f64(delay)) => {}
@@ -590,9 +850,10 @@ impl AdvancedAudioClient {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(poll.timeout_ms);
         loop {
             if cancellation.is_cancelled() {
+                self.debug(format_args!("[upload] advanced event=canceled phase=poll"));
                 return Err(AdvancedAudioError::Canceled);
             }
-            self.debug_stage("[advanced-audio] poll");
+            self.debug_stage("poll");
             let request = self.execute_retryable_stage_without_captures(
                 &poll.request,
                 audio,
@@ -614,7 +875,17 @@ impl AdvancedAudioClient {
                     // not attempt to extract it from pending responses (where
                     // it often does not exist), and do not let it overwrite
                     // itself after a repeated poll.
-                    self.store_captures(&poll.request, &response, captures)?;
+                    if let Err(error) = self.store_captures(&poll.request, &response, captures) {
+                        self.debug(format_args!(
+                            "[upload] advanced event=capture-failed kind={}",
+                            advanced_error_kind(&error)
+                        ));
+                        return Err(error);
+                    }
+                    self.debug(format_args!(
+                        "[upload] advanced event=capture-complete configured={}",
+                        poll.request.captures.len()
+                    ));
                     return Ok(response);
                 }
                 PollState::Failure => return Err(AdvancedAudioError::PollFailure),
@@ -642,15 +913,27 @@ impl AdvancedAudioClient {
         let mut delay = self.config.retry_base_delay.max(0.0);
         let mut last_error = None;
         for attempt in 0..max_attempts {
+            self.debug(format_args!(
+                "[upload] advanced event=attempt-start attempt={} total={max_attempts}",
+                attempt + 1
+            ));
             match self
                 .execute_request_stream_once(request, stream_schema, audio, runtime, cancellation)
                 .await
             {
                 Ok(transcription) => return Ok(transcription),
                 Err(_error) if cancellation.is_cancelled() => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=canceled phase=stream"
+                    ));
                     return Err(AdvancedAudioError::Canceled);
                 }
                 Err(error) if is_stream_retryable(&error) && attempt + 1 < max_attempts => {
+                    self.debug(format_args!(
+                        "[upload] advanced event=retry delay_ms={} kind={}",
+                        Duration::from_secs_f64(delay).as_millis(),
+                        advanced_error_kind(&error)
+                    ));
                     last_error = Some(error);
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AdvancedAudioError::Canceled),
@@ -678,14 +961,32 @@ impl AdvancedAudioClient {
         let response = self
             .send_stage(request, audio, runtime, cancellation, &captures)
             .await?;
-        if !request
-            .accepted_statuses
-            .iter()
-            .any(|status| *status == response.status().as_u16())
-        {
-            let response = read_response_limited(response, cancellation)
-                .await
-                .map_err(AdvancedAudioError::ReadResponse)?;
+        let status = response.status().as_u16();
+        if !request.accepted_statuses.contains(&status) {
+            let started = Instant::now();
+            let response = match read_response_limited(response, cancellation).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = AdvancedAudioError::ReadResponse(error);
+                    self.debug(format_args!(
+                        "[upload] advanced event=response-read-failed kind={} elapsed_ms={}",
+                        advanced_error_kind(&error),
+                        started.elapsed().as_millis()
+                    ));
+                    return Err(error);
+                }
+            };
+            self.debug(format_args!(
+                "[upload] advanced event=response-complete status={} bytes={} elapsed_ms={}",
+                response.status.as_u16(),
+                response.body.len(),
+                started.elapsed().as_millis()
+            ));
+            self.debug(format_args!(
+                "[upload] advanced event=response-rejected status={} response_bytes={}",
+                response.status.as_u16(),
+                response.body.len()
+            ));
             return Err(AdvancedAudioError::UnexpectedStatus {
                 status: response.status.as_u16(),
                 response: self.redact_sensitive_capture_response(&response.body, &captures),
@@ -709,8 +1010,14 @@ impl AdvancedAudioClient {
             extractor::extract_captures(&header_view, &request.captures)
                 .map_err(AdvancedAudioError::Extraction)?,
         );
+        self.debug(format_args!(
+            "[upload] advanced event=capture-complete configured={}",
+            request.captures.len()
+        ));
 
+        let started = Instant::now();
         let mut raw = Vec::new();
+        let mut chunks = 0usize;
         let mut accumulator = TranscriptAccumulator::new();
         let mut bytes = response.bytes_stream();
         match stream_schema.format {
@@ -718,6 +1025,7 @@ impl AdvancedAudioClient {
                 let mut decoder = SseDecoder::new();
                 while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
                     append_raw(&mut raw, &chunk)?;
+                    chunks += 1;
                     for event in decoder
                         .push(&chunk)
                         .map_err(AdvancedAudioError::StreamFrame)?
@@ -743,6 +1051,7 @@ impl AdvancedAudioClient {
                 let mut decoder = NdjsonDecoder::new();
                 while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
                     append_raw(&mut raw, &chunk)?;
+                    chunks += 1;
                     for frame in decoder
                         .push(&chunk)
                         .map_err(AdvancedAudioError::StreamFrame)?
@@ -758,6 +1067,7 @@ impl AdvancedAudioClient {
                 let mut decoder = JsonChunksDecoder::new();
                 while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
                     append_raw(&mut raw, &chunk)?;
+                    chunks += 1;
                     for frame in decoder
                         .push(&chunk)
                         .map_err(AdvancedAudioError::StreamFrame)?
@@ -770,9 +1080,28 @@ impl AdvancedAudioClient {
                 }
             }
         }
-        let text = accumulator
-            .into_final_text()
-            .map_err(AdvancedAudioError::Accumulator)?;
+        self.debug(format_args!(
+            "[upload] advanced event=response-complete status={status} bytes={} chunks={chunks} elapsed_ms={}",
+            raw.len(),
+            started.elapsed().as_millis()
+        ));
+        let text = match accumulator.into_final_text() {
+            Ok(text) => {
+                self.debug(format_args!(
+                    "[upload] advanced event=parse-complete characters={}",
+                    text.chars().count()
+                ));
+                text
+            }
+            Err(error) => {
+                let error = AdvancedAudioError::Accumulator(error);
+                self.debug(format_args!(
+                    "[upload] advanced event=parse-failed kind={}",
+                    advanced_error_kind(&error)
+                ));
+                return Err(error);
+            }
+        };
         Ok(Transcription {
             text,
             raw_response: raw,
@@ -1098,7 +1427,51 @@ impl AdvancedAudioError {
 
     pub fn is_canceled(&self) -> bool {
         matches!(self, Self::Canceled)
+            || matches!(self, Self::RemoteAudio(RemoteAudioError::Canceled))
             || matches!(self, Self::Realtime(error) if error.is_canceled())
+    }
+
+    /// Segmented uploads may have many completed failures waiting for their
+    /// sibling requests to drain. Retain the status but release the bounded
+    /// (and potentially large) HTTP body as soon as it is no longer needed.
+    pub(crate) fn discard_response_body(mut self) -> Self {
+        if let Self::UnexpectedStatus { response, .. } = &mut self {
+            response.clear();
+        }
+        self
+    }
+}
+
+fn advanced_error_kind(error: &AdvancedAudioError) -> &'static str {
+    match error {
+        AdvancedAudioError::Disabled
+        | AdvancedAudioError::MissingWorkflow
+        | AdvancedAudioError::InvalidConfig(_)
+        | AdvancedAudioError::Client(_)
+        | AdvancedAudioError::RemoteAudioUnavailable
+        | AdvancedAudioError::NotRealtimeWorkflow
+        | AdvancedAudioError::RealtimeUnavailable => "configuration",
+        AdvancedAudioError::Audio(_) | AdvancedAudioError::Http(HttpEngineError::Body(_)) => {
+            "request-body"
+        }
+        AdvancedAudioError::Http(HttpEngineError::Canceled)
+        | AdvancedAudioError::ReadResponse(ResponseReadError::Canceled)
+        | AdvancedAudioError::Canceled => "canceled",
+        AdvancedAudioError::Http(HttpEngineError::Request(_))
+        | AdvancedAudioError::ReadResponse(ResponseReadError::Body(_))
+        | AdvancedAudioError::StreamResponse(_) => "network",
+        AdvancedAudioError::Http(_)
+        | AdvancedAudioError::ReadResponse(ResponseReadError::TooLarge { .. }) => "request",
+        AdvancedAudioError::UnexpectedStatus { .. } => "http",
+        AdvancedAudioError::Extraction(_) => "extraction",
+        AdvancedAudioError::StreamFrame(_) | AdvancedAudioError::StreamTooLarge => "stream",
+        AdvancedAudioError::Accumulator(_) => "incomplete-stream",
+        AdvancedAudioError::RemoteAudio(_) => "remote-audio",
+        AdvancedAudioError::Realtime(_) => "realtime",
+        AdvancedAudioError::PollFailure => "poll-failure",
+        AdvancedAudioError::PollUnexpectedState => "poll-state",
+        AdvancedAudioError::PollTimeout { .. } => "poll-timeout",
+        AdvancedAudioError::Execution(_) => "execution",
     }
 }
 
@@ -1117,6 +1490,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::advanced_audio::realtime::{RealtimeSessionError, RealtimeSourceError};
     use crate::advanced_audio::schema::{
         AudioSpec, PauseBehavior, RealtimeAudioMessage, RealtimeAudioStream, RealtimeCompletion,
         RealtimeConnect, RealtimeMessage, RealtimePacing, RealtimeTransport, RealtimeWorkflow,
@@ -1552,6 +1926,33 @@ mod tests {
         assert!(!is_poll_retryable(&AdvancedAudioError::ReadResponse(
             ResponseReadError::TooLarge { maximum: 1 },
         )));
+    }
+
+    #[test]
+    fn remote_audio_cancellation_is_not_an_insertable_failure() {
+        let client = replay_client("ws://127.0.0.1:1/realtime".into(), 1, 0.0);
+        let error = AdvancedAudioError::RemoteAudio(RemoteAudioError::Canceled);
+
+        assert!(error.is_canceled());
+        assert_eq!(client.terminal_failure_placeholder(&error), None);
+    }
+
+    #[test]
+    fn realtime_placeholders_only_cover_remote_or_protocol_failures() {
+        let client = replay_client("ws://127.0.0.1:1/realtime".into(), 1, 0.0);
+
+        assert_eq!(
+            client.terminal_failure_placeholder(&AdvancedAudioError::Realtime(
+                RealtimeSessionError::ClosedBeforeComplete,
+            )),
+            Some("[Invalid ASR response]".into()),
+        );
+        assert_eq!(
+            client.terminal_failure_placeholder(&AdvancedAudioError::Realtime(
+                RealtimeSessionError::Source(RealtimeSourceError::InvalidWav),
+            )),
+            None,
+        );
     }
 
     #[test]

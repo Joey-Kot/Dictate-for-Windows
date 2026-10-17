@@ -80,35 +80,95 @@ impl AudioApiClient {
     }
 
     /// Runs one complete non-realtime transcription workflow for every prepared
-    /// segment. The completed texts are concatenated in source-segment order
-    /// without adding separators.
+    /// segment. Successful texts and eligible terminal-failure placeholders are
+    /// concatenated in source-segment order without adding separators.
     ///
-    /// Successful per-segment raw responses are deliberately discarded before
-    /// the batch result is collected. This avoids retaining an unbounded set of
-    /// response bodies for a long recording; callers receive the merged text
-    /// with an empty `raw_response`.
+    /// Per-segment raw responses and error bodies are deliberately discarded
+    /// before the batch result is collected. This avoids retaining an
+    /// unbounded set of response bodies for a long recording; callers receive
+    /// the merged text with an empty `raw_response`.
     pub async fn transcribe_segments(
         &self,
         cancellation: &CancellationToken,
         file_paths: &[PathBuf],
         max_concurrency: usize,
     ) -> Result<Transcription, AudioApiError> {
+        self.transcribe_segments_with_failure_placeholders(
+            cancellation,
+            file_paths,
+            max_concurrency,
+            true,
+        )
+        .await
+    }
+
+    /// Runs a segmented transcription without converting terminal service
+    /// failures into foreground-output placeholders. File output and similar
+    /// non-interactive callers use this so an incomplete transcription remains
+    /// an ordinary error.
+    pub async fn transcribe_segments_strict(
+        &self,
+        cancellation: &CancellationToken,
+        file_paths: &[PathBuf],
+        max_concurrency: usize,
+    ) -> Result<Transcription, AudioApiError> {
+        self.transcribe_segments_with_failure_placeholders(
+            cancellation,
+            file_paths,
+            max_concurrency,
+            false,
+        )
+        .await
+    }
+
+    async fn transcribe_segments_with_failure_placeholders(
+        &self,
+        cancellation: &CancellationToken,
+        file_paths: &[PathBuf],
+        max_concurrency: usize,
+        insert_failure_placeholders: bool,
+    ) -> Result<Transcription, AudioApiError> {
         self.ensure_segmented_upload_available()?;
-        let texts = run_segment_batch(
+        let outcomes = run_segment_batch(
             file_paths,
             cancellation,
             max_concurrency,
             |_, file_path, segment_cancellation| async move {
-                self.transcribe(&segment_cancellation, &file_path)
-                    .await
-                    .map(|transcription| transcription.text)
+                match self.transcribe(&segment_cancellation, &file_path).await {
+                    Ok(transcription) => Ok(SegmentTranscription::Text(transcription.text)),
+                    Err(error) if error.is_canceled() => Err(error),
+                    Err(error) if insert_failure_placeholders => {
+                        match self.terminal_failure_placeholder(&error) {
+                            Some(placeholder) => Ok(SegmentTranscription::Placeholder(placeholder)),
+                            None => Err(error.discard_response_bodies()),
+                        }
+                    }
+                    Err(error) => Err(error.discard_response_bodies()),
+                }
             },
         )
         .await
         .map_err(AudioApiError::from_segment_batch_error)?;
 
+        let mut text = String::new();
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(SegmentTranscription::Text(segment_text))
+                | Ok(SegmentTranscription::Placeholder(segment_text)) => {
+                    text.push_str(&segment_text)
+                }
+                Err(error) if error.is_canceled() => return Err(AudioApiError::Canceled),
+                Err(error) => {
+                    return Err(AudioApiError::Segment {
+                        index: outcome.index,
+                        source: Box::new(error),
+                    });
+                }
+            }
+        }
+
         Ok(Transcription {
-            text: texts.concat(),
+            text,
             raw_response: Vec::new(),
         })
     }
@@ -165,7 +225,7 @@ impl AudioApiClient {
         max_concurrency: usize,
     ) -> Result<(), AudioApiError> {
         self.ensure_segmented_upload_available()?;
-        run_segment_batch(
+        let outcomes = run_segment_batch(
             file_paths,
             cancellation,
             max_concurrency,
@@ -176,7 +236,38 @@ impl AudioApiClient {
         )
         .await
         .map_err(AudioApiError::from_segment_batch_error)?;
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(()) => {}
+                Err(error) if error.is_canceled() => return Err(AudioApiError::Canceled),
+                Err(error) => {
+                    return Err(AudioApiError::Segment {
+                        index: outcome.index,
+                        source: Box::new(error),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Returns a safe, concise text fragment for a terminal request failure.
+    /// Cancelled, local-media, and configuration failures intentionally remain
+    /// task errors instead of being inserted into the target application.
+    pub(crate) fn terminal_failure_placeholder(&self, error: &AudioApiError) -> Option<String> {
+        if error.is_canceled() {
+            return None;
+        }
+        match (self, error) {
+            (Self::Legacy(client), AudioApiError::Legacy(error)) => {
+                client.terminal_failure_placeholder(error)
+            }
+            (Self::Advanced(client), AudioApiError::Advanced(error)) => {
+                client.terminal_failure_placeholder(error)
+            }
+            (_, AudioApiError::Segment { source, .. }) => self.terminal_failure_placeholder(source),
+            _ => None,
+        }
     }
 
     fn ensure_segmented_upload_available(&self) -> Result<(), AudioApiError> {
@@ -188,6 +279,12 @@ impl AudioApiClient {
     }
 }
 
+#[derive(Debug)]
+enum SegmentTranscription {
+    Text(String),
+    Placeholder(String),
+}
+
 /// Executes independent segment operations while retaining every started
 /// future until it finishes. Keeping the futures alive after an error or
 /// cancellation is required for Advanced workflows to run their existing
@@ -197,7 +294,7 @@ async fn run_segment_batch<T, E, F, Fut>(
     cancellation: &CancellationToken,
     max_concurrency: usize,
     mut operation: F,
-) -> Result<Vec<T>, SegmentBatchError<E>>
+) -> Result<Vec<SegmentBatchOutcome<T, E>>, SegmentBatchError>
 where
     F: FnMut(usize, PathBuf, CancellationToken) -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -218,7 +315,6 @@ where
 
     let mut in_flight = FuturesUnordered::new();
     let mut completed = Vec::with_capacity(file_paths.len());
-    let mut first_error = None;
 
     loop {
         while !stopped && in_flight.len() < max_concurrency && next_index < file_paths.len() {
@@ -262,16 +358,7 @@ where
         let Some((index, result)) = completed_operation else {
             break;
         };
-        match result {
-            Ok(value) => completed.push((index, value)),
-            Err(source) => {
-                if first_error.is_none() {
-                    first_error = Some(SegmentBatchError::Segment { index, source });
-                }
-                stopped = true;
-                segment_cancellation.cancel();
-            }
-        }
+        completed.push(SegmentBatchOutcome { index, result });
     }
 
     // A user cancellation wins even when an earlier segment had already
@@ -280,20 +367,21 @@ where
     if cancellation.is_cancelled() {
         return Err(SegmentBatchError::Canceled);
     }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-
-    completed.sort_unstable_by_key(|(index, _)| *index);
-    Ok(completed.into_iter().map(|(_, value)| value).collect())
+    completed.sort_unstable_by_key(|outcome| outcome.index);
+    Ok(completed)
 }
 
 #[derive(Debug)]
-enum SegmentBatchError<E> {
+struct SegmentBatchOutcome<T, E> {
+    index: usize,
+    result: Result<T, E>,
+}
+
+#[derive(Debug)]
+enum SegmentBatchError {
     Empty,
     InvalidConcurrency,
     Canceled,
-    Segment { index: usize, source: E },
 }
 
 #[derive(Debug, Error)]
@@ -323,15 +411,11 @@ pub enum AudioApiError {
 }
 
 impl AudioApiError {
-    fn from_segment_batch_error(error: SegmentBatchError<Self>) -> Self {
+    fn from_segment_batch_error(error: SegmentBatchError) -> Self {
         match error {
             SegmentBatchError::Empty => Self::EmptySegmentBatch,
             SegmentBatchError::InvalidConcurrency => Self::InvalidSegmentConcurrency,
             SegmentBatchError::Canceled => Self::Canceled,
-            SegmentBatchError::Segment { index, source } => Self::Segment {
-                index,
-                source: Box::new(source),
-            },
         }
     }
 
@@ -365,6 +449,20 @@ impl AudioApiError {
     pub fn is_text_extraction_error(&self) -> bool {
         matches!(self, Self::Legacy(AsrError::TextExtraction { .. }))
             || matches!(self, Self::Segment { source, .. } if source.is_text_extraction_error())
+    }
+
+    /// Keeps a segmented batch's failure state useful without retaining every
+    /// raw service body until its sibling requests have completed.
+    pub(crate) fn discard_response_bodies(self) -> Self {
+        match self {
+            Self::Legacy(error) => Self::Legacy(error.discard_response_body()),
+            Self::Advanced(error) => Self::Advanced(error.discard_response_body()),
+            Self::Segment { index, source } => Self::Segment {
+                index,
+                source: Box::new(source.discard_response_bodies()),
+            },
+            error => error,
+        }
     }
 }
 
@@ -561,60 +659,51 @@ mod tests {
             .await
             .expect("batch must finish")
             .expect("batch task must not panic");
-        assert_eq!(result.expect("batch must succeed"), vec![0, 1, 2, 3]);
+        let values = result
+            .expect("batch must succeed")
+            .into_iter()
+            .map(|outcome| outcome.result.expect("every segment must succeed"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0, 1, 2, 3]);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn segment_batch_first_error_stops_feeding_and_drains_started_work() {
+    async fn segment_batch_keeps_feeding_after_terminal_segment_errors() {
         let paths = paths(3);
         let parent = CancellationToken::new();
         let started = Arc::new(Mutex::new(Vec::new()));
-        let (cleanup_sender, cleanup_receiver) = oneshot::channel();
-        let cleanup_sender = Arc::new(Mutex::new(Some(cleanup_sender)));
 
         let result = timeout(
             Duration::from_secs(1),
             run_segment_batch(&paths, &parent, 2, {
                 let started = started.clone();
-                move |index, _, segment_cancellation| {
+                move |index, _, _| {
                     started
                         .lock()
                         .expect("test lock must not poison")
                         .push(index);
-                    let cleanup_sender = cleanup_sender.clone();
                     async move {
                         if index == 0 {
                             return Err::<usize, TestError>(TestError::Failed(index));
                         }
-                        segment_cancellation.cancelled().await;
-                        cleanup_sender
-                            .lock()
-                            .expect("test lock must not poison")
-                            .take()
-                            .expect("only the started sibling should clean up")
-                            .send(())
-                            .expect("test receiver must remain available");
-                        Err::<usize, TestError>(TestError::Canceled)
+                        Ok::<usize, TestError>(index)
                     }
                 }
             }),
         )
         .await
-        .expect("batch must drain started work");
+        .expect("batch must finish every independent segment")
+        .expect("ordinary segment errors remain in the ordered result");
 
-        assert!(matches!(
-            result,
-            Err(SegmentBatchError::Segment {
-                index: 0,
-                source: TestError::Failed(0),
-            })
-        ));
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[0].result, Err(TestError::Failed(0))));
+        assert!(matches!(&result[1].result, Ok(1)));
+        assert!(matches!(&result[2].result, Ok(2)));
         assert_eq!(
             *started.lock().expect("test lock must not poison"),
-            vec![0, 1]
+            vec![0, 1, 2]
         );
-        assert!(cleanup_receiver.await.is_ok());
         assert!(!parent.is_cancelled());
     }
 
@@ -697,8 +786,8 @@ mod tests {
                     if index == 0 {
                         return Err::<usize, TestError>(TestError::Failed(index));
                     }
-                    segment_cancellation.cancelled().await;
                     cancel_parent.cancel();
+                    segment_cancellation.cancelled().await;
                     Err::<usize, TestError>(TestError::Canceled)
                 }
             }),
@@ -750,14 +839,16 @@ mod tests {
 
     #[test]
     fn segment_error_hides_nested_display_but_preserves_error_helpers() {
-        let error = AudioApiError::from_segment_batch_error(SegmentBatchError::Segment {
+        let error = AudioApiError::Segment {
             index: 2,
-            source: AudioApiError::Legacy(AsrError::RetryExhausted {
+            source: Box::new(AudioApiError::Legacy(AsrError::RetryExhausted {
                 max_retry: 1,
                 attempts: 1,
+                last_status: Some(503),
+                last_failure: crate::asr::AsrRequestFailureKind::Http,
                 last_response: b"response body that must not be displayed".to_vec(),
-            }),
-        });
+            })),
+        };
 
         assert_eq!(error.to_string(), "segmented upload failed for segment 2");
         assert!(error.is_retry_exhausted());
@@ -766,6 +857,17 @@ mod tests {
             b"response body that must not be displayed"
         );
         assert!(!error.to_string().contains("response body"));
+
+        let compacted = error.discard_response_bodies();
+        assert!(compacted.is_retry_exhausted());
+        assert!(compacted.last_response().is_empty());
+
+        let advanced = AudioApiError::Advanced(AdvancedAudioError::UnexpectedStatus {
+            status: 503,
+            response: b"large advanced response".to_vec(),
+        })
+        .discard_response_bodies();
+        assert!(advanced.last_response().is_empty());
 
         let canceled = AudioApiError::Segment {
             index: 0,

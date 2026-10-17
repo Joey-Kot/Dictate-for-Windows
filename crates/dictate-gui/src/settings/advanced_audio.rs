@@ -66,6 +66,7 @@ const ID_DYNAMIC_SELECT: usize = 0x6c1c;
 const ID_DYNAMIC_MULTI_SELECT: usize = 0x6c1d;
 const ID_DYNAMIC_JSON_OBJECT: usize = 0x6c1e;
 const ID_DYNAMIC_JSON_ARRAY: usize = 0x6c1f;
+const ID_TEST_RESULT: usize = 0x6c50;
 const ID_REMOTE_FIELD_BASE: usize = 0x6c20;
 const ID_DYNAMIC_SELECT_LIST: usize = 0x6c40;
 const ID_DYNAMIC_MULTI_SELECT_LIST: usize = 0x6c41;
@@ -233,7 +234,8 @@ const STATIC_STYLE_END_ELLIPSIS: u32 = 0x0000_4000;
 const SECRETS_LABEL_TOP: i32 = 458;
 const SECRETS_TOP: i32 = 482;
 const VALIDATION_ACTION_TOP: i32 = 532;
-const STATUS_TOP: i32 = 570;
+const STATUS_TOP: i32 = 580;
+const STATUS_BOTTOM: i32 = WINDOW_HEIGHT - FOOTER_HEIGHT - 10;
 const GENERATION_STATUS_TOP: i32 = VALUES_TOP;
 const GENERATION_STATUS_HEIGHT: i32 = VALIDATION_ACTION_TOP - GENERATION_STATUS_TOP - 10;
 const REMOTE_FIELD_TOP: i32 = 208;
@@ -296,6 +298,7 @@ pub(super) struct Page {
     summary_editor: HWND,
     summary_reset: HWND,
     generation_status: HWND,
+    test_result: TestResultView,
     test_requested: bool,
 }
 
@@ -578,6 +581,7 @@ impl Page {
             summary_editor: HWND::default(),
             summary_reset: HWND::default(),
             generation_status: HWND::default(),
+            test_result: TestResultView::default(),
             test_requested: false,
         }
     }
@@ -756,6 +760,8 @@ pub(super) fn create(
         state.localized_controls.push((button, label));
         register_normal_control(state, button);
     }
+
+    state.advanced_audio.test_result = create_test_result_view(state, ID_TEST_RESULT, instance)?;
 
     create_remote_editor_controls(state, instance)?;
 
@@ -2569,7 +2575,7 @@ fn handle_dynamic_multi_select_action(
 
 fn dynamic_input_changed(state: &mut SettingsState, refresh_dynamic_layout: bool) {
     state.advanced_audio.validation = ValidationState::NotValidated;
-    state.advanced_audio.test_requested = false;
+    clear_workflow_test(state);
     if refresh_dynamic_layout {
         normalize_dynamic_page(state);
         sync_dynamic_form_page(state);
@@ -3099,6 +3105,7 @@ pub(super) fn resize(state: &mut SettingsState) {
     sync_dynamic_form_page(state);
     resize_dynamic_label_tooltip(state);
     layout_remote_viewport(state);
+    sync_visibility(state);
 }
 
 unsafe extern "system" fn remote_viewport_proc(
@@ -3450,7 +3457,7 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
         return true;
     }
     if is_remote_field(id) && notification == EN_CHANGE {
-        state.advanced_audio.test_requested = false;
+        clear_workflow_test(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, true);
         }
@@ -3469,7 +3476,7 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
     }
     if id == ID_WORKFLOW && notification == EN_CHANGE {
         state.advanced_audio.validation = ValidationState::NotValidated;
-        state.advanced_audio.test_requested = false;
+        clear_workflow_test(state);
         if !is_generating(state) {
             state.advanced_audio.generation = GenerationState::Idle;
         }
@@ -3495,7 +3502,7 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
         state.boolean_values.insert(ENABLE_KEY, enabled);
         state.advanced_audio.validation = ValidationState::NotValidated;
         state.advanced_audio.generation = GenerationState::Idle;
-        state.advanced_audio.test_requested = false;
+        clear_workflow_test(state);
         update_controls(state);
         sync_visibility(state);
         unsafe {
@@ -3540,7 +3547,7 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
             sync_remote_draft_from_controls(state);
             state.advanced_audio.config.remote_audio = state.advanced_audio.remote_draft.clone();
             state.advanced_audio.remote_open = false;
-            state.advanced_audio.test_requested = false;
+            clear_workflow_test(state);
             validate_workflow_draft(state);
             sync_visibility(state);
             update_controls(state);
@@ -3910,6 +3917,7 @@ pub(super) fn sync_visibility(state: &SettingsState) {
         .map(|group| group.0)
         .unwrap_or_default();
     if active != GROUP {
+        hide_test_result_view(state.advanced_audio.test_result);
         pop_dynamic_label_tooltip(state);
         sync_dynamic_label_tooltip_rects(state, false, false);
         return;
@@ -3962,6 +3970,77 @@ pub(super) fn sync_visibility(state: &SettingsState) {
         remote_open && provider != RemoteProvider::None,
     );
     sync_generation_status_control(state, !remote_open);
+    sync_workflow_test_result(state);
+}
+
+pub(super) fn workflow_test_requested(state: &SettingsState) -> bool {
+    state.advanced_audio.test_requested
+}
+
+pub(super) fn clear_workflow_test(state: &mut SettingsState) {
+    state.advanced_audio.test_requested = false;
+    hide_test_result_view(state.advanced_audio.test_result);
+}
+
+pub(super) fn workflow_test_result_state(state: &SettingsState) -> TestResultState {
+    match state.connectivity_status {
+        super::ConnectivityStatus::Idle => TestResultState::Testing,
+        super::ConnectivityStatus::Testing => TestResultState::Testing,
+        super::ConnectivityStatus::Succeeded => TestResultState::Succeeded,
+        super::ConnectivityStatus::Failed(_) => TestResultState::Failed,
+    }
+}
+
+fn workflow_test_result_message(state: &SettingsState) -> String {
+    match &state.connectivity_status {
+        super::ConnectivityStatus::Idle | super::ConnectivityStatus::Testing => {
+            state.language.text("advanced_audio_testing").into()
+        }
+        super::ConnectivityStatus::Succeeded => format!(
+            "{} ({} ms)",
+            state.language.text("advanced_audio_test_succeeded"),
+            state.connectivity_elapsed
+        ),
+        super::ConnectivityStatus::Failed(error) => {
+            format!(
+                "{}: {error}",
+                state.language.text("advanced_audio_test_failed")
+            )
+        }
+    }
+}
+
+fn workflow_test_result_bounds(state: &SettingsState) -> TestResultLayout {
+    test_result_layout(
+        state.advanced_audio.test_result.editor,
+        CONTENT_LEFT,
+        STATUS_TOP,
+        EDIT_LEFT + EDIT_WIDTH,
+    )
+}
+
+fn sync_workflow_test_result(state: &SettingsState) {
+    let active = GROUPS
+        .get(state.active_group)
+        .map(|group| group.0)
+        .unwrap_or_default();
+    let visible = active == GROUP
+        && enabled(state)
+        && !state.advanced_audio.remote_open
+        && !is_generating(state)
+        && state.advanced_audio.test_requested;
+    if !visible {
+        hide_test_result_view(state.advanced_audio.test_result);
+        return;
+    }
+    sync_test_result_view(
+        state.advanced_audio.test_result,
+        state.dpi,
+        CONTENT_LEFT,
+        STATUS_TOP,
+        EDIT_LEFT + EDIT_WIDTH,
+        &workflow_test_result_message(state),
+    );
 }
 
 fn generation_status_message(state: &SettingsState) -> Option<String> {
@@ -4136,7 +4215,7 @@ fn start_generation(state: &mut SettingsState) {
     state.advanced_audio.generation_cancel = cancel;
     state.advanced_audio.generation_receiver = Some(receiver);
     state.advanced_audio.generation = GenerationState::Generating;
-    state.advanced_audio.test_requested = false;
+    clear_workflow_test(state);
     update_controls(state);
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(state.hwnd), TIMER, 50, None);
@@ -4176,7 +4255,7 @@ fn reset_workflow_draft(state: &mut SettingsState) {
     state.advanced_audio.config.secrets.clear();
     state.advanced_audio.validation = ValidationState::NotValidated;
     state.advanced_audio.generation = GenerationState::Idle;
-    state.advanced_audio.test_requested = false;
+    clear_workflow_test(state);
     refresh_dynamic_form(state);
     update_controls(state);
     sync_visibility(state);
@@ -4534,6 +4613,10 @@ pub(super) fn is_generation_status_control(state: &SettingsState, control: HWND)
     control == state.advanced_audio.generation_status
 }
 
+pub(super) fn is_test_result_control(state: &SettingsState, control: HWND) -> bool {
+    control == state.advanced_audio.test_result.editor
+}
+
 pub(super) fn paint(state: &SettingsState, hdc: HDC) {
     let s = |value| platform::scale(value, state.dpi);
     if !enabled(state) {
@@ -4547,7 +4630,7 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
                     left: s(CONTENT_LEFT),
                     top: s(STATUS_TOP),
                     right: s(CONTENT_LEFT + EDIT_WIDTH),
-                    bottom: s(600),
+                    bottom: s(STATUS_BOTTOM),
                 },
             );
         }
@@ -4584,7 +4667,19 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
     }
 
     if state.advanced_audio.test_requested {
-        paint_workflow_test_status(state, hdc);
+        let layout = workflow_test_result_bounds(state);
+        let layout = TestResultLayout {
+            icon: scaled_rect(layout.icon, state.dpi),
+            frame: scaled_rect(layout.frame, state.dpi),
+            editor: scaled_rect(layout.editor, state.dpi),
+        };
+        paint_test_result(
+            hdc,
+            state.dpi,
+            workflow_test_result_state(state),
+            layout,
+            unsafe { GetFocus() } == state.advanced_audio.test_result.editor,
+        );
         return;
     }
 
@@ -4599,7 +4694,7 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
                     left: s(CONTENT_LEFT),
                     top: s(STATUS_TOP),
                     right: s(CONTENT_LEFT + EDIT_WIDTH),
-                    bottom: s(600),
+                    bottom: s(STATUS_BOTTOM),
                 },
                 DT_LEFT,
             );
@@ -4627,37 +4722,12 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
                     left: s(CONTENT_LEFT),
                     top: s(STATUS_TOP + 14),
                     right: s(CONTENT_LEFT + EDIT_WIDTH),
-                    bottom: s(600),
+                    bottom: s(STATUS_BOTTOM),
                 },
             );
         },
         ValidationState::Valid(_) => {}
     }
-}
-
-fn paint_workflow_test_status(state: &SettingsState, hdc: HDC) {
-    let (message, color) = match &state.connectivity_status {
-        super::ConnectivityStatus::Idle | super::ConnectivityStatus::Testing => (
-            state.language.text("advanced_audio_testing").into(),
-            rgb(174, 193, 196),
-        ),
-        super::ConnectivityStatus::Succeeded => (
-            format!(
-                "{} ({} ms)",
-                state.language.text("advanced_audio_test_succeeded"),
-                state.connectivity_elapsed
-            ),
-            rgb(112, 215, 195),
-        ),
-        super::ConnectivityStatus::Failed(error) => (
-            format!(
-                "{}: {error}",
-                state.language.text("advanced_audio_test_failed")
-            ),
-            rgb(255, 142, 145),
-        ),
-    };
-    paint_generation_status(state, hdc, &message, color);
 }
 
 fn paint_generation_status(state: &SettingsState, hdc: HDC, message: &str, color: COLORREF) {
@@ -4672,7 +4742,7 @@ fn paint_generation_status(state: &SettingsState, hdc: HDC, message: &str, color
                 left: s(CONTENT_LEFT),
                 top: s(STATUS_TOP),
                 right: s(CONTENT_LEFT + EDIT_WIDTH),
-                bottom: s(600),
+                bottom: s(STATUS_BOTTOM),
             },
         );
     }
@@ -4691,9 +4761,9 @@ pub(super) fn paint_legacy_notice(state: &SettingsState, hdc: HDC) {
             rgb(221, 183, 105),
             RECT {
                 left: s(CONTENT_LEFT),
-                top: s(562),
+                top: s(590),
                 right: s(EDIT_LEFT + EDIT_WIDTH),
-                bottom: s(598),
+                bottom: s(634),
             },
         );
     }
