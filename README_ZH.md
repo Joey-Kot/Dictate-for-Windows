@@ -14,7 +14,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 ## 功能特性
 
 - **录音转写**：通过浮窗或全局快捷键录音，支持暂停、取消和重新转录最近一次录音。
-- **文本改写**：为提示词配置快捷键，调用不同服务商的文本模型改写选中文本。
+- **文本改写**：通过提示词快捷键或可选的原生 Rewrite 菜单，调用不同服务商的文本模型改写选中文本。
 - **自定义 API**：配置普通 OpenAI-compatible 风格音频 API 与不同服务商的 Rewrite 接口、模型、提示词和额外请求参数。
 - **高级自定义 Audio API Provider**：根据独立的用户需求和厂商资料生成并校验声明式 ASR Provider 工作流，提供类型化、条件显示、单选和多选控件，支持单请求、流式响应、异步轮询和 WebSocket 实时转写。
 - **自动写入**：转写与改写结果共用剪贴板粘贴或 SendInput，写入当前应用。
@@ -98,7 +98,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 | Audio API | 旧接口的地址、Token、模型、语言、提示词、文本路径和额外字段 |
 | 高级 Audio API | 启用开关、用户需求与厂商资料、工作流生成/校验、参数值、密钥、原始工作流 JSON、远程托管和测试工作流 |
 | Audio Record | 麦克风（第一项）、输出声道数、输出采样率、输出位深、比特率、编码器、容器、VAD 和边界填充 |
-| Rewrite API | Provider、Base URL、API Key、Model、提示词列表、ADD PROMPT 和连接测试 |
+| Rewrite API | Provider、Base URL、API Key、Model、有序提示词列表和图标、ADD PROMPT、Enable menu、Menu key 和连接测试 |
 | Network | 旧音频 API、高级 Audio API 与 Rewrite API 共用的超时、重试、HTTP/2、TLS 校验，以及可选的非实时分片上传 |
 | Audio Hotkeys | 三个快捷键、低级键盘钩子开关、两个剪贴板等待时间，以及可配置单批大小的 SendInput 输出 |
 | Cache | 缓存目录和缓存保留 |
@@ -109,8 +109,8 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 1. 在 **Audio Record** 下方的 **Rewrite API** 页面选择 Provider，填写 Base URL、API Key 和文本 Model。这些配置独立于 Audio API。
 2. 点击 **ADD PROMPT**。**Same as Main Provider（与主服务商相同）** 沿用主 Rewrite API；选择其他 Provider 后，可填写该提示词独立的 Base URL、API Key 和 Model。
-3. 填写 Title、Prompt Content、可选 Extra config 和一个 Hotkey。先保存提示词，再保存 Settings，整套草稿才会生效。
-4. 在任意输入框当中选中文本并按提示词快捷键。程序读取文本、请求所选 API，再按配置的写入方式回填有效的最终结果。
+3. 选择 Icon，填写 Title、Prompt Content、可选 Extra config 和可选 Hotkey。先保存提示词，再保存 Settings，整套草稿才会生效。
+4. 在输入框中选中文本并按提示词快捷键。也可以勾选 **Enable menu**、录入 **Menu key** 并保存设置，按下自定义菜单快捷键后，在鼠标处弹出的提示词列表中选择快捷操作。
 
 ## 高级 Audio API
 
@@ -133,7 +133,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 `dictate-cli.exe` 支持两种模式：
 
-- **快捷键模式**：功能上等同于 GUI，只是没有界面。
+- **快捷键模式**：支持录音和非空提示词快捷键，没有图形界面。读取相同配置，但不注册仅用于 GUI 的 Menu key。
 - **文件模式**：通过 `--file` 参数转写指定已有音频文件，将文本写入指定文件，方便搭配脚本使用。
 
 命令行程序使用的配置文件建议使用 GUI 配置自动生成后使用，手写会相当麻烦。
@@ -329,12 +329,12 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 | `MODEL` | `""` | 非空时发送 multipart 字段 `model` |
 | `LANGUAGE` | `""` | 非空时发送 multipart 字段 `language` |
 | `PROMPT` | `""` | 非空时发送 multipart 字段 `prompt` |
-| `TEXT_PATH` | `"$.text"` | 用 JSONPath 从响应中选取唯一的字符串、数字或布尔值；不回退 |
+| `TEXT_PATH` | `"$.text"` | 用 JSONPath 选取唯一的转写值；字符串、数字和布尔值转为文本，`null` 表示无文本；不回退 |
 | `ExtraConfig` | `""` | 字符串化 JSON 对象，用于增删或覆盖 multipart 字段 |
 
 ### Rewrite API 字段
 
-`REWRITE` 是独立对象。旧配置缺少它时，默认 Provider 为 `custom_openai_compatible`，URL、密钥、模型为空，提示词列表为空；不会添加默认快捷键。旧提示词缺少 `provider` 或设为 `null` 时，继续沿用主 Rewrite API。上面的完整示例分别展示沿用主 API 和独立 API，两条提示词各有自己的 Extra config 与快捷键。
+`REWRITE` 是独立对象。旧配置缺少它时，默认 Provider 为 `custom_openai_compatible`，URL、密钥、模型为空，提示词列表为空；不会添加默认快捷键。缺少菜单字段时默认关闭菜单，Menu key 为空；已有提示词快捷键继续有效，缺少图标时显示默认图标。旧提示词缺少 `provider` 或设为 `null` 时，继续沿用主 Rewrite API。上面的完整示例分别展示沿用主 API 和独立 API，两条提示词各有自己的 Extra config 与快捷键。
 
 | 路径 | 默认值 | 行为 |
 |---|---|---|
@@ -342,6 +342,8 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 | `REWRITE.base_url` | `""` | HTTP(S) 基础地址或对应的完整端点，不接受查询参数、片段或内嵌账号密码 |
 | `REWRITE.api_key` | `""` | 使用主 Rewrite API 请求时必须非空，按 Provider 发送认证头 |
 | `REWRITE.model` | `""` | 文本模型，可由单条提示词的额外参数覆盖；合并后必须是非空字符串 |
+| `REWRITE.menu_enabled` | `false` | 启用 GUI Rewrite 菜单；关闭后保留 Menu key，但不注册 |
+| `REWRITE.menu_key` | `""` | 菜单快捷键；启用菜单时必须填写有效的非空组合 |
 | `REWRITE.prompts` | `[]` | 按显示顺序保存提示词 |
 | `prompts[].id` | 自动生成 | 稳定且唯一的内部标识，编辑和排序时保留 |
 | `prompts[].provider` | `null` | `null` 或缺失表示 Same as Main Provider；选择下表中的值时使用该提示词独立的整组 API 配置 |
@@ -349,9 +351,10 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 | `prompts[].api_key` | `""` | 独立 API 密钥；沿用主配置时忽略 |
 | `prompts[].model` | `""` | 独立文本模型，仍可由该提示词的 Extra config 覆盖；沿用主配置时忽略 |
 | `prompts[].title` | `""` | 必填显示名称 |
+| `prompts[].icon` | `{"kind":"default"}` | 默认、内置或应用管理的自定义图标；引用无效或图片缺失时回退默认图标 |
 | `prompts[].prompt` | `""` | 必填提示词内容；选中文本作为独立用户输入发送 |
 | `prompts[].extra_config` | `""` | 可留空，否则为包含 JSON 对象的字符串；编辑窗直接填写对象 |
-| `prompts[].hotkey` | `""` | 必填执行快捷键，不能与音频动作或其他提示词冲突 |
+| `prompts[].hotkey` | `""` | 可选执行快捷键，空值不注册；非空值不能与音频动作、其他提示词或已启用的 Menu key 冲突 |
 
 提示词选择独立 Provider 时，不会逐项继承主配置；全部提示词均使用独立 API 时，主 API 字段可留空。保存设置不要求 API 已填写完整，测试或请求时才检查当前有效配置。实际执行在合并 Extra config 后检查模型，因此 Extra config 也可提供 `model`；连接测试不使用 Extra config，必须填写 API 的 Model。`extra_config` 只合并请求体，不用于配置 Provider、地址或认证密钥。
 
@@ -431,6 +434,8 @@ Earshot VAD 语义只适用于不启用分片的完整文件。
 | `MAX_UPLOAD_CONCURRENCY` | `1` | 正整数，同时运行的完整分片识别工作流数，包含远程上传、提交、轮询、结果获取和清理；开关关闭时仍保留并校验 |
 
 ### 快捷键、剪贴板、缓存与调试字段
+
+两种热键模式均按完整组合键精确匹配。音频操作、Rewrite 提示词和启用的菜单快捷键可以使用同一主键、不同修饰键，例如 `Ctrl+Q`、`Shift+Q`、`Alt+Q`。按下 `Ctrl+Shift+Q` 只会触发它自己的绑定；未配置时不会触发其他操作。归一化后完全相同的组合仍会判为冲突。RegisterHotKey 模式仍为 Rewrite 读取输入保留 `Ctrl+C`。
 
 | 字段 | 默认值 | 行为 |
 |---|---:|---|
@@ -614,7 +619,7 @@ cargo test -p dictate-gui --features native-gui,static-libav \
 
 快捷键录入的自动测试范围与待执行的 Windows 键盘、焦点检查项，见[快捷键录入验证记录](docs/hotkey-recording-validation.md)。
 
-本次 Rewrite 的自动化结果及待执行的选区读取、真实写入、Provider 和 DPI 检查，见 [Rewrite 验证记录](docs/rewrite-validation.md)。Linux 测试和 Windows 交叉编译不能替代 Windows 桌面验证。
+Rewrite 的自动化结果及待执行的选区读取、真实写入、Provider 和 DPI 检查，见 [Rewrite 验证记录](docs/rewrite-validation.md)。[Rewrite 菜单验收记录](docs/rewrite-menu-validation.md)分别记录功能检查和深浅主题、有无滚动条的四组参考图验收。Linux 测试和 Windows 交叉编译不能替代 Windows 桌面验证；Windows 10 实机验收由用户完成。
 
 日志接收、缓冲、请求脱敏和原生 FFmpeg 转发测试，以及待执行的 Windows 日志框检查，见 [GUI Debug 输出验证记录](docs/debug-output-validation.md)。
 

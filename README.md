@@ -14,7 +14,7 @@ It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
 ## Features
 
 - **Recording and transcription**: Record through the floating window or global hotkeys, with pause, cancel, and retry of the most recent recording.
-- **Text rewriting**: Configure prompt hotkeys that send selected text to different text-model providers.
+- **Text rewriting**: Use prompt hotkeys or an optional native Rewrite menu to rewrite selected text with different providers.
 - **Custom APIs**: Configure a regular OpenAI-compatible-style audio API plus provider-specific Rewrite APIs, models, prompts, and extra request parameters.
 - **Advanced custom Audio API providers**: Generate and validate declarative ASR-provider workflows from separate user requirements and vendor documentation. Workflows provide typed, conditionally visible, single-select, and multi-select controls, and support single requests, streamed responses, asynchronous polling, and real-time WebSocket transcription.
 - **Automatic insertion**: Insert transcription and rewrite results into the active application through the clipboard or SendInput.
@@ -98,7 +98,7 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 | Audio API | Legacy API endpoint, token, model, language, prompt, text path, and extra fields |
 | Advanced Audio API | Enable switch, user requirements and vendor documentation, workflow generation/validation, parameter values, secrets, raw workflow JSON, remote hosting, and workflow testing |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
-| Rewrite API | Provider, Base URL, API Key, Model, prompt list, ADD PROMPT, and connection testing |
+| Rewrite API | Provider, Base URL, API Key, Model, ordered prompts and icons, ADD PROMPT, Enable menu, Menu key, and connection testing |
 | Network | Timeouts, retries, HTTP/2, TLS validation, and optional non-real-time segmented uploads shared by Legacy Audio API, Advanced Audio API, and Rewrite API |
 | Audio Hotkeys | Three hotkeys, the low-level keyboard-hook switch, two clipboard wait times, and configurable SendInput batch size |
 | Cache | Cache directory and cache retention |
@@ -109,8 +109,8 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 
 1. On the **Rewrite API** page below **Audio Record**, select a provider and enter its Base URL, API Key, and text Model. These settings are independent of Audio API.
 2. Click **ADD PROMPT**. **Same as Main Provider** reuses the main Rewrite API; after selecting another provider, you can provide this prompt with its own Base URL, API Key, and Model.
-3. Enter a Title, Prompt Content, optional Extra config, and a Hotkey. Save the prompt first, then save Settings for the complete draft to take effect.
-4. Select text in any input field and press the prompt hotkey. The application reads the text, requests the selected API, and inserts the valid final result using the configured output method.
+3. Choose an Icon and enter a Title, Prompt Content, optional Extra config, and an optional Hotkey. Save the prompt first, then save Settings for the complete draft to take effect.
+4. Select text in the input box and press the prompt shortcut. You can also check **Enable menu**, enter a **Menu key**, and save your settings. Then press the custom menu shortcut and select a quick action from the prompt list that appears at the mouse cursor.
 
 ## Advanced Audio API
 
@@ -133,7 +133,7 @@ Advanced Audio API is an optional, constrained declarative ASR workflow. Once co
 
 `dictate-cli.exe` has two modes:
 
-- **Hotkey mode**: Functionally equivalent to the GUI, without a user interface.
+- **Hotkey mode**: Records audio and runs nonempty prompt hotkeys without a user interface. It loads the same configuration but does not register the GUI-only Menu key.
 - **File mode**: Transcribes an existing audio file given by `--file` and writes text to the requested output file, making it suitable for scripts.
 
 It is recommended to generate the configuration using the GUI, rather than hand-writing the CLI configuration.
@@ -329,12 +329,12 @@ This is a Legacy Audio API example. See ExtraConfig below for the expanded form 
 | `MODEL` | `""` | Sends multipart field `model` when non-empty |
 | `LANGUAGE` | `""` | Sends multipart field `language` when non-empty |
 | `PROMPT` | `""` | Sends multipart field `prompt` when non-empty |
-| `TEXT_PATH` | `"$.text"` | Uses JSONPath to select exactly one string, number, or boolean from the response; no fallback |
+| `TEXT_PATH` | `"$.text"` | Uses JSONPath to select exactly one transcript value; strings, numbers, and booleans become text, while `null` means no text; no fallback |
 | `ExtraConfig` | `""` | A JSON-object string used to add, delete, or override multipart fields |
 
 ### Rewrite API fields
 
-`REWRITE` is an independent object. When older configuration lacks it, the default provider is `custom_openai_compatible`, with empty endpoint, key, model, and prompt list; no default hotkeys are added. A legacy prompt with a missing or `null` `provider` continues to inherit the main Rewrite API. The complete example above shows an inherited API and an independent API, with an Extra config and hotkey for each prompt.
+`REWRITE` is an independent object. When older configuration lacks it, the default provider is `custom_openai_compatible`, with empty endpoint, key, model, and prompt list; no default hotkeys are added. Missing menu fields mean a disabled menu and an empty Menu key. Existing prompt hotkeys retain their behavior, and a missing icon uses the default icon. A legacy prompt with a missing or `null` `provider` continues to inherit the main Rewrite API. The complete example above shows an inherited API and an independent API, with an Extra config and hotkey for each prompt.
 
 | Path | Default | Behavior |
 |---|---|---|
@@ -342,6 +342,8 @@ This is a Legacy Audio API example. See ExtraConfig below for the expanded form 
 | `REWRITE.base_url` | `""` | HTTP(S) base URL or its complete endpoint; query parameters, fragments, and embedded usernames or passwords are rejected |
 | `REWRITE.api_key` | `""` | Required when requesting the main Rewrite API; sends the authentication header dictated by the provider |
 | `REWRITE.model` | `""` | Text model. A prompt's extra parameters may override it; the merged value must be a non-empty string |
+| `REWRITE.menu_enabled` | `false` | Enables the GUI Rewrite menu; disabling retains Menu key without registering it |
+| `REWRITE.menu_key` | `""` | Menu shortcut; a valid nonempty key is required when the menu is enabled |
 | `REWRITE.prompts` | `[]` | Prompts in display order |
 | `prompts[].id` | Generated automatically | Stable, unique internal identifier retained when editing and reordering |
 | `prompts[].provider` | `null` | `null` or absent means Same as Main Provider; selecting a value from the table uses this prompt's independent complete API configuration |
@@ -349,9 +351,10 @@ This is a Legacy Audio API example. See ExtraConfig below for the expanded form 
 | `prompts[].api_key` | `""` | Independent API key; ignored while inheriting |
 | `prompts[].model` | `""` | Independent text model, which this prompt's Extra config may still override; ignored while inheriting |
 | `prompts[].title` | `""` | Required display name |
+| `prompts[].icon` | `{"kind":"default"}` | Default, built-in, or managed custom image; invalid or missing images use the default icon |
 | `prompts[].prompt` | `""` | Required prompt content; selected text is sent as a separate user input |
 | `prompts[].extra_config` | `""` | May be empty; otherwise, a string containing a JSON object. The editing dialog accepts the object directly. |
-| `prompts[].hotkey` | `""` | Required execution hotkey; it cannot conflict with audio actions or another prompt |
+| `prompts[].hotkey` | `""` | Optional execution hotkey; empty values are not registered. Nonempty values must not conflict with audio actions, another prompt, or the enabled Menu key |
 
 When a prompt selects an independent provider, it does not inherit main configuration fields individually. If every prompt uses an independent API, the main API fields may remain empty. Saving Settings does not require complete API fields; the active configuration is checked only during testing or requests. Execution checks the model after Extra config is merged, so Extra config may provide `model`; connection testing does not use Extra config and requires the API Model. `extra_config` merges only into the request body; it cannot configure the provider, endpoint, or authentication key.
 
@@ -431,6 +434,12 @@ The fields below are shared by Legacy Audio API, Advanced Audio API, and Rewrite
 | `MAX_UPLOAD_CONCURRENCY` | `1` | Positive integer. Number of complete segment-recognition workflows allowed simultaneously, including remote upload, submission, polling, result retrieval, and cleanup; retained and validated even when disabled. |
 
 ### Hotkey, clipboard, cache, and debug fields
+
+Both hotkey modes match the complete combination. Audio actions, Rewrite prompts,
+and the enabled Menu key may share a key with different modifiers, such as
+`Ctrl+Q`, `Shift+Q`, and `Alt+Q`. `Ctrl+Shift+Q` triggers only its own binding;
+without one, it does not trigger another action. Identical normalized bindings
+remain conflicts. RegisterHotKey mode still reserves `Ctrl+C` for reading Rewrite input.
 
 | Field | Default | Behavior |
 |---|---:|---|
@@ -614,7 +623,7 @@ Tests require the corresponding output encoders and containers in the menu. For 
 
 For automated coverage of hotkey recording and the remaining Windows keyboard and focus checks, see the [hotkey input validation record](docs/hotkey-recording-validation.md).
 
-For automated Rewrite results and pending selection-reading, real insertion, provider, and DPI checks, see the [Rewrite validation record](docs/rewrite-validation.md). Linux tests and Windows cross-compilation do not replace Windows desktop verification.
+For automated Rewrite results and pending selection-reading, real insertion, provider, and DPI checks, see the [Rewrite validation record](docs/rewrite-validation.md). The [Rewrite menu validation record](docs/rewrite-menu-validation.md) separately tracks functional checks and the four light/dark, scrolling/non-scrolling visual references. Linux tests and Windows cross-compilation do not replace Windows desktop verification; Windows 10 acceptance is performed by the user.
 
 For log receiving, buffering, request redaction, and native FFmpeg forwarding tests, plus pending Windows log-box checks, see the [GUI Debug output validation record](docs/debug-output-validation.md).
 

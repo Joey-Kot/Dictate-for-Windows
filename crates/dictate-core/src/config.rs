@@ -820,4 +820,98 @@ mod tests {
         config.rewrite.prompts[0].extra_config = "[]".into();
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn rewrite_menu_and_icons_roundtrip_with_optional_hotkeys_and_tolerant_icons() {
+        use crate::rewrite::{BuiltinPromptIcon, PromptIcon};
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "REWRITE": {"prompts": [
+                {"id":"legacy", "title":"Legacy", "prompt":"Rewrite", "hotkey":"ctrl+alt+w"},
+                {"id":"menu", "title":"Menu only", "prompt":"Rewrite", "icon":{"kind":"builtin","value":"translate"}},
+                {"id":"custom", "title":"Custom", "prompt":"Rewrite", "icon":{"kind":"custom","value":"icons/example.png"}},
+                {"id":"unknown", "title":"Unknown icon", "prompt":"Rewrite", "icon":{"kind":"future","value":14}},
+                {"id":"damaged", "title":"Damaged icon", "prompt":"Rewrite", "icon":42}
+            ]}
+        })).unwrap();
+        config.validate().unwrap();
+        assert!(!config.rewrite.menu_enabled);
+        assert!(config.rewrite.menu_key.is_empty());
+        assert_eq!(config.rewrite.prompts[0].icon, PromptIcon::Default);
+        assert_eq!(
+            config.rewrite.prompts[1].icon,
+            PromptIcon::Builtin(BuiltinPromptIcon::Translate)
+        );
+        assert_eq!(
+            config.rewrite.prompts[2].icon,
+            PromptIcon::Custom("icons/example.png".into())
+        );
+        assert_eq!(config.rewrite.prompts[3].icon, PromptIcon::Default);
+        assert_eq!(config.rewrite.prompts[4].icon, PromptIcon::Default);
+        config.rewrite.menu_enabled = true;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Menu key")
+        );
+        config.rewrite.validate_prompts().unwrap();
+        config.rewrite.menu_key = "ctrl+alt+m".into();
+        config.validate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("menu-config.json");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+        config.rewrite.menu_enabled = false;
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().rewrite.menu_key, "ctrl+alt+m");
+    }
+
+    #[test]
+    fn builtin_icon_catalog_saves_and_loads_all_25_choices() {
+        use crate::rewrite::{BuiltinPromptIcon, PromptIcon, RewritePrompt};
+        let expected_ids = [
+            "chat",
+            "messages",
+            "translate",
+            "eye",
+            "feather",
+            "document",
+            "shield",
+            "pie_chart",
+            "tags",
+            "text_card",
+            "box",
+            "flask",
+            "globe",
+            "cookie",
+            "window",
+            "plug",
+            "settings",
+            "layers",
+            "key",
+            "network",
+            "hierarchy",
+            "bar_chart",
+            "microphone",
+            "fingerprint",
+            "layout",
+        ];
+        assert_eq!(BuiltinPromptIcon::ALL.len(), expected_ids.len());
+        let mut config = Config::default();
+        for (builtin, id) in BuiltinPromptIcon::ALL.into_iter().zip(expected_ids) {
+            assert_eq!(serde_json::to_value(builtin).unwrap(), id);
+            config.rewrite.prompts.push(RewritePrompt {
+                id: id.into(),
+                title: builtin.label().into(),
+                prompt: "Rewrite".into(),
+                icon: PromptIcon::Builtin(builtin),
+                ..Default::default()
+            });
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("icons-config.json");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
 }

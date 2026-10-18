@@ -135,6 +135,126 @@ impl Provider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinPromptIcon {
+    Chat,
+    Messages,
+    Translate,
+    Eye,
+    Feather,
+    Document,
+    Shield,
+    PieChart,
+    Tags,
+    TextCard,
+    Box,
+    Flask,
+    Globe,
+    Cookie,
+    Window,
+    Plug,
+    Settings,
+    Layers,
+    Key,
+    Network,
+    Hierarchy,
+    BarChart,
+    Microphone,
+    Fingerprint,
+    Layout,
+}
+
+impl BuiltinPromptIcon {
+    pub const ALL: [Self; 25] = [
+        Self::Chat,
+        Self::Messages,
+        Self::Translate,
+        Self::Eye,
+        Self::Feather,
+        Self::Document,
+        Self::Shield,
+        Self::PieChart,
+        Self::Tags,
+        Self::TextCard,
+        Self::Box,
+        Self::Flask,
+        Self::Globe,
+        Self::Cookie,
+        Self::Window,
+        Self::Plug,
+        Self::Settings,
+        Self::Layers,
+        Self::Key,
+        Self::Network,
+        Self::Hierarchy,
+        Self::BarChart,
+        Self::Microphone,
+        Self::Fingerprint,
+        Self::Layout,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Messages => "Messages",
+            Self::Translate => "Translate",
+            Self::Eye => "Eye",
+            Self::Feather => "Feather",
+            Self::Document => "Document",
+            Self::Shield => "Shield",
+            Self::PieChart => "Pie chart",
+            Self::Tags => "Tags",
+            Self::TextCard => "Text card",
+            Self::Box => "Box",
+            Self::Flask => "Flask",
+            Self::Globe => "Globe",
+            Self::Cookie => "Cookie",
+            Self::Window => "Window",
+            Self::Plug => "Plug",
+            Self::Settings => "Settings",
+            Self::Layers => "Layers",
+            Self::Key => "Key",
+            Self::Network => "Network",
+            Self::Hierarchy => "Hierarchy",
+            Self::BarChart => "Bar chart",
+            Self::Microphone => "Microphone",
+            Self::Fingerprint => "Fingerprint",
+            Self::Layout => "Layout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PromptIcon {
+    #[default]
+    Default,
+    Builtin(BuiltinPromptIcon),
+    /// Relative reference in the application's managed icon directory.
+    Custom(String),
+}
+
+impl<'de> Deserialize<'de> for PromptIcon {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+        enum IconValue {
+            Default,
+            Builtin(BuiltinPromptIcon),
+            Custom(String),
+        }
+        // A damaged or newer icon must not prevent otherwise valid prompts
+        // from loading. Resource availability is checked by the GUI cache.
+        let value = Value::deserialize(deserializer)?;
+        Ok(match serde_json::from_value::<IconValue>(value) {
+            Ok(IconValue::Builtin(icon)) => Self::Builtin(icon),
+            Ok(IconValue::Custom(path)) if !path.trim().is_empty() => Self::Custom(path),
+            _ => Self::Default,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RewritePrompt {
@@ -143,6 +263,7 @@ pub struct RewritePrompt {
     pub prompt: String,
     pub extra_config: String,
     pub hotkey: String,
+    pub icon: PromptIcon,
     pub provider: Option<Provider>,
     pub base_url: String,
     pub api_key: String,
@@ -157,6 +278,7 @@ impl Default for RewritePrompt {
             prompt: String::new(),
             extra_config: String::new(),
             hotkey: String::new(),
+            icon: PromptIcon::default(),
             provider: None,
             base_url: String::new(),
             api_key: String::new(),
@@ -189,7 +311,10 @@ impl RewritePrompt {
         if self.id.is_empty() || self.title.trim().is_empty() || self.prompt.trim().is_empty() {
             return Err("Prompt ID, title and content must not be empty".into());
         }
-        crate::hotkey::parse_hotkey(&self.hotkey).map_err(|e| format!("{}: {e}", self.title))?;
+        if !self.hotkey.trim().is_empty() {
+            crate::hotkey::parse_hotkey(&self.hotkey)
+                .map_err(|e| format!("{}: {e}", self.title))?;
+        }
         additional_parameters::parse(&self.extra_config)
             .map_err(|e| format!("{}: {e}", self.title))?;
         Ok(())
@@ -211,11 +336,24 @@ pub struct RewriteConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub menu_enabled: bool,
+    pub menu_key: String,
     pub prompts: Vec<RewritePrompt>,
 }
 
 impl RewriteConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_prompts()?;
+        if self.menu_enabled {
+            crate::hotkey::parse_hotkey(&self.menu_key)
+                .map_err(|error| format!("Menu key: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Prompt editor commits may occur before the main settings draft has a
+    /// menu key. Only final settings application requires that key.
+    pub fn validate_prompts(&self) -> Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for prompt in &self.prompts {
             prompt.validate()?;
@@ -1122,6 +1260,7 @@ mod tests {
             api_key: "key".into(),
             model: "default".into(),
             prompts: vec![],
+            ..Default::default()
         }
     }
 
@@ -2063,6 +2202,7 @@ mod tests {
                         api_key: "probe-key".into(),
                         model: "probe-model".into(),
                         prompts: Vec::new(),
+                        ..Default::default()
                     };
                     prompt.provider = None;
                     prompt.base_url = "invalid hidden URL".into();

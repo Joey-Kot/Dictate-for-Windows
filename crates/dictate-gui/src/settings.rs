@@ -56,9 +56,12 @@ mod debug;
 mod dropdown;
 #[path = "dropdown_scrollbar.rs"]
 mod dropdown_scrollbar;
+pub(crate) use dropdown_scrollbar::Metrics as ScrollbarMetrics;
 mod hotkeys;
 mod microphone;
 mod rewrite;
+#[cfg(test)]
+mod text_tests;
 use microphone::{
     ID_MICROPHONE, ID_MICROPHONE_LIST, MICROPHONE_TIMER, MicrophonePicker, WM_MICROPHONE_ACTION,
 };
@@ -106,7 +109,7 @@ pub(super) const TEST_RESULT_MIN_HEIGHT: i32 = 34;
 pub(super) const TEST_RESULT_LINE_HEIGHT: i32 = 20;
 pub(super) const TEST_RESULT_MAX_HEIGHT: i32 = TEST_RESULT_MIN_HEIGHT + TEST_RESULT_LINE_HEIGHT * 2;
 const API_TEST_RESULT_TOP: i32 = 506;
-const REWRITE_TEST_RESULT_TOP: i32 = 492;
+const REWRITE_TEST_RESULT_TOP: i32 = 626;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const HOTKEY_INPUT_KEYS: [&str; 3] = [
     "CLIPBOARD_WRITE_DELAY",
@@ -588,7 +591,7 @@ impl SettingsWindow {
             connectivity_elapsed: 0,
             connectivity_result: TestResultView::default(),
             advanced_audio: advanced_audio::Page::new(&runtime.config()),
-            rewrite: rewrite::Page::new(runtime.config().rewrite),
+            rewrite: rewrite::Page::new(runtime.config().rewrite, &platform::config_path()?),
             debug: debug::Page::default(),
             language,
             language_control: HWND::default(),
@@ -778,8 +781,11 @@ unsafe extern "system" fn settings_proc(
                 }
             } else if id >= ID_FIELD_BASE
                 && id < ID_FIELD_BASE + FIELDS.len()
-                && (notification == EN_SETFOCUS || notification == EN_KILLFOCUS)
+                && matches!(notification, EN_SETFOCUS | EN_KILLFOCUS | EN_CHANGE)
             {
+                if hotkeys::KEYS.contains(&FIELDS[id - ID_FIELD_BASE].key) {
+                    rewrite::refresh_hotkey_context(state);
+                }
                 if notification == EN_KILLFOCUS && FIELDS[id - ID_FIELD_BASE].key == "ExtraConfig" {
                     format_json_input(HWND(lparam.0 as *mut c_void));
                 }
@@ -1015,6 +1021,7 @@ unsafe extern "system" fn settings_proc(
             let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             if resized {
                 apply_settings_region(hwnd, state.dpi);
+                rewrite::resize_page(state);
             }
             sync_settings_frame(state, resized);
             result
@@ -1560,6 +1567,7 @@ fn resize_controls(state: &mut SettingsState) {
         }
     }
     rewrite::resize_list(state);
+    rewrite::resize_page(state);
     debug::resize(&mut state.debug, state.dpi);
     sync_connectivity_result(state);
     unsafe {
@@ -1712,7 +1720,7 @@ fn paint_window(state: &SettingsState) {
         if active == "About" {
             paint_about(state, hdc);
         }
-        if active == "API" || active == "Rewrite" {
+        if active == "API" {
             paint_connectivity_status(state, hdc);
         }
         if active == "API" {
@@ -1907,34 +1915,16 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
             return;
         }
 
-        let (fill, border, text_color, radius) = if id == ID_TEST_CONNECTIVITY
-            || (rewrite::ID_ADD..=rewrite::ID_TEST).contains(&id)
+        if id == ID_TEST_CONNECTIVITY
+            || rewrite::is_action_button(id)
             || debug::is_button(id)
             || advanced_audio::is_button(id)
         {
-            (
-                if disabled {
-                    rgb(29, 39, 43)
-                } else if pressed {
-                    rgb(33, 61, 61)
-                } else {
-                    rgb(16, 22, 25)
-                },
-                if disabled {
-                    rgb(48, 61, 66)
-                } else if focused || hot {
-                    rgb(82, 192, 176)
-                } else {
-                    rgb(56, 84, 86)
-                },
-                if disabled {
-                    rgb(107, 123, 126)
-                } else {
-                    rgb(226, 239, 239)
-                },
-                7,
-            )
-        } else if selected_page {
+            draw_action_button(item, state.font, state.dpi);
+            return;
+        }
+
+        let (fill, border, text_color, radius) = if selected_page {
             (rgb(27, 51, 52), rgb(55, 115, 106), rgb(237, 248, 246), 7)
         } else {
             (
@@ -1982,6 +1972,51 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
             },
             0,
         );
+    }
+}
+
+// Shared by settings actions and the prompt editor's compact Clear button.
+unsafe fn draw_action_button(item: &DRAWITEMSTRUCT, font: HFONT, dpi: u32) {
+    let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+    let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0 || dropdown::hovered(item.hwndItem);
+    let focused = item.itemState.0 & ODS_FOCUS.0 != 0;
+    let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+    unsafe {
+        fill_color(item.hDC, item.rcItem, rgb(16, 22, 25));
+        rounded_box(
+            item.hDC,
+            item.rcItem,
+            if disabled {
+                rgb(29, 39, 43)
+            } else if pressed {
+                rgb(33, 61, 61)
+            } else {
+                rgb(16, 22, 25)
+            },
+            if disabled {
+                rgb(48, 61, 66)
+            } else if focused || hot {
+                rgb(82, 192, 176)
+            } else {
+                rgb(56, 84, 86)
+            },
+            platform::scale(7, dpi),
+        );
+        let text = read_text(item.hwndItem);
+        if !text.is_empty() {
+            draw_text_line(
+                item.hDC,
+                font,
+                &text,
+                if disabled {
+                    rgb(107, 123, 126)
+                } else {
+                    rgb(226, 239, 239)
+                },
+                item.rcItem,
+                DT_CENTER,
+            );
+        }
     }
 }
 
@@ -2553,6 +2588,7 @@ fn sync_connectivity_result(state: &SettingsState) {
         right,
         &connectivity_result_message(state),
     );
+    rewrite::position_test_result(state);
 }
 
 unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
@@ -2953,30 +2989,29 @@ fn save(state: &mut SettingsState) {
             return;
         }
     };
-    if let Err(dictate_core::hotkey::HotkeyError::DuplicateBinding {
-        name,
-        previous_name,
-        ..
-    }) = dictate_core::hotkey::validate_bindings(
-        &config.start_key,
-        &config.pause_key,
-        &config.cancel_or_retry_key,
-    ) {
-        show_error(
-            state.hwnd,
-            &format!(
-                "{}: {} / {}",
-                state.language.text("hotkey_duplicate"),
-                state.language.text(name),
-                state.language.text(previous_name)
-            ),
-        );
+    if config.rewrite.menu_enabled && config.rewrite.menu_key.trim().is_empty() {
+        show_error(state.hwnd, state.language.text("rewrite_menu_key_required"));
+        return;
+    }
+    if let Err(error) = hotkeys::validate_draft(&config, state.language) {
+        show_error(state.hwnd, &error);
         return;
     }
     if let Err(error) = config.validate() {
         show_error(state.hwnd, &error.to_string());
         return;
     }
+    let prepared_icons = match state
+        .rewrite
+        .icon_draft
+        .prepare(config.rewrite.prompts.iter().map(|prompt| &prompt.icon))
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            show_error(state.hwnd, &error);
+            return;
+        }
+    };
     state.saving = true;
     rewrite::close_provider(state);
     audio::close_all(state);
@@ -3000,6 +3035,9 @@ fn save(state: &mut SettingsState) {
             async_runtime
                 .block_on(runtime.save_and_reload(config, &config_path))
                 .map_err(|error| error.to_string())?;
+            // Keep the resource transaction with the worker even if its settings
+            // window closes while reload is in flight.
+            prepared_icons.commit();
             Ok(runtime.snapshot())
         })();
         let _ = tx.send(result);
@@ -3123,6 +3161,7 @@ fn enable_controls(state: &SettingsState, enabled: bool) {
 }
 
 fn update_input_controls(state: &SettingsState) {
+    rewrite::update_menu_controls(state);
     for key in ["__test_connectivity", "__rewrite_test"] {
         if let Some(button) = state.controls.get(key) {
             unsafe {
@@ -3306,6 +3345,11 @@ unsafe fn draw_text_line(
     mut rect: RECT,
     alignment: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
 ) {
+    // An empty Vec<u16> has a dangling data pointer. DrawTextW can read the
+    // first UTF-16 unit even when its character count is zero.
+    if text.is_empty() {
+        return;
+    }
     let mut text = text.encode_utf16().collect::<Vec<_>>();
     unsafe {
         let old = SelectObject(hdc, HGDIOBJ(font.0));
@@ -3322,6 +3366,9 @@ unsafe fn draw_text_line(
 }
 
 unsafe fn draw_text_wrapped(hdc: HDC, font: HFONT, text: &str, color: COLORREF, mut rect: RECT) {
+    if text.is_empty() {
+        return;
+    }
     let mut text = text.encode_utf16().collect::<Vec<_>>();
     unsafe {
         let old = SelectObject(hdc, HGDIOBJ(font.0));

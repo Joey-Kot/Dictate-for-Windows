@@ -181,19 +181,23 @@ impl AsrClient {
             if attempt > 1 {
                 prepare().await?;
             }
-            let (status, failure, response) = match self
-                .upload_once(cancellation, file_path)
-                .await?
-            {
-                UploadAttempt::Accepted(response) => {
-                    let text =
-                        match jsonpath::extract_text_from_response(&response, &self.text_path) {
+            let (status, failure, response) =
+                match self.upload_once(cancellation, file_path).await? {
+                    UploadAttempt::Accepted(response) => {
+                        let text = match jsonpath::extract_transcript_from_response(
+                            &response,
+                            &self.text_path,
+                        ) {
                             Ok(text) => {
                                 self.debug(format_args!(
                                     "[upload] audio event=parse-complete characters={}",
                                     text.chars().count()
                                 ));
-                                text
+                                if text.trim().is_empty() {
+                                    String::new()
+                                } else {
+                                    text
+                                }
                             }
                             Err(source) => {
                                 self.debug(format_args!(
@@ -205,25 +209,25 @@ impl AsrClient {
                                 });
                             }
                         };
-                    self.debug(format_args!("[upload] audio event=completed"));
-                    return Ok(Transcription {
-                        text,
-                        raw_response: response,
-                    });
-                }
-                UploadAttempt::NoSpeech(response) => {
-                    self.debug(format_args!("[upload] audio event=no-speech"));
-                    return Ok(Transcription {
-                        text: String::new(),
-                        raw_response: response,
-                    });
-                }
-                UploadAttempt::Rejected {
-                    status,
-                    failure,
-                    response,
-                } => (status, failure, response),
-            };
+                        self.debug(format_args!("[upload] audio event=completed"));
+                        return Ok(Transcription {
+                            text,
+                            raw_response: response,
+                        });
+                    }
+                    UploadAttempt::NoSpeech(response) => {
+                        self.debug(format_args!("[upload] audio event=no-speech"));
+                        return Ok(Transcription {
+                            text: String::new(),
+                            raw_response: response,
+                        });
+                    }
+                    UploadAttempt::Rejected {
+                        status,
+                        failure,
+                        response,
+                    } => (status, failure, response),
+                };
             self.debug(format_args!(
                 "[upload] audio event=attempt-failed attempt={attempt} response_bytes={}",
                 response.len()
@@ -548,11 +552,17 @@ impl AsrClient {
 /// transcription completed but did not contain a word. Restrict the exception
 /// to the documented code and response shape so ordinary 400s remain visible
 /// configuration or service failures.
-fn is_no_words_response(status: StatusCode, response: &[u8]) -> bool {
+pub(crate) fn is_no_words_response(status: StatusCode, response: &[u8]) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
-    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(response) else {
+    serde_json::from_slice::<Value>(response).is_ok_and(|value| is_no_words_error(&value))
+}
+
+/// Shared only by explicit ASR failure responses/events, never by arbitrary
+/// transcript strings or remote-resource upload errors.
+pub(crate) fn is_no_words_error(response: &Value) -> bool {
+    let Some(object) = response.as_object() else {
         return false;
     };
     let has_no_words_code = |object: &serde_json::Map<String, Value>| {
@@ -562,7 +572,7 @@ fn is_no_words_response(status: StatusCode, response: &[u8]) -> bool {
                 object.get(field).and_then(Value::as_str) == Some(ASR_RESPONSE_HAVE_NO_WORDS)
             })
     };
-    has_no_words_code(&object)
+    has_no_words_code(object)
         || match object.get("error") {
             Some(Value::String(value)) => value == ASR_RESPONSE_HAVE_NO_WORDS,
             Some(Value::Object(error)) => has_no_words_code(error),
@@ -652,7 +662,7 @@ mod tests {
         for (body, path) in [
             ("not JSON", "$.text"),
             (r#"{"text":"fallback","other":"fallback"}"#, "$.missing"),
-            (r#"{"text":null}"#, "$.text"),
+            (r#"{"text":[]}"#, "$.text"),
             (
                 r#"{"segments":[{"text":"a"},{"text":"b"}]}"#,
                 "$.segments[*].text",
@@ -787,70 +797,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_words_response_is_an_empty_transcription_without_retry() {
+    async fn empty_transcriptions_succeed_without_retry() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let body = r#"{"error":"ASR_RESPONSE_HAVE_NO_WORDS"}"#;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0; 4096];
-                let n = stream.read(&mut buffer).await.unwrap();
-                assert!(n > 0);
-                request.extend_from_slice(&buffer[..n]);
-                if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                    let length = headers
-                        .lines()
-                        .find_map(|value| value.strip_prefix("content-length: "))
-                        .and_then(|value| value.trim().parse::<usize>().ok());
-                    if length.is_some_and(|value| request.len() >= end + 4 + value)
-                        || request.ends_with(b"0\r\n\r\n")
-                    {
-                        break;
+        for (status, body) in [
+            (200, r#"{"text":""}"#),
+            (200, r#"{"text":" \t\n　"}"#),
+            (200, r#"{"text":null}"#),
+            (400, r#"{"error":"ASR_RESPONSE_HAVE_NO_WORDS"}"#),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|value| value.strip_prefix("content-length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok());
+                        if length.is_some_and(|value| request.len() >= end + 4 + value)
+                            || request.ends_with(b"0\r\n\r\n")
+                        {
+                            break;
+                        }
                     }
                 }
-            }
-            let response = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let audio = directory.path().join("audio.wav");
-        std::fs::write(&audio, b"audio").unwrap();
-        let client = super::AsrClient::new(crate::Config {
-            api_endpoint: format!("http://{address}"),
-            max_retry: 3,
-            retry_base_delay: 0.0,
-            ..Default::default()
-        })
-        .unwrap();
-        let prepared = Arc::new(AtomicUsize::new(0));
-        let count = prepared.clone();
-        let transcription = client
-            .transcribe_with_retry_prepare(
-                &tokio_util::sync::CancellationToken::new(),
-                &audio,
-                || async {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-            )
-            .await
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let audio = directory.path().join("audio.wav");
+            std::fs::write(&audio, b"audio").unwrap();
+            let client = super::AsrClient::new(crate::Config {
+                api_endpoint: format!("http://{address}"),
+                max_retry: 3,
+                retry_base_delay: 0.0,
+                ..Default::default()
+            })
             .unwrap();
-        assert!(transcription.text.is_empty());
-        assert_eq!(transcription.raw_response, body.as_bytes());
-        assert_eq!(prepared.load(Ordering::SeqCst), 0);
-        server.await.unwrap();
+            let prepared = Arc::new(AtomicUsize::new(0));
+            let count = prepared.clone();
+            let transcription = client
+                .transcribe_with_retry_prepare(
+                    &tokio_util::sync::CancellationToken::new(),
+                    &audio,
+                    || async {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(transcription.text.is_empty());
+            assert_eq!(transcription.raw_response, body.as_bytes());
+            assert_eq!(prepared.load(Ordering::SeqCst), 0);
+            server.await.unwrap();
+        }
     }
 
     #[test]

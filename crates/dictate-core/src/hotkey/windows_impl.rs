@@ -4,12 +4,15 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HINSTANCE, LPARAM, LRESULT, SetLastError, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
-    RegisterHotKey, UnregisterHotKey, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+    SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
@@ -18,38 +21,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYUP,
 };
 
-use super::{HotkeyError, HotkeyRegistration, ParsedHotkey, parse_hotkey, validate_bindings};
+use super::hook_state::{HookKeys, KeyDown, matching_action};
+use super::{HotkeyError, HotkeyRegistration, ParsedHotkey, binding_definitions};
 
 pub fn register(
-    start: &str,
-    pause: &str,
-    cancel_or_retry: &str,
-    prompts: &[crate::rewrite::RewritePrompt],
-    hook: bool,
+    config: &crate::Config,
+    menu_available: bool,
     handler: impl Fn(i32) + Send + Sync + 'static,
-    debug: bool,
 ) -> Result<HotkeyRegistration, HotkeyError> {
-    validate_bindings(start, pause, cancel_or_retry)?;
-    let mut definitions = vec![
-        (1, start.to_string(), parse_hotkey(start)?),
-        (2, pause.to_string(), parse_hotkey(pause)?),
-        (
-            3,
-            cancel_or_retry.to_string(),
-            parse_hotkey(cancel_or_retry)?,
-        ),
-    ];
-    for (index, prompt) in prompts.iter().enumerate() {
-        definitions.push((
-            1000 + index as i32,
-            prompt.hotkey.clone(),
-            parse_hotkey(&prompt.hotkey)?,
-        ));
-    }
-    if hook {
-        start_low_level_hook(definitions, Arc::new(handler), debug)
+    let definitions = binding_definitions(config, menu_available)?;
+    if config.hotkey_hook {
+        start_low_level_hook(definitions, Arc::new(handler), config.hotkey_debug)
     } else {
-        start_registered_hotkeys(definitions, Arc::new(handler), debug)
+        start_registered_hotkeys(definitions, Arc::new(handler), config.hotkey_debug)
     }
 }
 
@@ -129,7 +113,7 @@ fn start_registered_hotkeys(
 
 struct HookState {
     lookup: HashMap<u32, Vec<(i32, u32)>>,
-    swallowed: HashMap<u32, bool>,
+    keys: HookKeys,
     handler: Arc<dyn Fn(i32) + Send + Sync>,
     debug: bool,
 }
@@ -152,58 +136,110 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     }
     let state = unsafe { &mut *state };
     if super::capture_active() {
-        state.swallowed.clear();
+        state.keys.clear();
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
-        if state.swallowed.contains_key(&virtual_key) {
-            return LRESULT(1);
-        }
-        if let Some(candidates) = state.lookup.get(&virtual_key) {
-            for &(id, modifiers) in candidates {
-                if modifiers_satisfied(modifiers) {
-                    state.swallowed.insert(virtual_key, true);
-                    if state.debug {
-                        crate::debug_log::write(
-                            crate::debug_log::Category::Hotkey,
-                            format_args!(
-                                "[hotkey-debug] swallowed keydown vk=0x{virtual_key:X} id={id}"
-                            ),
-                        );
-                    }
-                    (state.handler)(id);
-                    return LRESULT(1);
+        let pressed_modifiers = current_modifiers();
+        let matched_action = state
+            .lookup
+            .get(&virtual_key)
+            .and_then(|candidates| matching_action(candidates, pressed_modifiers));
+        match state
+            .keys
+            .key_down(virtual_key, matched_action, pressed_modifiers)
+        {
+            KeyDown::Suppress => return LRESULT(1),
+            KeyDown::Trigger { id, mask_alt } => {
+                // This must precede the action handler and the physical Alt
+                // release. The injected key is ignored by this hook above.
+                if mask_alt {
+                    mask_alt_menu(state.debug);
                 }
+                if state.debug {
+                    crate::debug_log::write(
+                        crate::debug_log::Category::Hotkey,
+                        format_args!(
+                            "[hotkey-debug] swallowed keydown vk=0x{virtual_key:X} id={id}"
+                        ),
+                    );
+                }
+                (state.handler)(id);
+                return LRESULT(1);
             }
+            KeyDown::Pass => {}
         }
     }
-    if (message == WM_KEYUP || message == WM_SYSKEYUP)
-        && state.swallowed.remove(&virtual_key).is_some()
-    {
+    if (message == WM_KEYUP || message == WM_SYSKEYUP) && state.keys.key_up(virtual_key) {
         return LRESULT(1);
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn modifiers_satisfied(required: u32) -> bool {
+fn current_modifiers() -> u32 {
+    let mut modifiers = 0;
     unsafe {
-        if required & MOD_CONTROL.0 != 0 && GetAsyncKeyState(VK_CONTROL.0 as i32) >= 0 {
-            return false;
+        if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 {
+            modifiers |= MOD_CONTROL.0;
         }
-        if required & MOD_ALT.0 != 0 && GetAsyncKeyState(VK_MENU.0 as i32) >= 0 {
-            return false;
+        if GetAsyncKeyState(VK_MENU.0 as i32) < 0 {
+            modifiers |= MOD_ALT.0;
         }
-        if required & MOD_SHIFT.0 != 0 && GetAsyncKeyState(VK_SHIFT.0 as i32) >= 0 {
-            return false;
+        if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+            modifiers |= MOD_SHIFT.0;
         }
-        if required & MOD_WIN.0 != 0
-            && GetAsyncKeyState(VK_LWIN.0 as i32) >= 0
-            && GetAsyncKeyState(VK_RWIN.0 as i32) >= 0
-        {
-            return false;
+        if GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 {
+            modifiers |= MOD_WIN.0;
         }
     }
-    true
+    modifiers
+}
+
+fn mask_alt_menu(debug: bool) {
+    // VK_E8 is unassigned and has no text/modifier side effects. A consumed
+    // Alt chord otherwise looks like bare Alt to the foreground app. Do not
+    // synthesize Ctrl or swallow Alt-up: either can change held key state.
+    // https://www.autohotkey.com/docs/v2/lib/A_MenuMaskKey.htm
+    const MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+    let down = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: MASK_KEY,
+                ..Default::default()
+            },
+        },
+    };
+    let up = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: MASK_KEY,
+                dwFlags: KEYEVENTF_KEYUP,
+                ..Default::default()
+            },
+        },
+    };
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let sent = SendInput(&[down, up], size_of::<INPUT>() as i32);
+        let error = GetLastError().0;
+        // A partial send must release only our mask key, never a physical
+        // modifier or the consumed main key. No injected key is retried on 0.
+        let released = if sent == 1 {
+            SendInput(&[up], size_of::<INPUT>() as i32) == 1
+        } else {
+            sent == 2
+        };
+        if debug && sent != 2 {
+            crate::debug_log::write(
+                crate::debug_log::Category::Hotkey,
+                format_args!(
+                    "[hotkey-debug] Alt menu mask inserted {sent}/2 events; system error={error}; mask key released={released}"
+                ),
+            );
+        }
+    }
 }
 
 fn start_low_level_hook(
@@ -224,7 +260,7 @@ fn start_low_level_hook(
             }
             let state = Box::new(HookState {
                 lookup,
-                swallowed: HashMap::new(),
+                keys: HookKeys::default(),
                 handler,
                 debug,
             });

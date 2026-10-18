@@ -263,10 +263,11 @@ impl TranscriptAccumulator {
             State::Failed(message) => Err(TranscriptAccumulatorError::StreamFailed {
                 message: message.clone(),
             }),
-            State::Complete => Ok(self
-                .authoritative_final
-                .clone()
-                .unwrap_or_else(|| self.accumulated_text())),
+            State::Complete => Ok(normalize_final_text(
+                self.authoritative_final
+                    .clone()
+                    .unwrap_or_else(|| self.accumulated_text()),
+            )),
         }
     }
 
@@ -275,11 +276,13 @@ impl TranscriptAccumulator {
         match self.state {
             State::Open => Err(TranscriptAccumulatorError::IncompleteStream),
             State::Failed(message) => Err(TranscriptAccumulatorError::StreamFailed { message }),
-            State::Complete => Ok(self.authoritative_final.unwrap_or_else(|| {
-                let mut text = self.committed;
-                text.push_str(&self.partial);
-                text
-            })),
+            State::Complete => Ok(normalize_final_text(
+                self.authoritative_final.unwrap_or_else(|| {
+                    let mut text = self.committed;
+                    text.push_str(&self.partial);
+                    text
+                }),
+            )),
         }
     }
 
@@ -330,6 +333,14 @@ impl TranscriptAccumulator {
     fn accumulated_text(&self) -> String {
         let mut text = self.committed.clone();
         text.push_str(&self.partial);
+        text
+    }
+}
+
+pub(crate) fn normalize_final_text(text: String) -> String {
+    if text.trim().is_empty() {
+        String::new()
+    } else {
         text
     }
 }
@@ -510,6 +521,22 @@ mod tests {
         accumulator.complete().unwrap();
 
         assert_eq!(accumulator.final_text().unwrap(), "");
+    }
+
+    #[test]
+    fn completed_whitespace_is_empty_but_word_separators_are_preserved() {
+        let mut empty = TranscriptAccumulator::new();
+        empty.append_delta(" \n\t").unwrap();
+        empty.complete().unwrap();
+        assert_eq!(empty.final_text().unwrap(), "");
+        assert_eq!(empty.into_final_text().unwrap(), "");
+
+        let mut words = TranscriptAccumulator::new();
+        for part in ["one", " ", "two"] {
+            words.append_delta(part).unwrap();
+        }
+        words.complete().unwrap();
+        assert_eq!(words.into_final_text().unwrap(), "one two");
     }
 
     #[test]

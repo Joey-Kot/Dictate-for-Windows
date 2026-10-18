@@ -41,7 +41,7 @@ struct Arguments {
     /// Prompt multipart field.
     #[arg(long, value_name = "TEXT", help_heading = "Audio API")]
     prompt: Option<String>,
-    /// JSONPath selecting exactly one string, number or boolean (default: $.text).
+    /// JSONPath selecting one scalar or null (no recognized text); default: $.text.
     #[arg(long, value_name = "PATH", help_heading = "Audio API")]
     text_path: Option<String>,
     /// Stringified JSON object with extra multipart fields.

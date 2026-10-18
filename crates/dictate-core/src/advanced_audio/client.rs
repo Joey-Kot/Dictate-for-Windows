@@ -10,7 +10,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::accumulator::{TranscriptAccumulator, TranscriptAccumulatorError, TranscriptAction};
+use super::accumulator::{
+    TranscriptAccumulator, TranscriptAccumulatorError, TranscriptAction, normalize_final_text,
+};
 use super::extractor::{self, ResponseData, ResponseExtractionError};
 use super::http::{
     BodyError, HttpEngine, HttpEngineError, HttpResponseData, PreparedAudio, ResponseReadError,
@@ -340,9 +342,13 @@ impl AdvancedAudioClient {
                     final_text,
                 } => {
                     self.debug_stage("request");
-                    let response = self
+                    let response = match self
                         .execute_retryable_stage(request, &audio, &runtime, cancellation)
-                        .await?;
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => return no_words_transcription(error),
+                    };
                     let text = self.extract_final(&response, final_text)?;
                     Ok(Transcription {
                         text,
@@ -511,7 +517,14 @@ impl AdvancedAudioClient {
                 attempt + 1
             ));
             match self
-                .execute_stage(stage, audio, runtime, cancellation, &mut BTreeMap::new())
+                .execute_stage(
+                    stage,
+                    audio,
+                    runtime,
+                    cancellation,
+                    &mut BTreeMap::new(),
+                    true,
+                )
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -546,10 +559,14 @@ impl AdvancedAudioClient {
         runtime: &RuntimeTemplateValues,
         cancellation: &CancellationToken,
         captures: &mut BTreeMap<String, String>,
+        recognition: bool,
     ) -> Result<HttpResponseData, AdvancedAudioError> {
         let response = self
             .execute_stage_response(stage, audio, runtime, cancellation, captures)
             .await?;
+        if recognition && response_is_no_words(&response) {
+            return Ok(response);
+        }
         if let Err(error) = self.store_captures(stage, &response, captures) {
             self.debug(format_args!(
                 "[upload] advanced event=capture-failed kind={}",
@@ -706,46 +723,75 @@ impl AdvancedAudioClient {
         let mut captures = BTreeMap::new();
         if let Some(prepare) = prepare {
             self.debug_stage("prepare");
-            self.execute_stage(prepare, audio, runtime, cancellation, &mut captures)
+            self.execute_stage(prepare, audio, runtime, cancellation, &mut captures, false)
                 .await?;
         }
-        // Never route a failed submit through the request retry loop. The
-        // server may have created a paid task even when its response was lost.
-        self.debug_stage("submit");
-        let mut response = self
-            .execute_stage(submit, audio, runtime, cancellation, &mut captures)
-            .await?;
-        if let Some(poll) = poll {
-            response = self
-                .poll_until_terminal(poll, audio, runtime, cancellation, &mut captures)
+        // A no-speech result can terminate recognition at submission, polling,
+        // or a result fetch. Preparation/upload errors remain ordinary failures.
+        let result = async {
+            // Never route a failed submit through the request retry loop. The
+            // server may have created a paid task even when its response was lost.
+            self.debug_stage("submit");
+            let mut response = self
+                .execute_stage(submit, audio, runtime, cancellation, &mut captures, true)
                 .await?;
-        }
-        for stage in result_steps {
-            self.debug_stage("result");
-            if stage.method.is_read_only() {
-                response = self
-                    .execute_retryable_stage_with_captures(
-                        stage,
-                        audio,
-                        runtime,
-                        cancellation,
-                        &mut captures,
-                    )
-                    .await?;
-            } else {
-                response = self
-                    .execute_stage(stage, audio, runtime, cancellation, &mut captures)
-                    .await?;
+            if response_is_no_words(&response) {
+                return Ok(Transcription {
+                    text: String::new(),
+                    raw_response: self.redact_sensitive_capture_response(&response.body, &captures),
+                });
             }
+            if let Some(poll) = poll {
+                response = self
+                    .poll_until_terminal(poll, audio, runtime, cancellation, &mut captures)
+                    .await?;
+                if response_is_no_words(&response)
+                    || (response_has_no_words_error(&response.body)
+                        && matches!(poll_state(poll, &response)?, PollState::Failure))
+                {
+                    return Ok(Transcription {
+                        text: String::new(),
+                        raw_response: self
+                            .redact_sensitive_capture_response(&response.body, &captures),
+                    });
+                }
+            }
+            for stage in result_steps {
+                self.debug_stage("result");
+                if stage.method.is_read_only() {
+                    response = self
+                        .execute_retryable_stage_with_captures(
+                            stage,
+                            audio,
+                            runtime,
+                            cancellation,
+                            &mut captures,
+                        )
+                        .await?;
+                } else {
+                    response = self
+                        .execute_stage(stage, audio, runtime, cancellation, &mut captures, true)
+                        .await?;
+                }
+                if response_is_no_words(&response) {
+                    return Ok(Transcription {
+                        text: String::new(),
+                        raw_response: self
+                            .redact_sensitive_capture_response(&response.body, &captures),
+                    });
+                }
+            }
+            let text = self.extract_final(&response, final_text)?;
+            Ok(Transcription {
+                text,
+                // The final response is retained by the cache layer. It can echo
+                // a temporary result URL captured earlier in this workflow, so
+                // apply the same execution-local redaction used for errors.
+                raw_response: self.redact_sensitive_capture_response(&response.body, &captures),
+            })
         }
-        let text = self.extract_final(&response, final_text)?;
-        Ok(Transcription {
-            text,
-            // The final response is retained by the cache layer. It can echo
-            // a temporary result URL captured earlier in this workflow, so
-            // apply the same execution-local redaction used for errors.
-            raw_response: self.redact_sensitive_capture_response(&response.body, &captures),
-        })
+        .await;
+        result.or_else(no_words_transcription)
     }
 
     async fn execute_retryable_stage_with_captures(
@@ -764,7 +810,7 @@ impl AdvancedAudioClient {
                 attempt + 1
             ));
             match self
-                .execute_stage(stage, audio, runtime, cancellation, captures)
+                .execute_stage(stage, audio, runtime, cancellation, captures, true)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -869,6 +915,9 @@ impl AdvancedAudioClient {
                     })??
                 }
             };
+            if response_is_no_words(&response) {
+                return Ok(response);
+            }
             match poll_state(poll, &response)? {
                 PollState::Success => {
                     // A poll capture is a terminal value by construction. Do
@@ -886,6 +935,9 @@ impl AdvancedAudioClient {
                         "[upload] advanced event=capture-complete configured={}",
                         poll.request.captures.len()
                     ));
+                    return Ok(response);
+                }
+                PollState::Failure if response_has_no_words_error(&response.body) => {
                     return Ok(response);
                 }
                 PollState::Failure => return Err(AdvancedAudioError::PollFailure),
@@ -962,7 +1014,8 @@ impl AdvancedAudioClient {
             .send_stage(request, audio, runtime, cancellation, &captures)
             .await?;
         let status = response.status().as_u16();
-        if !request.accepted_statuses.contains(&status) {
+        let (headers, mut bytes) = if !request.accepted_statuses.contains(&status) || status == 400
+        {
             let started = Instant::now();
             let response = match read_response_limited(response, cancellation).await {
                 Ok(response) => response,
@@ -982,20 +1035,36 @@ impl AdvancedAudioClient {
                 response.body.len(),
                 started.elapsed().as_millis()
             ));
-            self.debug(format_args!(
-                "[upload] advanced event=response-rejected status={} response_bytes={}",
-                response.status.as_u16(),
-                response.body.len()
-            ));
-            return Err(AdvancedAudioError::UnexpectedStatus {
-                status: response.status.as_u16(),
-                response: self.redact_sensitive_capture_response(&response.body, &captures),
-            });
-        }
+            if response_is_no_words(&response) {
+                return Ok(Transcription {
+                    text: String::new(),
+                    raw_response: response.body,
+                });
+            }
+            if !request.accepted_statuses.contains(&status) {
+                self.debug(format_args!(
+                    "[upload] advanced event=response-rejected status={} response_bytes={}",
+                    response.status.as_u16(),
+                    response.body.len()
+                ));
+                return Err(AdvancedAudioError::UnexpectedStatus {
+                    status,
+                    response: self.redact_sensitive_capture_response(&response.body, &captures),
+                });
+            }
+            (
+                response.headers,
+                futures_util::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(
+                    response.body,
+                ))])
+                .boxed(),
+            )
+        } else {
+            (response.headers().clone(), response.bytes_stream().boxed())
+        };
         // Header-only captures are available before streamed body events. A
         // JSON/body capture deliberately cannot be requested from a stream.
-        let headers = response.headers().clone();
-        let header_view = ResponseData::new(response.status().as_u16(), &headers, &[]);
+        let header_view = ResponseData::new(status, &headers, &[]);
         for capture in &request.captures {
             if !matches!(
                 capture.from,
@@ -1019,64 +1088,95 @@ impl AdvancedAudioClient {
         let mut raw = Vec::new();
         let mut chunks = 0usize;
         let mut accumulator = TranscriptAccumulator::new();
-        let mut bytes = response.bytes_stream();
-        match stream_schema.format {
-            StreamFormat::Sse => {
-                let mut decoder = SseDecoder::new();
-                while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
-                    append_raw(&mut raw, &chunk)?;
-                    chunks += 1;
-                    for event in decoder
-                        .push(&chunk)
-                        .map_err(AdvancedAudioError::StreamFrame)?
-                    {
-                        apply_stream_rules(
+        // An explicit no-speech failure is already a terminal recognition
+        // result. Stop consuming its transport here, including any trailing
+        // events decoded from the same chunk. Ordinary `complete` actions
+        // retain the accumulator's strict handling of subsequent actions.
+        'response: {
+            match stream_schema.format {
+                StreamFormat::Sse => {
+                    let mut decoder = SseDecoder::new();
+                    while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
+                        append_raw(&mut raw, &chunk)?;
+                        chunks += 1;
+                        for event in decoder
+                            .push(&chunk)
+                            .map_err(AdvancedAudioError::StreamFrame)?
+                        {
+                            if apply_stream_rules(
+                                stream_schema,
+                                event.event.as_deref(),
+                                &event.data,
+                                &mut accumulator,
+                            )? == StreamRuleOutcome::NoSpeechComplete
+                            {
+                                break 'response;
+                            }
+                        }
+                    }
+                    for event in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
+                        if apply_stream_rules(
                             stream_schema,
                             event.event.as_deref(),
                             &event.data,
                             &mut accumulator,
-                        )?;
+                        )? == StreamRuleOutcome::NoSpeechComplete
+                        {
+                            break 'response;
+                        }
                     }
                 }
-                for event in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
-                    apply_stream_rules(
-                        stream_schema,
-                        event.event.as_deref(),
-                        &event.data,
-                        &mut accumulator,
-                    )?;
-                }
-            }
-            StreamFormat::Ndjson => {
-                let mut decoder = NdjsonDecoder::new();
-                while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
-                    append_raw(&mut raw, &chunk)?;
-                    chunks += 1;
-                    for frame in decoder
-                        .push(&chunk)
-                        .map_err(AdvancedAudioError::StreamFrame)?
-                    {
-                        apply_stream_rules(stream_schema, None, &frame.data, &mut accumulator)?;
+                StreamFormat::Ndjson => {
+                    let mut decoder = NdjsonDecoder::new();
+                    while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
+                        append_raw(&mut raw, &chunk)?;
+                        chunks += 1;
+                        for frame in decoder
+                            .push(&chunk)
+                            .map_err(AdvancedAudioError::StreamFrame)?
+                        {
+                            if apply_stream_rules(
+                                stream_schema,
+                                None,
+                                &frame.data,
+                                &mut accumulator,
+                            )? == StreamRuleOutcome::NoSpeechComplete
+                            {
+                                break 'response;
+                            }
+                        }
+                    }
+                    for frame in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
+                        if apply_stream_rules(stream_schema, None, &frame.data, &mut accumulator)?
+                            == StreamRuleOutcome::NoSpeechComplete
+                        {
+                            break 'response;
+                        }
                     }
                 }
-                for frame in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
-                    apply_stream_rules(stream_schema, None, &frame.data, &mut accumulator)?;
-                }
-            }
-            StreamFormat::JsonChunks => {
-                let mut decoder = JsonChunksDecoder::new();
-                while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
-                    append_raw(&mut raw, &chunk)?;
-                    chunks += 1;
-                    for frame in decoder
-                        .push(&chunk)
-                        .map_err(AdvancedAudioError::StreamFrame)?
-                    {
-                        apply_stream_rules(stream_schema, None, &frame, &mut accumulator)?;
+                StreamFormat::JsonChunks => {
+                    let mut decoder = JsonChunksDecoder::new();
+                    while let Some(chunk) = next_stream_chunk(&mut bytes, cancellation).await? {
+                        append_raw(&mut raw, &chunk)?;
+                        chunks += 1;
+                        for frame in decoder
+                            .push(&chunk)
+                            .map_err(AdvancedAudioError::StreamFrame)?
+                        {
+                            if apply_stream_rules(stream_schema, None, &frame, &mut accumulator)?
+                                == StreamRuleOutcome::NoSpeechComplete
+                            {
+                                break 'response;
+                            }
+                        }
                     }
-                }
-                for frame in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
-                    apply_stream_rules(stream_schema, None, &frame, &mut accumulator)?;
+                    for frame in decoder.finish().map_err(AdvancedAudioError::StreamFrame)? {
+                        if apply_stream_rules(stream_schema, None, &frame, &mut accumulator)?
+                            == StreamRuleOutcome::NoSpeechComplete
+                        {
+                            break 'response;
+                        }
+                    }
                 }
             }
         }
@@ -1167,8 +1267,34 @@ fn extract_final(
     response: &HttpResponseData,
     extractor: &ResponseExtractor,
 ) -> Result<String, AdvancedAudioError> {
+    if response_is_no_words(response) {
+        return Ok(String::new());
+    }
     let view = ResponseData::new(response.status.as_u16(), &response.headers, &response.body);
-    extractor::extract(&view, extractor).map_err(AdvancedAudioError::Extraction)
+    extractor::extract_transcript(&view, extractor)
+        .map(normalize_final_text)
+        .map_err(AdvancedAudioError::Extraction)
+}
+
+fn response_is_no_words(response: &HttpResponseData) -> bool {
+    crate::asr::is_no_words_response(response.status, &response.body)
+}
+
+fn no_words_transcription(error: AdvancedAudioError) -> Result<Transcription, AdvancedAudioError> {
+    if let AdvancedAudioError::UnexpectedStatus { status, response } = &error
+        && reqwest::StatusCode::from_u16(*status)
+            .is_ok_and(|status| crate::asr::is_no_words_response(status, response))
+    {
+        return Ok(Transcription {
+            text: String::new(),
+            raw_response: response.clone(),
+        });
+    }
+    Err(error)
+}
+
+fn response_has_no_words_error(body: &[u8]) -> bool {
+    serde_json::from_slice(body).is_ok_and(|body| crate::asr::is_no_words_error(&body))
 }
 
 fn is_retryable(error: &AdvancedAudioError) -> bool {
@@ -1301,12 +1427,18 @@ fn append_raw(raw: &mut Vec<u8>, chunk: &[u8]) -> Result<(), AdvancedAudioError>
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamRuleOutcome {
+    Continue,
+    NoSpeechComplete,
+}
+
 pub(crate) fn apply_stream_rules(
     schema: &StreamResponse,
     event_name: Option<&str>,
     data: &str,
     accumulator: &mut TranscriptAccumulator,
-) -> Result<(), AdvancedAudioError> {
+) -> Result<StreamRuleOutcome, AdvancedAudioError> {
     for rule in &schema.rules {
         if rule
             .event
@@ -1319,8 +1451,19 @@ pub(crate) fn apply_stream_rules(
             Some(path) => {
                 let headers = reqwest::header::HeaderMap::new();
                 let view = ResponseData::new(200, &headers, data.as_bytes());
-                match extractor::extract(&view, &ResponseExtractor::JsonPath { path: path.clone() })
-                {
+                let extractor = ResponseExtractor::JsonPath { path: path.clone() };
+                let value = if matches!(
+                    rule.action,
+                    StreamAction::AppendDelta
+                        | StreamAction::ReplacePartial
+                        | StreamAction::CommitSegment
+                        | StreamAction::SetFinalText
+                ) {
+                    extractor::extract_transcript(&view, &extractor)
+                } else {
+                    extractor::extract(&view, &extractor)
+                };
+                match value {
                     // A stream commonly mixes frames: for example, delta
                     // frames do not carry `done`, and the terminal frame does
                     // not carry `delta`.  A rule with no value on this frame
@@ -1339,6 +1482,19 @@ pub(crate) fn apply_stream_rules(
             .is_some_and(|expected| value.as_deref() != Some(expected))
         {
             continue;
+        }
+        if matches!(rule.action, StreamAction::Fail)
+            && (response_has_no_words_error(data.as_bytes())
+                || value.as_deref() == Some("ASR_RESPONSE_HAVE_NO_WORDS"))
+        {
+            // This explicit terminal result supersedes any provisional text.
+            accumulator
+                .set_final_text("")
+                .map_err(AdvancedAudioError::Accumulator)?;
+            accumulator
+                .complete()
+                .map_err(AdvancedAudioError::Accumulator)?;
+            return Ok(StreamRuleOutcome::NoSpeechComplete);
         }
         let action = match rule.action {
             StreamAction::Ignore => TranscriptAction::Ignore,
@@ -1361,7 +1517,7 @@ pub(crate) fn apply_stream_rules(
             .apply(action)
             .map_err(AdvancedAudioError::Accumulator)?;
     }
-    Ok(())
+    Ok(StreamRuleOutcome::Continue)
 }
 
 #[derive(Debug, Error)]

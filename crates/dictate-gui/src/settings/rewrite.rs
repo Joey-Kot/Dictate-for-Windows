@@ -1,6 +1,12 @@
 //! Rewrite settings and the prompt editor share the settings draft and theme.
+mod icon_picker;
+
 use super::*;
-use dictate_core::rewrite::{Provider, RewriteConfig, RewritePrompt};
+use crate::prompt_icons::{IconCache, IconDraft};
+use dictate_core::rewrite::{
+    BuiltinPromptIcon, PromptIcon, Provider, RewriteConfig, RewritePrompt,
+};
+use std::cell::Cell;
 use windows::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
@@ -15,12 +21,16 @@ const ID_DELETE: usize = 0x6804;
 const ID_UP: usize = 0x6805;
 const ID_DOWN: usize = 0x6806;
 pub const ID_TEST: usize = 0x6807;
+const ID_MENU_ENABLED: usize = 0x6808;
+const ID_MENU_KEY: usize = 0x6809;
+const ID_MENU_CLEAR: usize = 0x680a;
 const ID_OPTION: usize = 0x6820;
 const WM_PROVIDER_ACTION: u32 = WM_APP + 86;
 const PROVIDER_PANEL_SUBCLASS_ID: usize = 10;
 const EDITOR_WIDTH: i32 = 700;
 const EDITOR_HEADER: i32 = 38;
-const EDITOR_BODY_HEIGHT: i32 = 598;
+const EDITOR_ICON_HEIGHT: i32 = 114;
+const EDITOR_BODY_HEIGHT: i32 = 598 + EDITOR_ICON_HEIGHT;
 const EDITOR_API_HEIGHT: i32 = 126;
 const EDITOR_TEST_BOTTOM_GAP: i32 = 10;
 const ID_EDITOR_PROVIDER: usize = 0x69f0;
@@ -30,6 +40,12 @@ const ID_EDITOR_API: usize = 0x6920;
 const ID_EDITOR_OPTION: usize = 0x6a00;
 const WM_EDITOR_REVEAL: u32 = WM_APP + 87;
 const EDITOR_TEST_TIMER: usize = 0x69f2;
+const ID_EDITOR_ICON_PREVIEW: usize = 0x69d0;
+const ID_EDITOR_ICON_IMPORT: usize = 0x69d1;
+const ID_EDITOR_KEY_CLEAR: usize = 0x69d2;
+const ID_EDITOR_ICON_SELECT: usize = 0x69d3;
+// Keep the entire palette away from the provider and connectivity controls.
+const ID_EDITOR_ICON_FIRST: usize = 0x6b00;
 const PROMPTS_TOP: i32 = 304;
 const PROMPTS_HEIGHT: i32 = 132;
 
@@ -37,18 +53,30 @@ pub fn handles_escape(id: usize) -> bool {
     id == ID_PROVIDER || (ID_OPTION..ID_OPTION + Provider::ALL.len()).contains(&id)
 }
 
+pub(super) fn is_action_button(id: usize) -> bool {
+    (ID_ADD..=ID_TEST).contains(&id) || id == ID_MENU_CLEAR
+}
+
 pub fn resize_list(state: &SettingsState) {
     let scale = |value| platform::scale(value, state.dpi);
-    let right = scale(EDIT_LEFT + EDIT_WIDTH);
+    let origin = if state.rewrite.viewport.is_invalid() {
+        POINT::default()
+    } else {
+        POINT {
+            x: scale(SIDEBAR_WIDTH + 1),
+            y: scale(HEADER_HEIGHT) + state.rewrite.page_offset.get(),
+        }
+    };
+    let right = scale(EDIT_LEFT + EDIT_WIDTH) - origin.x;
     let scrollbar_left = right - dropdown_scrollbar::thickness(state.dpi);
     unsafe {
         // Keep a stable gutter; the shared bar draws no thumb for a short list.
         let _ = SetWindowPos(
             state.rewrite.list,
             None,
-            scale(CONTENT_LEFT),
-            scale(PROMPTS_TOP),
-            scrollbar_left - scale(CONTENT_LEFT),
+            scale(CONTENT_LEFT) - origin.x,
+            scale(PROMPTS_TOP) - origin.y,
+            scrollbar_left - scale(CONTENT_LEFT) + origin.x,
             scale(PROMPTS_HEIGHT),
             SWP_NOACTIVATE | SWP_NOZORDER,
         );
@@ -63,12 +91,314 @@ pub fn resize_list(state: &SettingsState) {
         state.rewrite.scrollbar,
         RECT {
             left: scrollbar_left,
-            top: scale(PROMPTS_TOP),
+            top: scale(PROMPTS_TOP) - origin.y,
             right,
-            bottom: scale(PROMPTS_TOP) + scale(PROMPTS_HEIGHT),
+            bottom: scale(PROMPTS_TOP) + scale(PROMPTS_HEIGHT) - origin.y,
         },
         state.dpi,
     );
+}
+
+fn page_rect(state: &SettingsState, rect: RECT) -> RECT {
+    let mut rect = scaled_rect(rect, state.dpi);
+    let x = platform::scale(SIDEBAR_WIDTH + 1, state.dpi);
+    let y = platform::scale(HEADER_HEIGHT, state.dpi) + state.rewrite.page_offset.get();
+    rect.left -= x;
+    rect.right -= x;
+    rect.top -= y;
+    rect.bottom -= y;
+    rect
+}
+
+fn create_page_viewport(
+    state: &mut SettingsState,
+    instance: windows::Win32::Foundation::HMODULE,
+) -> Result<(), String> {
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(page_proc),
+        hInstance: instance.into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).map_err(|e| e.to_string())? },
+        lpszClassName: w!("DictateRewriteSettingsPage"),
+        ..Default::default()
+    };
+    unsafe {
+        RegisterClassExW(&class);
+    }
+    let viewport = unsafe {
+        CreateWindowExW(
+            WS_EX_CONTROLPARENT | WS_EX_COMPOSITED,
+            w!("DictateRewriteSettingsPage"),
+            w!(""),
+            WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1,
+            1,
+            Some(state.hwnd),
+            None,
+            Some(instance.into()),
+            Some(state.hwnd.0.cast_const()),
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    state.rewrite.viewport = viewport;
+    state.rewrite.page_scrollbar = dropdown_scrollbar::attach_viewport(viewport, state.dpi)?;
+    for (&handle, &group) in &state.control_groups {
+        if group != "Rewrite" {
+            continue;
+        }
+        let hwnd = HWND(handle as *mut c_void);
+        unsafe {
+            SetParent(hwnd, Some(viewport)).map_err(|e| e.to_string())?;
+            if GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_TABSTOP.0 != 0 {
+                windows::Win32::UI::Shell::SetWindowSubclass(
+                    hwnd,
+                    Some(page_focus_proc),
+                    15,
+                    state.hwnd.0 as usize,
+                )
+                .ok()
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    state.control_groups.insert(viewport.0 as usize, "Rewrite");
+    resize_page(state);
+    Ok(())
+}
+
+pub fn resize_page(state: &SettingsState) {
+    if state.rewrite.viewport.is_invalid() {
+        return;
+    }
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(state.hwnd, &mut client);
+    }
+    let scale = |value| platform::scale(value, state.dpi);
+    let top = scale(HEADER_HEIGHT);
+    let height = (client.bottom - top - scale(FOOTER_HEIGHT)).max(1);
+    let width = (client.right - scale(SIDEBAR_WIDTH + 1)).max(1);
+    state.rewrite.page_offset.set(
+        state
+            .rewrite
+            .page_offset
+            .get()
+            .clamp(0, (scale(756 - HEADER_HEIGHT) - height).max(0)),
+    );
+    unsafe {
+        let _ = SetWindowPos(
+            state.rewrite.viewport,
+            None,
+            scale(SIDEBAR_WIDTH + 1),
+            top,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    let controls = state
+        .layouts
+        .borrow()
+        .iter()
+        .filter(|(hwnd, _)| unsafe { GetParent(*hwnd).ok() == Some(state.rewrite.viewport) })
+        .map(|(hwnd, rect)| (*hwnd, page_rect(state, *rect), true))
+        .collect::<Vec<_>>();
+    position_editor_controls(controls);
+    resize_list(state);
+    dropdown_scrollbar::position_rect(
+        state.rewrite.page_scrollbar,
+        RECT {
+            left: width - scale(18),
+            top: scale(4),
+            right: width - scale(4),
+            bottom: height - scale(4),
+        },
+        state.dpi,
+    );
+    unsafe {
+        let _ = ShowWindow(
+            state.rewrite.page_scrollbar,
+            if scale(756 - HEADER_HEIGHT) > height {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+    }
+    position_test_result(state);
+    redraw_editor_controls(state.rewrite.viewport);
+}
+
+pub fn position_test_result(state: &SettingsState) {
+    let view = state.connectivity_result;
+    if view.editor.is_invalid() {
+        return;
+    }
+    let rewrite = GROUPS[state.active_group].0 == "Rewrite";
+    let parent = if rewrite {
+        state.rewrite.viewport
+    } else {
+        state.hwnd
+    };
+    unsafe {
+        if GetParent(view.editor).ok() != Some(parent) {
+            let _ = SetParent(view.editor, Some(parent));
+        }
+    }
+    if rewrite && connectivity_result_bounds(state).is_some() {
+        let layout = test_result_layout(
+            view.editor,
+            CONTENT_LEFT,
+            REWRITE_TEST_RESULT_TOP,
+            EDIT_LEFT + EDIT_WIDTH,
+        );
+        let rect = page_rect(state, layout.editor);
+        unsafe {
+            let _ = SetWindowPos(
+                view.editor,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            let _ = InvalidateRect(Some(state.rewrite.viewport), None, true);
+        }
+    }
+}
+
+unsafe extern "system" fn page_focus_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    if message == WM_SETFOCUS {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(data as *mut c_void)),
+                WM_EDITOR_REVEAL,
+                WPARAM(0),
+                LPARAM(hwnd.0 as isize),
+            );
+        }
+    } else if message == WM_NCDESTROY {
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(page_focus_proc), id);
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+unsafe extern "system" fn page_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NCCREATE {
+        unsafe {
+            SetWindowLongPtrW(
+                hwnd,
+                GWLP_USERDATA,
+                (*(lparam.0 as *const CREATESTRUCTW)).lpCreateParams as isize,
+            );
+        }
+    }
+    let root = HWND(unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut c_void);
+    let pointer = unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *mut SettingsState;
+    if pointer.is_null() {
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    let state = unsafe { &mut *pointer };
+    match message {
+        dropdown_scrollbar::VIEWPORT_GET_EXTENT => {
+            LRESULT(platform::scale(756 - HEADER_HEIGHT, state.dpi) as isize)
+        }
+        dropdown_scrollbar::VIEWPORT_GET_OFFSET => {
+            LRESULT(state.rewrite.page_offset.get() as isize)
+        }
+        dropdown_scrollbar::VIEWPORT_SET_OFFSET => {
+            close_provider(state);
+            state.rewrite.page_offset.set(wparam.0 as i32);
+            resize_page(state);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => unsafe {
+            SendMessageW(
+                state.rewrite.page_scrollbar,
+                message,
+                Some(wparam),
+                Some(lparam),
+            )
+        },
+        WM_LBUTTONDOWN => {
+            close_provider(state);
+            LRESULT(0)
+        }
+        WM_COMMAND | WM_DRAWITEM | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+        | WM_CTLCOLORLISTBOX => unsafe {
+            if message == WM_COMMAND
+                && matches!((wparam.0 >> 16) as u32, EN_SETFOCUS | EN_KILLFOCUS)
+            {
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            SendMessageW(state.hwnd, message, Some(wparam), Some(lparam))
+        },
+        WM_PAINT => unsafe {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            FillRect(dc, &client, state.background_brush);
+            for frame in state
+                .input_frames
+                .iter()
+                .filter(|frame| frame.group == "Rewrite")
+            {
+                rounded_box(
+                    dc,
+                    page_rect(state, frame.rect),
+                    rgb(26, 35, 39),
+                    if GetFocus() == frame.control {
+                        rgb(92, 192, 176)
+                    } else {
+                        rgb(54, 68, 74)
+                    },
+                    platform::scale(7, state.dpi),
+                );
+            }
+            if connectivity_result_bounds(state).is_some() {
+                let layout = test_result_layout(
+                    state.connectivity_result.editor,
+                    CONTENT_LEFT,
+                    REWRITE_TEST_RESULT_TOP,
+                    EDIT_LEFT + EDIT_WIDTH,
+                );
+                paint_test_result(
+                    dc,
+                    state.dpi,
+                    connectivity_result_state(state),
+                    TestResultLayout {
+                        icon: page_rect(state, layout.icon),
+                        frame: page_rect(state, layout.frame),
+                        editor: page_rect(state, layout.editor),
+                    },
+                    GetFocus() == state.connectivity_result.editor,
+                );
+            }
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        },
+        WM_ERASEBKGND => LRESULT(1),
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
 }
 
 unsafe extern "system" fn provider_proc(
@@ -112,6 +442,35 @@ pub fn handle_message(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> bool {
+    if message == WM_EDITOR_REVEAL {
+        let control = HWND(lparam.0 as *mut c_void);
+        if let Some((_, rect)) = state
+            .layouts
+            .borrow()
+            .iter()
+            .find(|(hwnd, _)| *hwnd == control)
+        {
+            let rect = page_rect(state, *rect);
+            let mut client = RECT::default();
+            unsafe {
+                let _ = GetClientRect(state.rewrite.viewport, &mut client);
+            }
+            let margin = platform::scale(12, state.dpi);
+            let shift = if rect.top < margin {
+                rect.top - margin
+            } else if rect.bottom > client.bottom - margin {
+                rect.bottom - client.bottom + margin
+            } else {
+                0
+            };
+            state
+                .rewrite
+                .page_offset
+                .set(state.rewrite.page_offset.get() + shift);
+        }
+        resize_page(state);
+        return true;
+    }
     if message != WM_PROVIDER_ACTION {
         return false;
     }
@@ -175,10 +534,14 @@ pub struct Page {
     provider_offset: i32,
     list: HWND,
     scrollbar: HWND,
+    viewport: HWND,
+    page_scrollbar: HWND,
+    page_offset: Cell<i32>,
+    pub icon_draft: IconDraft,
 }
 
 impl Page {
-    pub fn new(config: RewriteConfig) -> Self {
+    pub fn new(config: RewriteConfig, config_path: &Path) -> Self {
         Self {
             config,
             provider_open: false,
@@ -188,6 +551,10 @@ impl Page {
             provider_offset: 0,
             list: HWND::default(),
             scrollbar: HWND::default(),
+            viewport: HWND::default(),
+            page_scrollbar: HWND::default(),
+            page_offset: Cell::new(0),
+            icon_draft: IconDraft::new(config_path),
         }
     }
 }
@@ -322,6 +689,97 @@ pub fn create(
         state.control_groups.insert(button.0 as usize, "Rewrite");
         state.localized_controls.push((button, label));
     }
+    for (key, y) in [("rewrite_menu_enabled", 492), ("rewrite_menu_key", 534)] {
+        let label = create_label(
+            state,
+            state.language.text(key),
+            CONTENT_LEFT,
+            y,
+            LABEL_WIDTH,
+            FIELD_HEIGHT,
+            instance,
+        )?;
+        state.control_groups.insert(label.0 as usize, "Rewrite");
+        state.localized_controls.push((label, key));
+    }
+    let enabled = create_child(
+        state,
+        w!("BUTTON"),
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        EDIT_LEFT,
+        492,
+        34,
+        34,
+        ID_MENU_ENABLED,
+        instance,
+    )?;
+    state.controls.insert("rewrite_menu_enabled", enabled);
+    state
+        .boolean_values
+        .insert("rewrite_menu_enabled", config.menu_enabled);
+    state
+        .boolean_ids
+        .insert(ID_MENU_ENABLED, "rewrite_menu_enabled");
+    state.control_groups.insert(enabled.0 as usize, "Rewrite");
+    let menu_key = create_child(
+        state,
+        w!("EDIT"),
+        &config.menu_key,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        EDIT_LEFT + 10,
+        541,
+        EDIT_WIDTH - 112,
+        20,
+        ID_MENU_KEY,
+        instance,
+    )?;
+    apply_dark_theme(menu_key);
+    state.controls.insert("rewrite_menu_key", menu_key);
+    state.control_groups.insert(menu_key.0 as usize, "Rewrite");
+    state.input_frames.push(InputFrame {
+        rect: RECT {
+            left: EDIT_LEFT,
+            top: 534,
+            right: EDIT_LEFT + EDIT_WIDTH - 92,
+            bottom: 568,
+        },
+        group: "Rewrite",
+        control: menu_key,
+    });
+    let clear = create_child(
+        state,
+        w!("BUTTON"),
+        state.language.text("hotkey_clear"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        EDIT_LEFT + EDIT_WIDTH - 84,
+        534,
+        84,
+        34,
+        ID_MENU_CLEAR,
+        instance,
+    )?;
+    dropdown::track_hover(clear, false)?;
+    state.controls.insert("__rewrite_menu_clear", clear);
+    state.control_groups.insert(clear.0 as usize, "Rewrite");
+    state.localized_controls.push((clear, "hotkey_clear"));
+    let status = create_child(
+        state,
+        w!("STATIC"),
+        state.language.text("hotkey_optional_help"),
+        WS_CHILD | WS_VISIBLE,
+        CONTENT_LEFT,
+        578,
+        520,
+        44,
+        0,
+        instance,
+    )?;
+    state.control_groups.insert(status.0 as usize, "Rewrite");
+    state
+        .localized_controls
+        .push((status, "hotkey_optional_help"));
+    hotkeys::attach_optional(menu_key, config.menu_key.clone(), state.language, status)?;
     let list = create_child(
         state,
         w!("LISTBOX"),
@@ -391,8 +849,8 @@ pub fn create(
         state.language.text("rewrite_network_hint"),
         WS_CHILD | WS_VISIBLE,
         CONTENT_LEFT,
-        576,
-        536,
+        710,
+        520,
         36,
         0,
         instance,
@@ -412,7 +870,9 @@ pub fn create(
             return Err("Unable to initialize provider dropdown".into());
         }
     }
+    create_page_viewport(state, instance)?;
     refresh_list(state, 0);
+    update_menu_controls(state);
     Ok(())
 }
 
@@ -427,11 +887,21 @@ pub fn read(state: &SettingsState) -> RewriteConfig {
             *value = read_text(*hwnd).trim().into();
         }
     }
+    config.menu_enabled = state
+        .boolean_values
+        .get("rewrite_menu_enabled")
+        .copied()
+        .unwrap_or(false);
+    config.menu_key = state
+        .controls
+        .get("rewrite_menu_key")
+        .and_then(|hwnd| hotkeys::value(*hwnd))
+        .unwrap_or_default();
     config
 }
 
 pub fn refresh_labels(state: &SettingsState) {
-    for key in hotkeys::KEYS {
+    for key in hotkeys::KEYS.into_iter().chain(["rewrite_menu_key"]) {
         if let Some(hwnd) = state.controls.get(key) {
             hotkeys::set_language(*hwnd, state.language);
         }
@@ -633,28 +1103,72 @@ fn refresh_list(state: &SettingsState, selected: usize) {
 }
 
 pub fn refresh_hotkey_context(state: &SettingsState) {
+    let config = read(state);
     for key in hotkeys::KEYS {
         if let Some(hwnd) = state.controls.get(key) {
-            hotkeys::set_context(
-                *hwnd,
-                state
-                    .rewrite
-                    .config
-                    .prompts
-                    .iter()
-                    .map(|p| (p.title.clone(), p.hotkey.clone()))
-                    .collect(),
-                state
-                    .boolean_values
-                    .get("HOTKEY_HOOK")
-                    .copied()
-                    .unwrap_or(true),
-            );
+            let mut context: Vec<_> = config
+                .prompts
+                .iter()
+                .map(|p| (p.title.clone(), p.hotkey.clone()))
+                .collect();
+            if config.menu_enabled {
+                context.push((
+                    state.language.text("rewrite_menu_key").into(),
+                    config.menu_key.clone(),
+                ));
+            }
+            hotkeys::set_context(*hwnd, context);
+        }
+    }
+    if let Some(hwnd) = state.controls.get("rewrite_menu_key") {
+        let mut context: Vec<_> = config
+            .prompts
+            .iter()
+            .map(|p| (p.title.clone(), p.hotkey.clone()))
+            .collect();
+        context.extend(hotkeys::KEYS.into_iter().filter_map(|key| {
+            state
+                .controls
+                .get(key)
+                .and_then(|hwnd| hotkeys::value(*hwnd))
+                .map(|value| (state.language.text(key).into(), value))
+        }));
+        hotkeys::set_context(*hwnd, context);
+    }
+}
+
+pub fn update_menu_controls(state: &SettingsState) {
+    let enabled = !state.saving
+        && state
+            .boolean_values
+            .get("rewrite_menu_enabled")
+            .copied()
+            .unwrap_or(false);
+    for key in ["rewrite_menu_key", "__rewrite_menu_clear"] {
+        if let Some(hwnd) = state.controls.get(key) {
+            unsafe {
+                let _ = EnableWindow(*hwnd, enabled);
+                let _ = InvalidateRect(Some(*hwnd), None, true);
+            }
         }
     }
 }
 
 pub fn command(state: &mut SettingsState, id: usize, notification: u32) -> bool {
+    if id == ID_MENU_KEY && matches!(notification, EN_CHANGE | EN_SETFOCUS | EN_KILLFOCUS) {
+        refresh_hotkey_context(state);
+        unsafe {
+            let _ = InvalidateRect(Some(state.rewrite.viewport), None, true);
+        }
+        return true;
+    }
+    if id == ID_MENU_CLEAR && notification == BN_CLICKED {
+        if !state.saving {
+            hotkeys::clear(state.controls["rewrite_menu_key"]);
+            refresh_hotkey_context(state);
+        }
+        return true;
+    }
     if id == ID_PROVIDER && notification == BN_CLICKED && !state.saving {
         provider_menu(state);
         return true;
@@ -701,13 +1215,23 @@ pub fn command(state: &mut SettingsState, id: usize, notification: u32) -> bool 
         let owner = state.hwnd;
         let runtime = state.runtime.clone();
         let result = read_config(state).and_then(|config| {
-            edit_prompt(owner, state.language, state.dpi, runtime, config, original)
+            edit_prompt(
+                owner,
+                state.language,
+                state.dpi,
+                runtime,
+                config,
+                original,
+                &state.config_path,
+                state.rewrite.icon_draft.clone(),
+            )
         });
         if !unsafe { IsWindow(Some(owner)) }.as_bool() {
             return true;
         }
         match result {
-            Ok(Some(prompt)) => {
+            Ok(Some((prompt, icons))) => {
+                state.rewrite.icon_draft.absorb(icons);
                 let index = state
                     .rewrite
                     .config
@@ -854,6 +1378,15 @@ struct Editor {
     runtime: Arc<Runtime>,
     config: Config,
     prompt: RewritePrompt,
+    icon_draft: IconDraft,
+    icon_cache: RefCell<IconCache>,
+    icon_preview: HWND,
+    icon_name: HWND,
+    icon_selector: HWND,
+    icon_panel: HWND,
+    icon_open: bool,
+    icon_key_latch: Option<u16>,
+    icon_buttons: Vec<HWND>,
     result: Option<RewritePrompt>,
     layouts: Vec<EditorLayout>,
     frame_overlay: Option<SettingsFrameOverlay>,
@@ -903,6 +1436,9 @@ impl Editor {
     }
 }
 
+// The editor borrows the outer draft's resource root and takes a cheap asset
+// snapshot so cancel can discard imports independently from the settings draft.
+#[allow(clippy::too_many_arguments)]
 fn edit_prompt(
     owner: HWND,
     language: Language,
@@ -910,7 +1446,9 @@ fn edit_prompt(
     runtime: Arc<Runtime>,
     config: Config,
     prompt: RewritePrompt,
-) -> Result<Option<RewritePrompt>, String> {
+    config_path: &Path,
+    icon_draft: IconDraft,
+) -> Result<Option<(RewritePrompt, IconDraft)>, String> {
     let instance = unsafe { GetModuleHandleW(None).map_err(|e| e.to_string())? };
     let classes: [(PCWSTR, WNDPROC); 2] = [
         (w!("DictateRewritePromptEditor"), Some(editor_proc)),
@@ -955,6 +1493,15 @@ fn edit_prompt(
         runtime,
         config,
         prompt,
+        icon_draft,
+        icon_cache: RefCell::new(IconCache::new(config_path)),
+        icon_preview: HWND::default(),
+        icon_name: HWND::default(),
+        icon_selector: HWND::default(),
+        icon_panel: HWND::default(),
+        icon_open: false,
+        icon_key_latch: None,
+        icon_buttons: vec![],
         result: None,
         layouts: vec![],
         frame_overlay: None,
@@ -1002,6 +1549,9 @@ fn edit_prompt(
                         }
                         break;
                     }
+                    if icon_picker::filter_message(&mut editor, &message) {
+                        continue;
+                    }
                     let focus = GetFocus();
                     if message.message == WM_KEYDOWN
                         && (focus == editor.provider_button
@@ -1045,7 +1595,10 @@ fn edit_prompt(
                     let _ = SetForegroundWindow(owner);
                 }
             }
-            Ok(editor.result.take())
+            Ok(editor
+                .result
+                .take()
+                .map(|prompt| (prompt, editor.icon_draft.clone())))
         }
         Err(error) => Err(error.to_string()),
     };
@@ -1186,6 +1739,187 @@ fn editor_body_child(
     Ok(hwnd)
 }
 
+fn palette_icon(index: usize) -> PromptIcon {
+    BuiltinPromptIcon::ALL
+        .get(index)
+        .copied()
+        .map(PromptIcon::Builtin)
+        .unwrap_or_default()
+}
+
+fn icon_label(icon: &PromptIcon) -> &'static str {
+    match icon {
+        PromptIcon::Default => "rewrite_icon_chat",
+        PromptIcon::Builtin(BuiltinPromptIcon::Translate) => "rewrite_icon_translate",
+        PromptIcon::Builtin(BuiltinPromptIcon::TextCard) => "rewrite_icon_text_card",
+        PromptIcon::Builtin(BuiltinPromptIcon::Layers) => "rewrite_icon_layers",
+        PromptIcon::Builtin(BuiltinPromptIcon::Feather) => "rewrite_icon_feather",
+        PromptIcon::Builtin(BuiltinPromptIcon::Document) => "rewrite_icon_document",
+        PromptIcon::Builtin(BuiltinPromptIcon::Messages) => "rewrite_icon_messages",
+        PromptIcon::Builtin(BuiltinPromptIcon::Shield) => "rewrite_icon_shield",
+        PromptIcon::Builtin(BuiltinPromptIcon::Chat) => "rewrite_icon_chat",
+        PromptIcon::Builtin(BuiltinPromptIcon::Eye) => "rewrite_icon_eye",
+        PromptIcon::Builtin(BuiltinPromptIcon::PieChart) => "rewrite_icon_pie_chart",
+        PromptIcon::Builtin(BuiltinPromptIcon::Tags) => "rewrite_icon_tags",
+        PromptIcon::Builtin(BuiltinPromptIcon::Box) => "rewrite_icon_box",
+        PromptIcon::Builtin(BuiltinPromptIcon::Flask) => "rewrite_icon_flask",
+        PromptIcon::Builtin(BuiltinPromptIcon::Globe) => "rewrite_icon_globe",
+        PromptIcon::Builtin(BuiltinPromptIcon::Cookie) => "rewrite_icon_cookie",
+        PromptIcon::Builtin(BuiltinPromptIcon::Window) => "rewrite_icon_window",
+        PromptIcon::Builtin(BuiltinPromptIcon::Plug) => "rewrite_icon_plug",
+        PromptIcon::Builtin(BuiltinPromptIcon::Settings) => "rewrite_icon_settings",
+        PromptIcon::Builtin(BuiltinPromptIcon::Key) => "rewrite_icon_key",
+        PromptIcon::Builtin(BuiltinPromptIcon::Network) => "rewrite_icon_network",
+        PromptIcon::Builtin(BuiltinPromptIcon::Hierarchy) => "rewrite_icon_hierarchy",
+        PromptIcon::Builtin(BuiltinPromptIcon::BarChart) => "rewrite_icon_bar_chart",
+        PromptIcon::Builtin(BuiltinPromptIcon::Microphone) => "rewrite_icon_microphone",
+        PromptIcon::Builtin(BuiltinPromptIcon::Fingerprint) => "rewrite_icon_fingerprint",
+        PromptIcon::Builtin(BuiltinPromptIcon::Layout) => "rewrite_icon_layout",
+        PromptIcon::Custom(_) => "rewrite_icon_custom",
+    }
+}
+
+fn create_icon_controls(editor: &mut Editor) -> Result<(), String> {
+    editor_body_child(
+        editor,
+        w!("STATIC"),
+        editor.language.text("rewrite_icon"),
+        WINDOW_STYLE(0),
+        RECT {
+            left: 24,
+            top: 82,
+            right: 660,
+            bottom: 104,
+        },
+        0,
+        true,
+        false,
+        None,
+    )?;
+    editor.icon_preview = editor_body_child(
+        editor,
+        w!("BUTTON"),
+        editor.language.text("rewrite_icon_preview"),
+        WINDOW_STYLE(BS_OWNERDRAW as u32),
+        RECT {
+            left: 24,
+            top: 108,
+            right: 72,
+            bottom: 156,
+        },
+        ID_EDITOR_ICON_PREVIEW,
+        true,
+        false,
+        None,
+    )?;
+    for (id, key, left, right) in [
+        (ID_EDITOR_ICON_SELECT, "rewrite_icon_select", 88, 296),
+        (ID_EDITOR_ICON_IMPORT, "rewrite_icon_import", 308, 516),
+    ] {
+        let button = editor_body_child(
+            editor,
+            w!("BUTTON"),
+            editor.language.text(key),
+            WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+            RECT {
+                left,
+                top: 115,
+                right,
+                bottom: 149,
+            },
+            id,
+            true,
+            false,
+            None,
+        )?;
+        dropdown::track_hover(button, false)?;
+        if id == ID_EDITOR_ICON_SELECT {
+            editor.icon_selector = button;
+        }
+    }
+    let name = editor
+        .language
+        .text(icon_label(&editor.prompt.icon))
+        .to_owned();
+    editor.icon_name = editor_body_child(
+        editor,
+        w!("STATIC"),
+        &name,
+        WINDOW_STYLE(0),
+        RECT {
+            left: 24,
+            top: 164,
+            right: 660,
+            bottom: 186,
+        },
+        0,
+        true,
+        false,
+        None,
+    )?;
+    Ok(())
+}
+
+fn choose_icon(editor: &mut Editor, icon: PromptIcon) {
+    editor.prompt.icon = icon;
+    unsafe {
+        let _ = SetWindowTextW(
+            editor.icon_name,
+            PCWSTR(wide(editor.language.text(icon_label(&editor.prompt.icon))).as_ptr()),
+        );
+        for hwnd in std::iter::once(&editor.icon_preview).chain(editor.icon_buttons.iter()) {
+            let _ = InvalidateRect(Some(*hwnd), None, true);
+        }
+    }
+}
+
+fn import_icon(editor: &mut Editor) -> Result<(), String> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::PWSTR;
+    hotkeys::deactivate();
+    let mut filename = vec![0_u16; 32_768];
+    let filter = wide("PNG, JPEG, SVG\0*.png;*.jpg;*.jpeg;*.svg\0\0");
+    let title = wide(editor.language.text("rewrite_icon_import"));
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: editor.hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(filename.as_mut_ptr()),
+        nMaxFile: filename.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
+        let error = unsafe { CommDlgExtendedError() };
+        return if error.0 == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: {}",
+                editor.language.text("rewrite_icon_import_failed"),
+                error.0
+            ))
+        };
+    }
+    let length = filename
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(filename.len());
+    let path = PathBuf::from(String::from_utf16_lossy(&filename[..length]));
+    let icon = editor.icon_draft.stage(&path).map_err(|error| {
+        format!(
+            "{}: {error}",
+            editor.language.text("rewrite_icon_import_failed")
+        )
+    })?;
+    choose_icon(editor, icon);
+    Ok(())
+}
+
 fn create_editor(editor: &mut Editor) -> Result<(), String> {
     let instance = unsafe { GetModuleHandleW(None).map_err(|e| e.to_string())? };
     editor.body = unsafe {
@@ -1296,6 +2030,8 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
         apply_dark_theme(field);
         editor.api_fields[index] = field;
     }
+    create_icon_controls(editor)?;
+    icon_picker::create(editor, instance)?;
     let values = [
         editor.prompt.title.clone(),
         editor.prompt.prompt.clone(),
@@ -1311,6 +2047,7 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
     .into_iter()
     .enumerate()
     {
+        let y = y + EDITOR_ICON_HEIGHT;
         editor_body_child(
             editor,
             w!("STATIC"),
@@ -1342,7 +2079,7 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
             RECT {
                 left: 34,
                 top: y + 6,
-                right: 650,
+                right: if index == 3 { 552 } else { 650 },
                 bottom: y + height - 6,
             },
             0x6900 + index,
@@ -1351,7 +2088,7 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
             Some(RECT {
                 left: 24,
                 top: y,
-                right: 660,
+                right: if index == 3 { 562 } else { 660 },
                 bottom: y + height,
             }),
         )?;
@@ -1372,13 +2109,13 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
     editor.status = editor_body_child(
         editor,
         w!("STATIC"),
-        editor.language.text("hotkey_help"),
+        editor.language.text("hotkey_optional_help"),
         WINDOW_STYLE(0),
         RECT {
             left: 24,
-            top: 544,
+            top: 544 + EDITOR_ICON_HEIGHT,
             right: 660,
-            bottom: 588,
+            bottom: 588 + EDITOR_ICON_HEIGHT,
         },
         0,
         true,
@@ -1432,13 +2169,36 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
             .filter(|p| p.id != editor.prompt.id)
             .map(|p| (p.title.clone(), p.hotkey.clone())),
     );
-    hotkeys::attach(
+    if editor.config.rewrite.menu_enabled {
+        context.push((
+            editor.language.text("rewrite_menu_key").into(),
+            editor.config.rewrite.menu_key.clone(),
+        ));
+    }
+    hotkeys::attach_optional(
         editor.fields[3],
         editor.prompt.hotkey.clone(),
         editor.language,
         editor.status,
     )?;
-    hotkeys::set_context(editor.fields[3], context, editor.config.hotkey_hook);
+    hotkeys::set_context(editor.fields[3], context);
+    let clear = editor_body_child(
+        editor,
+        w!("BUTTON"),
+        editor.language.text("hotkey_clear"),
+        WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        RECT {
+            left: 574,
+            top: 500 + EDITOR_ICON_HEIGHT,
+            right: 660,
+            bottom: 534 + EDITOR_ICON_HEIGHT,
+        },
+        ID_EDITOR_KEY_CLEAR,
+        true,
+        false,
+        None,
+    )?;
+    dropdown::track_hover(clear, false)?;
     for (index, (id, key)) in [
         (ID_EDITOR_TEST, "test_connectivity"),
         (ID_CANCEL, "cancel"),
@@ -1710,11 +2470,12 @@ fn reveal_editor_control(editor: &mut Editor, hwnd: HWND) {
         return;
     }
     let mut rect = if hwnd == editor.test_status {
-        editor_test_result_layout(editor).frame
+        editor.content_rect(editor_test_result_layout(editor).frame, item.after_api)
+    } else if let Some(frame) = item.frame {
+        editor.content_rect(frame, item.after_api)
     } else {
-        item.frame.unwrap_or(item.rect)
+        editor.content_rect(item.rect, item.after_api)
     };
-    rect = editor.content_rect(rect, item.after_api);
     rect.top = (rect.top - platform::scale(28, editor.dpi)).max(0);
     rect.bottom += platform::scale(8, editor.dpi);
     let mut client = RECT::default();
@@ -1731,6 +2492,7 @@ fn reveal_editor_control(editor: &mut Editor, hwnd: HWND) {
     let max = (platform::scale(editor.content_height(), editor.dpi) - client.bottom).max(0);
     if new_offset.clamp(0, max) != editor.offset {
         close_editor_provider(editor);
+        icon_picker::close(editor, true);
         editor.offset = new_offset.clamp(0, max);
         layout_editor_body(editor);
     }
@@ -1841,6 +2603,7 @@ fn reveal_editor_option(editor: &mut Editor, index: usize) {
 }
 
 fn editor_provider_menu(editor: &mut Editor) {
+    icon_picker::close(editor, false);
     if editor.provider_open {
         close_editor_provider(editor);
         return;
@@ -2179,6 +2942,7 @@ unsafe extern "system" fn editor_body_proc(
             if editor.offset != wparam.0 as i32 {
                 editor.offset = wparam.0 as i32;
                 close_editor_provider(editor);
+                icon_picker::close(editor, true);
                 layout_editor_body(editor);
             }
             LRESULT(0)
@@ -2248,8 +3012,59 @@ unsafe extern "system" fn editor_body_proc(
 
 unsafe fn draw_editor_button(editor: &Editor, item: &DRAWITEMSTRUCT) {
     let id = item.CtlID as usize;
+    if id == ID_EDITOR_ICON_PREVIEW
+        || (ID_EDITOR_ICON_FIRST..ID_EDITOR_ICON_FIRST + editor.icon_buttons.len()).contains(&id)
+    {
+        let icon = if id == ID_EDITOR_ICON_PREVIEW {
+            editor.prompt.icon.clone()
+        } else {
+            palette_icon(id - ID_EDITOR_ICON_FIRST)
+        };
+        let selected = (icon == editor.prompt.icon
+            || editor.prompt.icon == PromptIcon::Default
+                && icon == PromptIcon::Builtin(BuiltinPromptIcon::Chat))
+            && id != ID_EDITOR_ICON_PREVIEW;
+        let focused = item.itemState.0 & (ODS_FOCUS.0 | ODS_SELECTED.0) != 0
+            || dropdown::hovered(item.hwndItem);
+        let available_size = ((item.rcItem.right - item.rcItem.left)
+            .min(item.rcItem.bottom - item.rcItem.top)
+            - platform::scale(8, editor.dpi))
+        .max(1);
+        let size = platform::scale(
+            if id == ID_EDITOR_ICON_PREVIEW { 36 } else { 28 },
+            editor.dpi,
+        )
+        .min(available_size) as u32;
+        let pixels =
+            editor
+                .icon_cache
+                .borrow_mut()
+                .pixels(&icon, size, true, Some(&editor.icon_draft));
+        unsafe {
+            if id == ID_EDITOR_ICON_PREVIEW {
+                fill_color(item.hDC, item.rcItem, rgb(16, 22, 25));
+                rounded_box(
+                    item.hDC,
+                    item.rcItem,
+                    rgb(24, 33, 37),
+                    rgb(54, 68, 74),
+                    platform::scale(7, editor.dpi),
+                );
+            } else {
+                dropdown::draw_row(item.hDC, item.rcItem, selected, focused, editor.dpi);
+            }
+        }
+        let x = item.rcItem.left + (item.rcItem.right - item.rcItem.left - pixels.size as i32) / 2;
+        let y = item.rcItem.top + (item.rcItem.bottom - item.rcItem.top - pixels.size as i32) / 2;
+        let _ = crate::prompt_icons::draw_gdi(item.hDC, x, y, &pixels);
+        return;
+    }
     if id == ID_SAVE || id == ID_CANCEL {
         unsafe { draw_dialog_button(item, editor.font, editor.dpi) };
+        return;
+    }
+    if id == ID_EDITOR_KEY_CLEAR {
+        unsafe { draw_action_button(item, editor.font, editor.dpi) };
         return;
     }
     let focused = item.itemState.0 & (ODS_FOCUS.0 | ODS_SELECTED.0) != 0;
@@ -2305,7 +3120,10 @@ unsafe fn draw_editor_button(editor: &Editor, item: &DRAWITEMSTRUCT) {
                 rgb(230, 240, 240)
             },
             rect,
-            if id == ID_EDITOR_TEST {
+            if matches!(
+                id,
+                ID_EDITOR_TEST | ID_EDITOR_ICON_SELECT | ID_EDITOR_ICON_IMPORT
+            ) {
                 DT_CENTER
             } else {
                 DT_LEFT
@@ -2367,6 +3185,7 @@ unsafe extern "system" fn editor_proc(
         }
         WM_DPICHANGED => {
             close_editor_provider(editor);
+            icon_picker::close(editor, true);
             let old_dpi = editor.dpi;
             editor.dpi = ((wparam.0 >> 16) & 0xffff) as u32;
             editor.offset =
@@ -2379,6 +3198,7 @@ unsafe extern "system" fn editor_proc(
                 .map(|item| item.hwnd)
                 .chain(editor.buttons)
                 .chain(editor.provider_items.iter().copied())
+                .chain(editor.icon_buttons.iter().copied())
             {
                 set_font(child, editor.font);
             }
@@ -2390,6 +3210,7 @@ unsafe extern "system" fn editor_proc(
             LRESULT(0)
         }
         WM_WINDOWPOSCHANGED => {
+            icon_picker::close(editor, true);
             let resized = unsafe { (*(lparam.0 as *const WINDOWPOS)).flags.0 & SWP_NOSIZE.0 == 0 };
             let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             if resized {
@@ -2446,7 +3267,20 @@ unsafe extern "system" fn editor_proc(
                 }
             }
             if notification == BN_CLICKED {
-                if id == ID_EDITOR_PROVIDER {
+                if (ID_EDITOR_ICON_FIRST..ID_EDITOR_ICON_FIRST + editor.icon_buttons.len())
+                    .contains(&id)
+                {
+                    icon_picker::select(editor, id - ID_EDITOR_ICON_FIRST);
+                } else if id == ID_EDITOR_ICON_SELECT {
+                    icon_picker::toggle(editor);
+                } else if id == ID_EDITOR_ICON_IMPORT {
+                    icon_picker::close(editor, false);
+                    if let Err(error) = import_icon(editor) {
+                        show_error(hwnd, &error);
+                    }
+                } else if id == ID_EDITOR_KEY_CLEAR {
+                    hotkeys::clear(editor.fields[3]);
+                } else if id == ID_EDITOR_PROVIDER {
                     editor_provider_menu(editor);
                 } else if (ID_EDITOR_OPTION..ID_EDITOR_OPTION + editor.provider_items.len())
                     .contains(&id)
@@ -2463,14 +3297,19 @@ unsafe extern "system" fn editor_proc(
                     let mut config = editor.config.clone();
                     config.rewrite.prompts.retain(|p| p.id != prompt.id);
                     config.rewrite.prompts.push(prompt.clone());
-                    match config.validate() {
+                    let validation = config
+                        .rewrite
+                        .validate_prompts()
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| hotkeys::validate_draft(&config, editor.language));
+                    match validation {
                         Ok(()) => {
                             editor.result = Some(prompt);
                             unsafe {
                                 let _ = DestroyWindow(hwnd);
                             }
                         }
-                        Err(error) => show_error(hwnd, &error.to_string()),
+                        Err(error) => show_error(hwnd, &error),
                     }
                 }
             }
@@ -2552,6 +3391,8 @@ unsafe extern "system" fn editor_proc(
         WM_ACTIVATE => {
             if wparam.0 & 0xffff == 0 {
                 close_editor_provider(editor);
+                icon_picker::close(editor, false);
+                editor.icon_key_latch = None;
                 hotkeys::deactivate();
             } else {
                 hotkeys::activate(unsafe { GetFocus() });
@@ -2563,6 +3404,7 @@ unsafe extern "system" fn editor_proc(
             LRESULT(0)
         },
         WM_DESTROY => {
+            icon_picker::close(editor, false);
             editor.test_cancel.cancel();
             editor.test_receiver = None;
             hotkeys::deactivate();

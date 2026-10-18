@@ -32,6 +32,7 @@ use crate::render::{
     hit_test_button,
 };
 use crate::resources;
+use crate::rewrite_menu::{RewriteMenu, WM_REWRITE_MENU_PICK};
 use crate::settings::{
     SettingsWindow, WM_LANGUAGE_CHANGED, WM_OPACITY_CHANGED, WM_WINDOW_SCALE_CHANGED,
 };
@@ -40,6 +41,7 @@ use crate::tray::{COMMAND_MINIMAL, COMMAND_QUIT, COMMAND_SETTINGS, TrayIcon, WM_
 
 const WM_RUNTIME_EVENT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
 const WM_ESCAPE_COMMAND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
+const WM_TOGGLE_REWRITE_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
 const ANIMATION_TIMER_ID: usize = 0x7101;
 const ANIMATION_INTERVAL_MS: u32 = 16;
 const ANIMATION_STEP_SECONDS: f32 = ANIMATION_INTERVAL_MS as f32 / 1_000.0;
@@ -53,6 +55,7 @@ struct WindowState {
     renderer: Renderer,
     tray: Option<TrayIcon>,
     settings: Option<SettingsWindow>,
+    rewrite_menu: Option<RewriteMenu>,
     minimal: bool,
     rounded: bool,
     dpi: u32,
@@ -141,6 +144,7 @@ fn run_inner() -> Result<(), String> {
         renderer,
         tray: None,
         settings: None,
+        rewrite_menu: None,
         minimal: false,
         rounded,
         dpi,
@@ -210,6 +214,20 @@ fn run_inner() -> Result<(), String> {
         .is_err()
         {
             unsafe { drop(Box::from_raw(pointer)) };
+        }
+    })));
+    runtime.set_rewrite_menu_handler(Some(Arc::new(move || {
+        // Snapshot the pointer at the hotkey edge, before dispatching to the GUI.
+        let mut point = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut point).is_ok() {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_value as *mut c_void)),
+                    WM_TOGGLE_REWRITE_MENU,
+                    WPARAM(point.x as isize as usize),
+                    LPARAM(point.y as isize),
+                );
+            }
         }
     })));
     let _ = runtime.start_hotkeys();
@@ -420,6 +438,12 @@ unsafe extern "system" fn window_proc(
             let event = unsafe { Box::from_raw(lparam.0 as *mut Event) };
             let previous_state = state.event.state;
             state.event = *event;
+            if matches!(
+                state.event.state,
+                State::Recording | State::Paused | State::Uploading | State::Rewriting
+            ) {
+                close_rewrite_menu(state);
+            }
             if previous_state != State::Recording && state.event.state == State::Recording {
                 state.animation_time = 0.0;
             }
@@ -450,6 +474,9 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_WINDOW_SCALE_CHANGED => {
+            // Main settings posts this after applying any configuration, including
+            // prompt edits. Discard an open snapshot before it can be clicked.
+            close_rewrite_menu(state);
             state.window_scale = state.runtime.config().window_scale;
             state.renderer.set_window_scale(state.window_scale as f32);
             resize_overlay(state);
@@ -457,8 +484,30 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_ESCAPE_COMMAND => {
-            if !close_settings(state) {
+            if !close_rewrite_menu(state) && !close_settings(state) {
                 request_quit(state);
+            }
+            LRESULT(0)
+        }
+        WM_TOGGLE_REWRITE_MENU => {
+            toggle_rewrite_menu(
+                state,
+                POINT {
+                    x: wparam.0 as i32,
+                    y: lparam.0 as i32,
+                },
+            );
+            LRESULT(0)
+        }
+        WM_REWRITE_MENU_PICK => {
+            if let Some(id) = state
+                .rewrite_menu
+                .as_mut()
+                .and_then(RewriteMenu::take_selection)
+            {
+                // The popup has already hidden and released input/capture. The existing
+                // runtime reads selection now and outputs at the later current caret.
+                state.runtime.try_rewrite(&id);
             }
             LRESULT(0)
         }
@@ -468,6 +517,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             stop_animation_timer(state);
+            state.runtime.set_rewrite_menu_handler(None);
+            close_rewrite_menu(state);
+            state.rewrite_menu = None;
             state.runtime.set_event_handler(None);
             state.runtime.stop();
             close_settings(state);
@@ -579,7 +631,56 @@ fn resize_overlay(state: &WindowState) {
     }
 }
 
+fn close_rewrite_menu(state: &mut WindowState) -> bool {
+    let Some(menu) = &mut state.rewrite_menu else {
+        return false;
+    };
+    let open = menu.is_open();
+    menu.close();
+    open
+}
+
+fn toggle_rewrite_menu(state: &mut WindowState, point: POINT) {
+    if close_rewrite_menu(state) {
+        return;
+    }
+    let config = state.runtime.config();
+    if !config.rewrite.menu_enabled {
+        return;
+    }
+    if config.rewrite.prompts.is_empty() {
+        state.event.error.clear();
+        state.event.message = state.language.text("no_rewrite_prompts").into();
+        let _ = redraw_overlay(state);
+        return;
+    }
+    if matches!(
+        state.runtime.snapshot().state,
+        State::Recording | State::Paused | State::Uploading | State::Rewriting
+    ) {
+        return;
+    }
+    let result = (|| {
+        let config_path = platform::config_path()?;
+        if state.rewrite_menu.is_none() {
+            state.rewrite_menu = Some(RewriteMenu::new(state.hwnd)?);
+        }
+        state
+            .rewrite_menu
+            .as_mut()
+            .unwrap()
+            .toggle_at(&config.rewrite.prompts, &config_path, point)
+    })();
+    if let Err(error) = result {
+        close_rewrite_menu(state);
+        state.event.error.clear();
+        state.event.message = format!("{}: {error}", state.language.text("rewrite_menu_failed"));
+        let _ = redraw_overlay(state);
+    }
+}
+
 fn open_settings(state: &mut WindowState) {
+    close_rewrite_menu(state);
     set_minimal(state, false);
     if let Some(settings) = &state.settings {
         if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(settings.hwnd())) }

@@ -63,6 +63,29 @@ include this notice and the project license.
 - sha2 0.10.9 — MIT OR Apache-2.0; source: https://crates.io/crates/sha2/0.10.9
   (RustCrypto hashes: https://github.com/RustCrypto/hashes)
 
+### Rewrite menu icon decoding and rendering (GUI)
+
+The GUI statically links these components to decode imported PNG/JPEG images and
+render SVG icons at the current monitor DPI. Versions below match `Cargo.lock`;
+license identifiers and bundled texts come from the corresponding crate archives.
+
+- image 0.25.10 — MIT OR Apache-2.0
+  Source: https://crates.io/crates/image/0.25.10
+  Project: https://github.com/image-rs/image
+  Full texts: `THIRD_PARTY_LICENSES/image-MIT.txt`,
+  `THIRD_PARTY_LICENSES/image-Apache-2.0.txt`
+- resvg 0.48.1 and usvg 0.48.1 — Apache-2.0 OR MIT
+  Sources: https://crates.io/crates/resvg/0.48.1 and
+  https://crates.io/crates/usvg/0.48.1
+  Project: https://github.com/linebender/resvg
+  Full texts (identical in both crates): `THIRD_PARTY_LICENSES/resvg-usvg-MIT.txt`,
+  `THIRD_PARTY_LICENSES/resvg-usvg-Apache-2.0.txt`
+- tiny-skia 0.12.0 and tiny-skia-path 0.12.0 — BSD-3-Clause
+  Sources: https://crates.io/crates/tiny-skia/0.12.0 and
+  https://crates.io/crates/tiny-skia-path/0.12.0
+  Project: https://github.com/linebender/tiny-skia
+  Full text (identical in both crates): `THIRD_PARTY_LICENSES/tiny-skia-BSD-3-Clause.txt`
+
 ## Project License
 
 - GPL-3.0-or-later

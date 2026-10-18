@@ -26,6 +26,25 @@ pub fn extract_text_from_response(
     body: &[u8],
     text_path: &JsonPath,
 ) -> Result<String, TextExtractionError> {
+    extract_scalar_from_response(body, text_path, false)
+}
+
+/// Extracts a recognition value, allowing an explicit null to mean no text.
+/// A missing or non-scalar value remains a malformed response. Captures and
+/// status fields use the strict scalar extractor above instead. Whitespace is
+/// preserved because a streaming fragment can be a separator between words.
+pub fn extract_transcript_from_response(
+    body: &[u8],
+    text_path: &JsonPath,
+) -> Result<String, TextExtractionError> {
+    extract_scalar_from_response(body, text_path, true)
+}
+
+fn extract_scalar_from_response(
+    body: &[u8],
+    text_path: &JsonPath,
+    transcript: bool,
+) -> Result<String, TextExtractionError> {
     let root: Value = serde_json::from_slice(body)?;
     let nodes = text_path.query(&root);
     let count = nodes.len();
@@ -40,6 +59,7 @@ pub fn extract_text_from_response(
         Value::String(text) => Ok(text.clone()),
         Value::Number(number) => Ok(number.to_string()),
         Value::Bool(value) => Ok(value.to_string()),
+        Value::Null if transcript => Ok(String::new()),
         Value::Null => Err(TextExtractionError::InvalidType { kind: "null" }),
         Value::Array(_) => Err(TextExtractionError::InvalidType { kind: "an array" }),
         Value::Object(_) => Err(TextExtractionError::InvalidType { kind: "an object" }),
@@ -127,6 +147,38 @@ mod tests {
             extract("not JSON", "$.text"),
             Err(TextExtractionError::InvalidJson(_))
         ));
+    }
+
+    #[test]
+    fn transcript_accepts_present_empty_values_but_keeps_structural_errors() {
+        let path = parse_text_path("$.text").unwrap();
+        for body in [r#"{"text":""}"#, r#"{"text":null}"#] {
+            assert_eq!(
+                extract_transcript_from_response(body.as_bytes(), &path).unwrap(),
+                ""
+            );
+        }
+        assert_eq!(
+            extract_transcript_from_response(br#"{"text":" text "}"#, &path).unwrap(),
+            " text "
+        );
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"text":[]}"#,
+            br#"{"text":{}}"#,
+            b"invalid",
+        ] {
+            assert!(extract_transcript_from_response(body, &path).is_err());
+        }
+        assert!(extract_text_from_response(br#"{"text":null}"#, &path).is_err());
+        assert_eq!(
+            extract_text_from_response(br#"{"text":" "}"#, &path).unwrap(),
+            " "
+        );
+        assert_eq!(
+            extract_transcript_from_response(br#"{"text":" "}"#, &path).unwrap(),
+            " "
+        );
     }
 
     #[test]

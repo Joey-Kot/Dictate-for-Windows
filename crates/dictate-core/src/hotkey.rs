@@ -8,7 +8,13 @@ const MOD_CTRL: u32 = 0x0002;
 const MOD_SHIFT: u32 = 0x0004;
 const MOD_WIN: u32 = 0x0008;
 
+pub const REWRITE_MENU_ACTION: i32 = 4;
+pub const REWRITE_PROMPT_ACTION_BASE: i32 = 1000;
+
 pub mod capture;
+
+#[cfg(any(windows, test))]
+mod hook_state;
 
 static CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -130,9 +136,22 @@ pub fn parse_hotkey(spec: &str) -> Result<ParsedHotkey, HotkeyError> {
     })
 }
 
-/// Existing audio bindings retain their matching semantics. New rewrite
-/// bindings must not introduce any ambiguous hook match for the same key.
+/// Both hotkey backends match the complete modifier combination. Audio,
+/// menu and prompt bindings conflict only when their normalized chords match.
 pub fn validate_config(config: &crate::Config) -> Result<(), HotkeyError> {
+    if config.rewrite.menu_enabled {
+        parse_hotkey(&config.rewrite.menu_key).map_err(|error| HotkeyError::InvalidBinding {
+            name: "Menu key",
+            spec: config.rewrite.menu_key.clone(),
+            reason: error.to_string(),
+        })?;
+    }
+    validate_config_draft(config)
+}
+
+/// Validate existing bindings while a prompt editor updates the settings
+/// draft. Enabling the menu before recording its key must not block editing.
+pub fn validate_config_draft(config: &crate::Config) -> Result<(), HotkeyError> {
     validate_bindings(
         &config.start_key,
         &config.pause_key,
@@ -146,19 +165,23 @@ pub fn validate_config(config: &crate::Config) -> Result<(), HotkeyError> {
             parse_hotkey(&config.cancel_or_retry_key)?,
         ),
     ];
-    for prompt in &config.rewrite.prompts {
-        let parsed = parse_hotkey(&prompt.hotkey)?;
+    let menu_binding = (config.rewrite.menu_enabled && !config.rewrite.menu_key.trim().is_empty())
+        .then_some(("Menu key", config.rewrite.menu_key.as_str()));
+    let prompt_bindings = config.rewrite.prompts.iter().filter_map(|prompt| {
+        (!prompt.hotkey.trim().is_empty())
+            .then_some((prompt.title.as_str(), prompt.hotkey.as_str()))
+    });
+    for (title, spec) in menu_binding.into_iter().chain(prompt_bindings) {
+        let parsed = parse_hotkey(spec)?;
         for (name, previous) in &bindings {
-            if *previous == parsed
-                || (config.hotkey_hook && previous.virtual_key == parsed.virtual_key)
-            {
+            if *previous == parsed {
                 return Err(HotkeyError::Registration(format!(
                     "Hotkey conflict: {} / {name}",
-                    prompt.title
+                    title
                 )));
             }
         }
-        bindings.push((prompt.title.clone(), parsed));
+        bindings.push((title.to_owned(), parsed));
     }
     // RegisterHotKey consumes even injected Ctrl+C, which Rewrite uses to copy
     // the selection. The low-level hook ignores injected input instead.
@@ -173,6 +196,52 @@ pub fn validate_config(config: &crate::Config) -> Result<(), HotkeyError> {
         )));
     }
     Ok(())
+}
+
+/// Build both Windows backends from the same sparse action table. Prompt
+/// numbers use their original list index; skipping empty keys never shifts
+/// the stable prompt-ID lookup captured by the runtime.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn binding_definitions(
+    config: &crate::Config,
+    menu_available: bool,
+) -> Result<Vec<(i32, String, ParsedHotkey)>, HotkeyError> {
+    validate_config(config)?;
+    let mut definitions = vec![
+        (
+            1,
+            config.start_key.clone(),
+            parse_hotkey(&config.start_key)?,
+        ),
+        (
+            2,
+            config.pause_key.clone(),
+            parse_hotkey(&config.pause_key)?,
+        ),
+        (
+            3,
+            config.cancel_or_retry_key.clone(),
+            parse_hotkey(&config.cancel_or_retry_key)?,
+        ),
+    ];
+    if menu_available && config.rewrite.menu_enabled {
+        definitions.push((
+            REWRITE_MENU_ACTION,
+            config.rewrite.menu_key.clone(),
+            parse_hotkey(&config.rewrite.menu_key)?,
+        ));
+    }
+    for (index, prompt) in config.rewrite.prompts.iter().enumerate() {
+        if prompt.hotkey.trim().is_empty() {
+            continue;
+        }
+        let id = i32::try_from(index)
+            .ok()
+            .and_then(|index| REWRITE_PROMPT_ACTION_BASE.checked_add(index))
+            .ok_or_else(|| HotkeyError::Registration("Too many prompt hotkeys".into()))?;
+        definitions.push((id, prompt.hotkey.clone(), parse_hotkey(&prompt.hotkey)?));
+    }
+    Ok(definitions)
 }
 
 fn key_to_virtual_key(key: &str) -> Result<u32, HotkeyError> {
@@ -286,13 +355,9 @@ pub use windows_impl::register;
 
 #[cfg(not(windows))]
 pub fn register(
-    _start: &str,
-    _pause: &str,
-    _cancel_or_retry: &str,
-    _prompts: &[crate::rewrite::RewritePrompt],
-    _hook: bool,
+    _config: &crate::Config,
+    _menu_available: bool,
     _handler: impl Fn(i32) + Send + Sync + 'static,
-    _debug: bool,
 ) -> Result<HotkeyRegistration, HotkeyError> {
     Err(HotkeyError::UnsupportedPlatform)
 }
@@ -335,7 +400,73 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_conflicts_cover_aliases_other_prompts_and_hook_modifier_overlap() {
+    fn shared_key_dispatch_preserves_audio_menu_and_prompt_action_ids() {
+        // Numeric order follows MOD_ALT, MOD_CTRL, MOD_SHIFT and MOD_WIN.
+        let chords = [
+            "q",
+            "alt+q",
+            "ctrl+q",
+            "ctrl+alt+q",
+            "shift+q",
+            "alt+shift+q",
+            "ctrl+shift+q",
+            "ctrl+alt+shift+q",
+            "win+q",
+            "win+alt+q",
+            "win+ctrl+q",
+            "win+ctrl+alt+q",
+            "win+shift+q",
+            "win+alt+shift+q",
+            "win+ctrl+shift+q",
+            "win+ctrl+alt+shift+q",
+        ];
+        let mut config = crate::Config {
+            start_key: chords[0].into(),
+            pause_key: chords[1].into(),
+            cancel_or_retry_key: chords[2].into(),
+            ..Default::default()
+        };
+        config.rewrite.menu_enabled = true;
+        config.rewrite.menu_key = chords[3].into();
+        config.rewrite.prompts = chords[4..]
+            .iter()
+            .enumerate()
+            .map(|(index, chord)| crate::rewrite::RewritePrompt {
+                id: format!("prompt-{index}"),
+                title: format!("Prompt {index}"),
+                prompt: "Rewrite".into(),
+                hotkey: (*chord).into(),
+                ..Default::default()
+            })
+            .collect();
+        for hook in [false, true] {
+            config.hotkey_hook = hook;
+            config.validate().unwrap();
+            let definitions = binding_definitions(&config, true).unwrap();
+            assert_eq!(definitions.len(), 16);
+            let candidates: Vec<_> = definitions
+                .iter()
+                .map(|(id, _, binding)| {
+                    assert_eq!(binding.virtual_key, u32::from(b'Q'));
+                    (*id, binding.modifiers)
+                })
+                .collect();
+            for modifiers in 0..16 {
+                let id = match modifiers {
+                    0..=2 => modifiers as i32 + 1,
+                    3 => REWRITE_MENU_ACTION,
+                    _ => REWRITE_PROMPT_ACTION_BASE + modifiers as i32 - 4,
+                };
+                assert_eq!(
+                    hook_state::matching_action(&candidates, modifiers),
+                    Some(id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_conflicts_cover_aliases_and_allow_distinct_modifier_combinations() {
         let mut config = crate::Config::default();
         config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
             title: "One".into(),
@@ -347,10 +478,10 @@ mod tests {
             assert!(validate_config(&config).is_err());
         }
         config.rewrite.prompts[0].hotkey = "ctrl+shift+q".into();
-        config.hotkey_hook = false;
-        validate_config(&config).unwrap();
-        config.hotkey_hook = true;
-        assert!(validate_config(&config).is_err());
+        for hook in [false, true] {
+            config.hotkey_hook = hook;
+            validate_config(&config).unwrap();
+        }
         config.rewrite.prompts[0].hotkey = "ctrl+alt+w".into();
         validate_config(&config).unwrap();
         config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
@@ -419,5 +550,103 @@ mod tests {
             config.rewrite.prompts[0].hotkey = spec.into();
             validate_config(&config).unwrap();
         }
+    }
+
+    #[test]
+    fn optional_prompt_keys_preserve_sparse_action_ids_after_reordering() {
+        let mut config = crate::Config::default();
+        for (id, key) in [("a", ""), ("b", "ctrl+alt+w"), ("c", "  "), ("d", "alt+t")] {
+            config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+                id: id.into(),
+                title: id.into(),
+                hotkey: key.into(),
+                ..Default::default()
+            });
+        }
+        for expected in [[("b", 1001), ("d", 1003)], [("d", 1000), ("b", 1001)]] {
+            let definitions = binding_definitions(&config, true).unwrap();
+            let actual: Vec<_> = definitions
+                .iter()
+                .filter(|(id, _, _)| *id >= REWRITE_PROMPT_ACTION_BASE)
+                .map(|(id, _, _)| {
+                    let prompt =
+                        &config.rewrite.prompts[(*id - REWRITE_PROMPT_ACTION_BASE) as usize];
+                    (prompt.id.as_str(), *id)
+                })
+                .collect();
+            assert_eq!(actual, expected);
+            config.rewrite.prompts.swap(0, 3);
+        }
+        config.rewrite.prompts.remove(0);
+        let definitions = binding_definitions(&config, true).unwrap();
+        assert_eq!(definitions.last().unwrap().0, 1002);
+        assert_eq!(config.rewrite.prompts[2].id, "d");
+    }
+
+    #[test]
+    fn menu_key_is_required_only_at_final_validation_and_registered_only_for_gui() {
+        let mut config = crate::Config::default();
+        config.rewrite.menu_enabled = true;
+        validate_config_draft(&config).unwrap();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("Menu key")
+        );
+        config.rewrite.menu_key = "ctrl+alt+m".into();
+        validate_config(&config).unwrap();
+        assert!(
+            binding_definitions(&config, true)
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| *id == REWRITE_MENU_ACTION)
+        );
+        assert!(
+            !binding_definitions(&config, false)
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| *id == REWRITE_MENU_ACTION)
+        );
+
+        config.rewrite.menu_enabled = false;
+        for key in ["ctrl+alt+q", "invalid key", "ctrl+c"] {
+            config.rewrite.menu_key = key.into();
+            validate_config(&config).unwrap();
+            assert_eq!(binding_definitions(&config, true).unwrap().len(), 3);
+            assert_eq!(config.rewrite.menu_key, key);
+        }
+    }
+
+    #[test]
+    fn menu_conflicts_include_exact_audio_prompt_chords_and_copy_protection() {
+        let mut config = crate::Config::default();
+        config.rewrite.menu_enabled = true;
+        for hook in [false, true] {
+            config.hotkey_hook = hook;
+            config.rewrite.menu_key = "control+alt+q".into();
+            assert!(validate_config_draft(&config).is_err());
+            config.rewrite.menu_key = "ctrl+alt+m".into();
+            config.rewrite.prompts = vec![crate::rewrite::RewritePrompt {
+                title: "Prompt".into(),
+                hotkey: "alt+control+m".into(),
+                ..Default::default()
+            }];
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains("Prompt") && error.contains("Menu key"));
+            config.rewrite.prompts[0].hotkey.clear();
+            config.rewrite.menu_key = "ctrl+shift+q".into();
+            validate_config(&config).unwrap();
+        }
+        config.hotkey_hook = false;
+        config.rewrite.menu_key = "ctrl+c".into();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for copying")
+        );
+        config.hotkey_hook = true;
+        validate_config(&config).unwrap();
     }
 }

@@ -1,11 +1,11 @@
 //! Shared themed scrollbars for settings lists, multiline text fields, and viewports.
 #[derive(Clone, Copy, Debug)]
-struct Metrics {
-    height: i32,
-    thumb: i32,
-    top: i32,
-    max: i32,
-    page: i32,
+pub(crate) struct Metrics {
+    pub(crate) height: i32,
+    pub(crate) thumb: i32,
+    pub(crate) top: i32,
+    pub(crate) max: i32,
+    pub(crate) page: i32,
 }
 
 impl Metrics {
@@ -13,7 +13,13 @@ impl Metrics {
         Self::with_page(height, height / row.max(1), count, index, min_thumb)
     }
 
-    fn with_page(height: i32, page: i32, count: i32, index: i32, min_thumb: i32) -> Self {
+    pub(crate) fn with_page(
+        height: i32,
+        page: i32,
+        count: i32,
+        index: i32,
+        min_thumb: i32,
+    ) -> Self {
         let height = height.max(1);
         let page = page.max(1);
         let max = (count - page).max(0);
@@ -33,7 +39,7 @@ impl Metrics {
         }
     }
 
-    fn index_at(self, y: i32) -> i32 {
+    pub(crate) fn index_at(self, y: i32) -> i32 {
         let travel = self.height - self.thumb;
         if travel == 0 {
             0

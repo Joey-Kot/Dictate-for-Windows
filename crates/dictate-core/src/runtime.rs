@@ -133,6 +133,7 @@ struct RuntimeInner {
     hotkeys_requested: bool,
     event: Event,
     event_handler: Option<Arc<dyn Fn(Event) + Send + Sync>>,
+    rewrite_menu_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     next_session: u64,
     active_session: u64,
     // Kept alive from microphone start through conversion and upload so every
@@ -209,6 +210,7 @@ impl Runtime {
                 hotkeys_requested: false,
                 event: Event::default(),
                 event_handler: None,
+                rewrite_menu_handler: None,
                 next_session: 0,
                 active_session: 0,
                 active_debug_operation: None,
@@ -240,6 +242,35 @@ impl Runtime {
 
     pub fn config(&self) -> Config {
         self.inner.lock().config.clone()
+    }
+
+    /// Install the native GUI menu endpoint before starting hotkeys. CLI
+    /// callers leave this unset and therefore never reserve the menu key.
+    /// Clear it when the native window is destroyed.
+    pub fn set_rewrite_menu_handler(&self, handler: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.inner.lock().rewrite_menu_handler = handler;
+    }
+
+    fn try_toggle_rewrite_menu(&self) -> bool {
+        if self.is_stopped() {
+            return false;
+        }
+        let handler = {
+            let inner = self.inner.lock();
+            if !inner.config.rewrite.menu_enabled {
+                return false;
+            }
+            inner.rewrite_menu_handler.clone()
+        };
+        let Some(handler) = handler else {
+            return false;
+        };
+        // The GUI owns toggling, including an empty-list status notice. A
+        // menu shortcut never mutates runtime state: audio may have started
+        // concurrently. Clicking a prompt still enters try_rewrite() with
+        // the ordinary task mutex.
+        handler();
+        true
     }
 
     /// Enables the bounded, in-memory recording buffer used by interactive retry controls.
@@ -544,33 +575,28 @@ impl Runtime {
             .iter()
             .map(|p| p.id.clone())
             .collect();
-        hotkey::register(
-            &config.start_key,
-            &config.pause_key,
-            &config.cancel_or_retry_key,
-            &config.rewrite.prompts,
-            config.hotkey_hook,
-            move |id| {
-                if let Some(runtime) = weak.upgrade() {
-                    let accepted = if id >= 1000 {
-                        prompt_ids
-                            .get((id - 1000) as usize)
-                            .is_some_and(|prompt| runtime.try_rewrite(prompt))
-                    } else {
-                        runtime.try_action(id)
-                    };
-                    if !accepted && runtime.config().hotkey_debug {
-                        crate::debug_log::write(
-                            crate::debug_log::Category::Hotkey,
-                            format_args!(
-                                "[hotkey-debug] dropped action id={id} while another action is in progress"
-                            ),
-                        );
-                    }
+        let menu_available = self.inner.lock().rewrite_menu_handler.is_some();
+        hotkey::register(config, menu_available, move |id| {
+            if let Some(runtime) = weak.upgrade() {
+                let accepted = if id == hotkey::REWRITE_MENU_ACTION {
+                    runtime.try_toggle_rewrite_menu()
+                } else if id >= hotkey::REWRITE_PROMPT_ACTION_BASE {
+                    prompt_ids
+                        .get((id - hotkey::REWRITE_PROMPT_ACTION_BASE) as usize)
+                        .is_some_and(|prompt| runtime.try_rewrite(prompt))
+                } else {
+                    runtime.try_action(id)
+                };
+                if !accepted && runtime.config().hotkey_debug {
+                    crate::debug_log::write(
+                        crate::debug_log::Category::Hotkey,
+                        format_args!(
+                            "[hotkey-debug] dropped action id={id} while another action is in progress"
+                        ),
+                    );
                 }
-            },
-            config.hotkey_debug,
-        )
+            }
+        })
     }
 
     pub async fn reload(self: &Arc<Self>, config: Config) -> Result<(), RuntimeError> {
@@ -1422,7 +1448,7 @@ impl Runtime {
                     self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
                     return;
                 }
-                if transcription.text.is_empty() {
+                if transcription.text.trim().is_empty() {
                     clean_up_recording_attempt(
                         &config,
                         cache_attempt,
@@ -1658,7 +1684,7 @@ impl Runtime {
                     self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
                     return;
                 }
-                if transcription.text.is_empty() {
+                if transcription.text.trim().is_empty() {
                     clean_up_segmented_recording_attempt(
                         config,
                         cache_attempt,
@@ -1855,7 +1881,7 @@ impl Runtime {
                     self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>);
                     return;
                 }
-                if transcription.text.is_empty() {
+                if transcription.text.trim().is_empty() {
                     clean_up_recording_attempt(
                         config,
                         cache_attempt,
@@ -2760,6 +2786,115 @@ mod tests {
             }
         });
         (endpoint, worker)
+    }
+
+    #[tokio::test]
+    async fn segmented_empty_results_finish_normally_without_output() {
+        for response in [
+            (200, r#"{"text":""}"#),
+            (200, r#"{"text":" \t\n　"}"#),
+            (200, r#"{"text":null}"#),
+            (400, r#"{"error":"ASR_RESPONSE_HAVE_NO_WORDS"}"#),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (endpoint, server) = legacy_segment_server(vec![response; 3]).await;
+            let converter = Arc::new(InstrumentedSegmentConverter {
+                calls: Arc::new(ParkingMutex::new(SegmentedConverterCalls::default())),
+                outcome: SegmentExportOutcome::Succeed,
+            });
+            let runtime = Runtime::new(
+                segmented_runtime_config(directory.path(), endpoint),
+                converter,
+            )
+            .unwrap();
+            runtime.enable_retry_buffer();
+            let source = directory.path().join("original.wav");
+            std::fs::write(&source, b"original recording").unwrap();
+            let recording = RecordingResult {
+                wav_path: Some(source),
+                canceled: false,
+            };
+            runtime.save_completed_recording_for_retry(&recording);
+            runtime
+                .transcribe_recording(recording, &CancellationToken::new(), true)
+                .await;
+            server.await.unwrap();
+
+            let snapshot = runtime.snapshot();
+            assert_eq!(snapshot.state, State::Idle);
+            assert_eq!(snapshot.message, "Empty result from ASR");
+            assert!(snapshot.error.is_empty());
+            assert!(runtime.has_retryable_recording());
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_batch_skips_empty_results_but_retains_true_failure_placeholders() {
+        let directory = tempfile::tempdir().unwrap();
+        let (endpoint, server) = legacy_segment_server(vec![
+            (200, r#"{"text":"first "}"#),
+            (200, r#"{"text":null}"#),
+            (200, r#"{"text":" \t\n"}"#),
+            (400, r#"{"error":"ASR_RESPONSE_HAVE_NO_WORDS"}"#),
+            (200, r#"{"text":"last"}"#),
+            (503, r#"{}"#),
+            (200, r#"{}"#),
+        ])
+        .await;
+        let client = AudioApiClient::new(Config {
+            api_endpoint: endpoint,
+            max_retry: 1,
+            retry_base_delay: 0.0,
+            ..Config::default()
+        })
+        .unwrap();
+        let files: Vec<_> = (0..7)
+            .map(|index| {
+                let file = directory.path().join(format!("{index}.wav"));
+                std::fs::write(&file, b"audio").unwrap();
+                file
+            })
+            .collect();
+        let transcription = client
+            .transcribe_segments(&CancellationToken::new(), &files, 1)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            transcription.text,
+            "first last[503 Service Unavailable][Invalid ASR response]"
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_file_mode_writes_an_empty_file_for_valid_empty_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let (endpoint, server) = legacy_segment_server(vec![
+            (200, r#"{"text":" \t\n"}"#),
+            (200, r#"{"text":null}"#),
+            (400, r#"{"error":"ASR_RESPONSE_HAVE_NO_WORDS"}"#),
+        ])
+        .await;
+        let converter = Arc::new(InstrumentedSegmentConverter {
+            calls: Arc::new(ParkingMutex::new(SegmentedConverterCalls::default())),
+            outcome: SegmentExportOutcome::Succeed,
+        });
+        let source = directory.path().join("source.wav");
+        let output = directory.path().join("transcription.txt");
+        std::fs::write(&source, b"caller-owned recording").unwrap();
+        let result = run_file_mode_with_cancellation(
+            segmented_runtime_config(directory.path(), endpoint),
+            converter,
+            &source,
+            Some(&output),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result, output);
+        assert_eq!(std::fs::read(&output).unwrap(), b"");
+        assert!(source.exists());
     }
 
     #[tokio::test]
@@ -3800,6 +3935,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn menu_registration_failure_rolls_back_file_config_and_previous_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let mut original = Config::default();
+        original.rewrite.menu_enabled = true;
+        original.rewrite.menu_key = "ctrl+alt+m".into();
+        original.save(&path).unwrap();
+        let runtime = Runtime::new(original.clone(), Arc::new(NoopConverter)).unwrap();
+        runtime.set_rewrite_menu_handler(Some(Arc::new(|| {})));
+        let attempts = mock_hotkeys(&runtime, &[true, false, true]);
+        runtime.start_hotkeys().unwrap();
+        let mut replacement = original.clone();
+        replacement.rewrite.menu_key = "ctrl+alt+j".into();
+        assert!(matches!(
+            runtime.save_and_reload(replacement, &path).await,
+            Err(RuntimeError::Hotkey(_))
+        ));
+        assert_eq!(runtime.config(), original);
+        assert_eq!(Config::load(&path).unwrap(), original);
+        assert!(runtime.inner.lock().hotkeys.is_some());
+        assert_eq!(
+            attempts.lock().menu_keys,
+            ["ctrl+alt+m", "ctrl+alt+j", "ctrl+alt+m"]
+        );
+    }
+
+    #[tokio::test]
+    async fn menu_requires_gui_handler_and_never_changes_runtime_state() {
+        let mut config = Config::default();
+        config.rewrite.menu_enabled = true;
+        config.rewrite.menu_key = "ctrl+alt+m".into();
+        let runtime = Runtime::new(config, Arc::new(NoopConverter)).unwrap();
+        assert!(!runtime.try_toggle_rewrite_menu());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        runtime.set_rewrite_menu_handler(Some(Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+        assert!(runtime.try_toggle_rewrite_menu());
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut config = runtime.config();
+        config.rewrite.prompts.push(crate::rewrite::RewritePrompt {
+            title: "Only menu".into(),
+            prompt: "Rewrite".into(),
+            ..Default::default()
+        });
+        runtime.reload(config).await.unwrap();
+        assert!(runtime.try_toggle_rewrite_menu());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(runtime.snapshot().state, State::Idle);
+        runtime.set_state(State::Recording, "Recording", None::<&RuntimeError>);
+        assert!(runtime.try_toggle_rewrite_menu());
+        assert_eq!(runtime.snapshot().state, State::Recording);
+        runtime.set_rewrite_menu_handler(None);
+        assert!(!runtime.try_toggle_rewrite_menu());
+    }
+
+    #[tokio::test]
     async fn saving_recovers_after_both_replacement_and_rollback_hotkeys_fail() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
@@ -3843,6 +4037,7 @@ mod tests {
 
     struct HotkeyAttempts {
         keys: Vec<String>,
+        menu_keys: Vec<String>,
         outcomes: std::collections::VecDeque<bool>,
         stopped: usize,
     }
@@ -3850,6 +4045,7 @@ mod tests {
     fn mock_hotkeys(runtime: &Runtime, outcomes: &[bool]) -> Arc<Mutex<HotkeyAttempts>> {
         let attempts = Arc::new(Mutex::new(HotkeyAttempts {
             keys: Vec::new(),
+            menu_keys: Vec::new(),
             outcomes: outcomes.iter().copied().collect(),
             stopped: 0,
         }));
@@ -3858,6 +4054,7 @@ mod tests {
             let succeeds = {
                 let mut attempts = history.lock();
                 attempts.keys.push(config.start_key.clone());
+                attempts.menu_keys.push(config.rewrite.menu_key.clone());
                 attempts
                     .outcomes
                     .pop_front()

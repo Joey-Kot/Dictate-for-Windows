@@ -316,6 +316,501 @@ fn poll_stage(request: HttpStage, interval_ms: u64, timeout_ms: u64) -> PollStag
 }
 
 #[tokio::test]
+async fn empty_request_results_succeed_without_hiding_invalid_responses() {
+    for (status, body, succeeds) in [
+        ("200 OK", r#"{"text":""}"#, true),
+        ("200 OK", r#"{"text":" \n\t"}"#, true),
+        ("200 OK", r#"{"text":null}"#, true),
+        (
+            "400 Bad Request",
+            r#"{"error":{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}}"#,
+            true,
+        ),
+        (
+            "400 Bad Request",
+            r#"{"error":{"code":"INVALID_AUDIO"}}"#,
+            false,
+        ),
+        (
+            "401 Unauthorized",
+            r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+            false,
+        ),
+        ("200 OK", r#"{}"#, false),
+        ("200 OK", r#"{"text":[]}"#, false),
+        ("200 OK", r#"{"text":{}}"#, false),
+        ("200 OK", "not json", false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            read_request(&mut connection).await;
+            write_response(&mut connection, status, &[], body.as_bytes()).await;
+        });
+        let client = advanced_client(
+            "empty request",
+            AudioDelivery::RawAudio,
+            "audio/pcm",
+            AdvancedRecognition::Request {
+                request: Box::new(stage(
+                    HttpMethod::Post,
+                    format!("http://{address}/asr"),
+                    HttpBody::RawAudio,
+                )),
+                final_text: ResponseExtractor::JsonPath {
+                    path: "$.text".into(),
+                },
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let audio = audio_file(&directory, "empty.pcm", b"silent audio");
+        let result = client.transcribe(&CancellationToken::new(), &audio).await;
+        assert_eq!(result.is_ok(), succeeds, "{status}: {body}");
+        if let Ok(transcription) = result {
+            assert_eq!(transcription.text, "");
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_empty_streams_and_no_words_errors_succeed() {
+    for (status, format, body) in [
+        (
+            "200 OK",
+            StreamFormat::Sse,
+            "event: final\ndata: {\"text\":null}\n\nevent: done\ndata: {}\n\n",
+        ),
+        (
+            "200 OK",
+            StreamFormat::Sse,
+            "event: final\ndata: {\"text\":\" \\n\"}\n\nevent: done\ndata: {}\n\n",
+        ),
+        ("200 OK", StreamFormat::Sse, "event: done\ndata: {}\n\n"),
+        (
+            "200 OK",
+            StreamFormat::Sse,
+            "event: error\ndata: {\"code\":\"ASR_RESPONSE_HAVE_NO_WORDS\"}\n\n",
+        ),
+        (
+            "200 OK",
+            StreamFormat::Ndjson,
+            "{\"text\":null,\"done\":true}\n",
+        ),
+        (
+            "200 OK",
+            StreamFormat::JsonChunks,
+            "{\"text\":null,\"done\":true}",
+        ),
+        (
+            "400 Bad Request",
+            StreamFormat::Sse,
+            r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            read_request(&mut connection).await;
+            write_response(&mut connection, status, &[], body.as_bytes()).await;
+        });
+        let rules = if matches!(format, StreamFormat::Sse) {
+            let mut rules = stream_rules_for_sse();
+            rules.push(StreamRule {
+                event: Some("error".into()),
+                path: Some("$.code".into()),
+                action: StreamAction::Fail,
+                equals: None,
+            });
+            rules
+        } else {
+            vec![
+                StreamRule {
+                    event: None,
+                    path: Some("$.text".into()),
+                    action: StreamAction::SetFinalText,
+                    equals: None,
+                },
+                StreamRule {
+                    event: None,
+                    path: Some("$.done".into()),
+                    action: StreamAction::Complete,
+                    equals: Some("true".into()),
+                },
+            ]
+        };
+        let client = advanced_client(
+            "empty stream",
+            AudioDelivery::RawAudio,
+            "audio/pcm",
+            AdvancedRecognition::RequestStream {
+                request: Box::new(stage(
+                    HttpMethod::Post,
+                    format!("http://{address}/asr"),
+                    HttpBody::RawAudio,
+                )),
+                stream: StreamResponse { format, rules },
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let audio = audio_file(&directory, "empty.pcm", b"silent audio");
+        let transcription = client
+            .transcribe(&CancellationToken::new(), &audio)
+            .await
+            .unwrap();
+        assert_eq!(transcription.text, "");
+        server.await.unwrap();
+    }
+}
+
+fn no_speech_stream_rules() -> Vec<StreamRule> {
+    vec![
+        StreamRule {
+            event: None,
+            path: Some("$.delta".into()),
+            action: StreamAction::AppendDelta,
+            equals: None,
+        },
+        StreamRule {
+            event: None,
+            path: Some("$.code".into()),
+            action: StreamAction::Fail,
+            equals: None,
+        },
+        StreamRule {
+            event: None,
+            path: Some("$.done".into()),
+            action: StreamAction::Complete,
+            equals: Some("true".into()),
+        },
+    ]
+}
+
+fn frame_stream_json(format: StreamFormat, json: &str) -> String {
+    match format {
+        StreamFormat::Sse => format!("data: {json}\n\n"),
+        StreamFormat::Ndjson => format!("{json}\n"),
+        StreamFormat::JsonChunks => json.into(),
+    }
+}
+
+#[tokio::test]
+async fn no_words_streams_stop_before_trailing_events_and_transport_eof() {
+    for format in [
+        StreamFormat::Sse,
+        StreamFormat::Ndjson,
+        StreamFormat::JsonChunks,
+    ] {
+        for same_chunk in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release_server, server_released) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                read_request(&mut connection).await;
+                let recognition = [
+                    frame_stream_json(format, r#"{"delta":"provisional text"}"#),
+                    frame_stream_json(format, r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#),
+                ]
+                .concat();
+                let trailing = [
+                    frame_stream_json(format, r#"{"done":true}"#),
+                    frame_stream_json(format, r#"{"delta":"must not be delivered"}"#),
+                ]
+                .concat();
+                let chunks = if same_chunk {
+                    vec![recognition + &trailing]
+                } else {
+                    vec![recognition, trailing]
+                };
+                let mut wire =
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        .to_vec();
+                for chunk in chunks {
+                    wire.extend_from_slice(format!("{:X}\r\n{chunk}\r\n", chunk.len()).as_bytes());
+                }
+                connection.write_all(&wire).await.unwrap();
+                // Deliberately keep the HTTP response open. The terminal
+                // no-speech event must finish recognition without reading EOF.
+                let _ = server_released.await;
+            });
+            let client = advanced_client(
+                "terminal no speech stream",
+                AudioDelivery::RawAudio,
+                "audio/pcm",
+                AdvancedRecognition::RequestStream {
+                    request: Box::new(stage(
+                        HttpMethod::Post,
+                        format!("http://{address}/asr"),
+                        HttpBody::RawAudio,
+                    )),
+                    stream: StreamResponse {
+                        format,
+                        rules: no_speech_stream_rules(),
+                    },
+                },
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let audio = audio_file(&directory, "empty.pcm", b"silent audio");
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.transcribe(&CancellationToken::new(), &audio),
+            )
+            .await;
+            let _ = release_server.send(());
+            server.await.unwrap();
+            let transcription = result
+                .expect("no-speech result waited for HTTP EOF")
+                .unwrap();
+            assert_eq!(transcription.text, "");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_stream_completion_still_rejects_later_actions() {
+    for format in [
+        StreamFormat::Sse,
+        StreamFormat::Ndjson,
+        StreamFormat::JsonChunks,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            read_request(&mut connection).await;
+            let body = [
+                frame_stream_json(format, r#"{"done":true}"#),
+                frame_stream_json(format, r#"{"delta":"invalid late text"}"#),
+            ]
+            .concat();
+            write_response(&mut connection, "200 OK", &[], body.as_bytes()).await;
+        });
+        let client = advanced_client(
+            "strict stream completion",
+            AudioDelivery::RawAudio,
+            "audio/pcm",
+            AdvancedRecognition::RequestStream {
+                request: Box::new(stage(
+                    HttpMethod::Post,
+                    format!("http://{address}/asr"),
+                    HttpBody::RawAudio,
+                )),
+                stream: StreamResponse {
+                    format,
+                    rules: no_speech_stream_rules(),
+                },
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let audio = audio_file(&directory, "audio.pcm", b"audio");
+        assert!(matches!(
+            client.transcribe(&CancellationToken::new(), &audio).await,
+            Err(AdvancedAudioError::Accumulator(
+                dictate_core::advanced_audio::accumulator::TranscriptAccumulatorError::ActionAfterComplete {
+                    action: "append_delta"
+                }
+            ))
+        ));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn async_empty_results_stop_recognition_but_not_upload_validation() {
+    for phase in [
+        "submit",
+        "poll",
+        "poll-failure",
+        "result",
+        "empty",
+        "null",
+        "prepare",
+        "success-message",
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = match phase {
+                "submit" | "prepare" => vec![(
+                    "400 Bad Request",
+                    r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+                )],
+                "poll" => vec![
+                    ("200 OK", "{}"),
+                    (
+                        "400 Bad Request",
+                        r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+                    ),
+                ],
+                "poll-failure" => vec![
+                    ("200 OK", "{}"),
+                    (
+                        "200 OK",
+                        r#"{"state":"failed","code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+                    ),
+                ],
+                "result" => vec![
+                    ("200 OK", "{}"),
+                    ("200 OK", r#"{"state":"completed"}"#),
+                    (
+                        "400 Bad Request",
+                        r#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+                    ),
+                ],
+                "empty" => vec![
+                    ("200 OK", "{}"),
+                    ("200 OK", r#"{"state":"completed","text":" \n"}"#),
+                ],
+                "null" => vec![
+                    ("200 OK", "{}"),
+                    ("200 OK", r#"{"state":"completed","text":null}"#),
+                ],
+                "success-message" => vec![
+                    ("200 OK", "{}"),
+                    (
+                        "200 OK",
+                        r#"{"state":"completed","message":"ASR_RESPONSE_HAVE_NO_WORDS","text":"recognized words"}"#,
+                    ),
+                ],
+                _ => unreachable!(),
+            };
+            for (status, body) in responses {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                read_request(&mut connection).await;
+                write_response(&mut connection, status, &[], body.as_bytes()).await;
+            }
+        });
+        let client = advanced_client(
+            "empty async",
+            AudioDelivery::RawAudio,
+            "audio/pcm",
+            AdvancedRecognition::AsyncPoll {
+                prepare: (phase == "prepare").then(|| {
+                    Box::new(stage(
+                        HttpMethod::Get,
+                        format!("http://{address}/prepare"),
+                        HttpBody::None,
+                    ))
+                }),
+                submit: Box::new(stage(
+                    HttpMethod::Post,
+                    format!("http://{address}/asr"),
+                    HttpBody::RawAudio,
+                )),
+                poll: Some(Box::new(poll_stage(
+                    stage(
+                        HttpMethod::Get,
+                        format!("http://{address}/poll"),
+                        HttpBody::None,
+                    ),
+                    100,
+                    500,
+                ))),
+                result_steps: if ["result", "poll", "poll-failure", "submit"].contains(&phase) {
+                    vec![stage(
+                        HttpMethod::Get,
+                        format!("http://{address}/result"),
+                        HttpBody::None,
+                    )]
+                } else {
+                    vec![]
+                },
+                final_text: ResponseExtractor::JsonPath {
+                    path: "$.text".into(),
+                },
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let audio = audio_file(&directory, "empty.pcm", b"silent audio");
+        let result = client.transcribe(&CancellationToken::new(), &audio).await;
+        if phase == "prepare" {
+            assert!(result.is_err());
+        } else if phase == "success-message" {
+            assert_eq!(result.unwrap().text, "recognized words");
+        } else {
+            assert_eq!(result.unwrap().text, "", "{phase}");
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn no_words_still_succeeds_when_400_is_an_accepted_status() {
+    for mode in ["request", "stream", "async"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            read_request(&mut connection).await;
+            write_response(
+                &mut connection,
+                "400 Bad Request",
+                &[],
+                br#"{"code":"ASR_RESPONSE_HAVE_NO_WORDS"}"#,
+            )
+            .await;
+        });
+        let mut request = stage(
+            HttpMethod::Post,
+            format!("http://{address}/asr"),
+            HttpBody::RawAudio,
+        );
+        request.accepted_statuses.push(400);
+        request.captures.push(Capture {
+            id: "job".into(),
+            from: ResponseExtractor::Header {
+                name: "x-job-id".into(),
+            },
+            sensitive: false,
+        });
+        let final_text = ResponseExtractor::JsonPath {
+            path: "$.text".into(),
+        };
+        let recognition = match mode {
+            "request" => AdvancedRecognition::Request {
+                request: Box::new(request),
+                final_text,
+            },
+            "stream" => AdvancedRecognition::RequestStream {
+                request: Box::new(request),
+                stream: StreamResponse {
+                    format: StreamFormat::Sse,
+                    rules: stream_rules_for_sse(),
+                },
+            },
+            "async" => AdvancedRecognition::AsyncPoll {
+                prepare: None,
+                submit: Box::new(request),
+                poll: None,
+                result_steps: vec![],
+                final_text,
+            },
+            _ => unreachable!(),
+        };
+        let client = advanced_client(
+            "accepted no words",
+            AudioDelivery::RawAudio,
+            "audio/pcm",
+            recognition,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let audio = audio_file(&directory, "empty.pcm", b"silent audio");
+        assert_eq!(
+            client
+                .transcribe(&CancellationToken::new(), &audio)
+                .await
+                .unwrap()
+                .text,
+            ""
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn request_multipart_streams_audio_and_preserves_typed_parts() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

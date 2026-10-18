@@ -625,6 +625,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn realtime_accepts_empty_final_results_and_explicit_no_words_failures() {
+        for text in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(" \n"),
+        ] {
+            let realtime = workflow("ws://localhost".into());
+            let mut accumulator = TranscriptAccumulator::new();
+            accumulator.append_delta("provisional text").unwrap();
+            let mut raw = Vec::new();
+            process_incoming(
+                Message::Text(serde_json::json!({"event":"final", "text":text}).to_string()),
+                &realtime,
+                &mut accumulator,
+                &mut raw,
+            )
+            .unwrap();
+            process_incoming(
+                Message::Text(r#"{"event":"done"}"#.into()),
+                &realtime,
+                &mut accumulator,
+                &mut raw,
+            )
+            .unwrap();
+            assert_eq!(completed_transcription(accumulator, raw).unwrap().text, "");
+        }
+
+        let mut realtime = workflow("ws://localhost".into());
+        realtime.receive_rules.push(StreamRule {
+            event: Some("error".into()),
+            path: Some("$.code".into()),
+            action: StreamAction::Fail,
+            equals: None,
+        });
+        for (code, is_no_words) in [
+            ("ASR_RESPONSE_HAVE_NO_WORDS", true),
+            ("INVALID_API_KEY", false),
+        ] {
+            let mut accumulator = TranscriptAccumulator::new();
+            accumulator.append_delta("provisional text").unwrap();
+            let result = process_incoming(
+                Message::Text(serde_json::json!({"event":"error", "code":code}).to_string()),
+                &realtime,
+                &mut accumulator,
+                &mut Vec::new(),
+            );
+            assert_eq!(result.is_ok(), is_no_words);
+            if is_no_words {
+                assert_eq!(accumulator.into_final_text().unwrap(), "");
+            }
+        }
+    }
+
     struct FixedChunkSource {
         chunks: VecDeque<AudioChunk>,
         requires_pacing: bool,

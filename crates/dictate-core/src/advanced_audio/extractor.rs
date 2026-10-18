@@ -110,6 +110,24 @@ pub fn extract(
     Ok(value)
 }
 
+/// Extracts transcript text, where an explicit JSON null means no speech.
+/// Captures and protocol conditions continue to use the strict scalar extractor.
+pub(crate) fn extract_transcript(
+    response: &ResponseData<'_>,
+    extractor: &ResponseExtractor,
+) -> Result<String, ResponseExtractionError> {
+    let ResponseExtractor::JsonPath { path } = extractor else {
+        return extract(response, extractor);
+    };
+    ensure_body_size(response.body)?;
+    let path = crate::jsonpath::parse_text_path(path)
+        .map_err(|_| ResponseExtractionError::InvalidJsonPath)?;
+    let value = crate::jsonpath::extract_transcript_from_response(response.body, &path)
+        .map_err(map_json_error)?;
+    ensure_value_size(&value)?;
+    Ok(value)
+}
+
 /// Extracts a stage's captures into the template-ready capture map.
 ///
 /// Capture values are returned to the caller because later stages may need
@@ -243,6 +261,24 @@ mod tests {
                 .unwrap(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn transcript_null_is_empty_but_captures_and_protocol_values_remain_strict() {
+        let headers = HeaderMap::new();
+        let response = response(200, &headers, br#"{"text":null}"#);
+        let selector = ResponseExtractor::JsonPath {
+            path: "$.text".into(),
+        };
+        assert_eq!(extract_transcript(&response, &selector).unwrap(), "");
+        assert!(matches!(
+            extract(&response, &selector),
+            Err(ResponseExtractionError::JsonPathInvalidType { kind: "null" })
+        ));
+        for body in [br#"{}"#.as_slice(), br#"{"text":[]}"#, br#"{"text":{}}"#] {
+            let response = ResponseData::new(200, &headers, body);
+            assert!(extract_transcript(&response, &selector).is_err());
         }
     }
 

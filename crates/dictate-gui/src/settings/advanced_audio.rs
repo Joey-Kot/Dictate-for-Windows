@@ -304,7 +304,7 @@ pub(super) struct Page {
 
 enum ValidationState {
     NotValidated,
-    Valid(WorkflowSummary),
+    Valid(Box<WorkflowSummary>),
     Invalid(String),
 }
 
@@ -2052,10 +2052,10 @@ fn sync_dynamic_multi_select(state: &mut SettingsState) {
         .options
         .iter()
         .enumerate()
-        .filter_map(|(index, option)| {
-            (unsafe { SendMessageW(list, LB_GETSEL, Some(WPARAM(index)), None).0 > 0 })
-                .then(|| option.value.clone())
+        .filter(|(index, _)| unsafe {
+            SendMessageW(list, LB_GETSEL, Some(WPARAM(*index)), None).0 > 0
         })
+        .map(|(_, option)| option.value.clone())
         .collect::<Vec<_>>();
     let default = definition
         .default
@@ -3690,7 +3690,7 @@ fn validate_workflow_draft(state: &mut SettingsState) {
         Ok(Some(workflow_summary(&workflow, &remote_audio)))
     });
     state.advanced_audio.validation = match validation {
-        Ok(Some(summary)) => ValidationState::Valid(summary),
+        Ok(Some(summary)) => ValidationState::Valid(Box::new(summary)),
         Ok(None) => ValidationState::NotValidated,
         Err(error) => ValidationState::Invalid(error),
     };

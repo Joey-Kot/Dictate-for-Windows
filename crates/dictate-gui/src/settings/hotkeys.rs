@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const KEYS: [&str; 3] = ["START_KEY", "PAUSE_KEY", "CANCEL_OR_RETRY_KEY"];
+pub use crate::hotkey_validation::{KEYS, validate_draft};
 const SUBCLASS: usize = 0x484b;
 const INPUT: u32 = WM_APP + 80;
 const NAVIGATE: u32 = WM_APP + 81;
@@ -25,7 +25,7 @@ struct Field {
     language: Language,
     status: HWND,
     context: Vec<(String, String)>,
-    hook: bool,
+    optional: bool,
 }
 
 struct Hook {
@@ -49,6 +49,25 @@ impl Default for Hook {
 thread_local! { static HOOK: RefCell<Hook> = RefCell::new(Hook::default()); }
 
 pub fn attach(hwnd: HWND, value: String, language: Language, status: HWND) -> Result<(), String> {
+    attach_field(hwnd, value, language, status, false)
+}
+
+pub fn attach_optional(
+    hwnd: HWND,
+    value: String,
+    language: Language,
+    status: HWND,
+) -> Result<(), String> {
+    attach_field(hwnd, value, language, status, true)
+}
+
+fn attach_field(
+    hwnd: HWND,
+    value: String,
+    language: Language,
+    status: HWND,
+    optional: bool,
+) -> Result<(), String> {
     let field = Box::new(Field {
         value,
         recorder: Recorder::default(),
@@ -56,7 +75,7 @@ pub fn attach(hwnd: HWND, value: String, language: Language, status: HWND) -> Re
         language,
         status,
         context: Vec::new(),
-        hook: true,
+        optional,
     });
     let pointer = Box::into_raw(field);
     if !unsafe { SetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, pointer as usize) }.as_bool() {
@@ -72,6 +91,21 @@ pub fn attach(hwnd: HWND, value: String, language: Language, status: HWND) -> Re
     Ok(())
 }
 
+/// Clear only optional fields; the separate button keeps Delete available as a shortcut.
+pub fn clear(hwnd: HWND) {
+    let mut data = 0;
+    if unsafe { GetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, Some(&mut data)) }.as_bool() {
+        let field = unsafe { &mut *(data as *mut Field) };
+        if field.optional {
+            deactivate();
+            field.value.clear();
+            field.recorder = Recorder::default();
+            restore(hwnd, field);
+            check_duplicates(hwnd, field);
+        }
+    }
+}
+
 pub fn value(hwnd: HWND) -> Option<String> {
     let mut data = 0;
     if unsafe { GetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, Some(&mut data)) }.as_bool() {
@@ -81,12 +115,12 @@ pub fn value(hwnd: HWND) -> Option<String> {
     }
 }
 
-pub fn set_context(hwnd: HWND, context: Vec<(String, String)>, hook: bool) {
+pub fn set_context(hwnd: HWND, context: Vec<(String, String)>) {
     let mut data = 0;
     if unsafe { GetWindowSubclass(hwnd, Some(field_proc), SUBCLASS, Some(&mut data)) }.as_bool() {
         let field = unsafe { &mut *(data as *mut Field) };
         field.context = context;
-        field.hook = hook;
+        check_duplicates(hwnd, field);
     }
 }
 
@@ -270,7 +304,7 @@ fn check_duplicates(hwnd: HWND, field: &Field) {
     if let Ok(current) = parse_hotkey(&field.value) {
         for (name, spec) in &field.context {
             if let Ok(other) = parse_hotkey(spec)
-                && (current == other || (field.hook && current.virtual_key == other.virtual_key))
+                && current == other
             {
                 set_text(
                     field.status,
@@ -296,6 +330,8 @@ fn check_duplicates(hwnd: HWND, field: &Field) {
         };
         if let Some(parsed) = text.and_then(|text| parse_hotkey(&text).ok()) {
             for (previous, key) in &bindings {
+                // This loop only compares the three audio fields. Rewrite
+                // conflicts were already checked against field.context above.
                 if *key == parsed {
                     set_text(
                         field.status,
@@ -312,7 +348,14 @@ fn check_duplicates(hwnd: HWND, field: &Field) {
             bindings.push((spec.key, parsed));
         }
     }
-    set_text(field.status, field.language.text("hotkey_help"));
+    set_text(
+        field.status,
+        field.language.text(if field.optional {
+            "hotkey_optional_help"
+        } else {
+            "hotkey_help"
+        }),
+    );
 }
 
 unsafe extern "system" fn field_proc(

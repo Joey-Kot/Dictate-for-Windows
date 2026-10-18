@@ -31,4 +31,8 @@ cargo clippy --target x86_64-pc-windows-gnu -p dictate-gui --features native-gui
 10. 验证非美式键盘布局、Num Lock 状态及固件 Fn 转换。配置按 Windows 上报的虚拟键识别，符号标签采用美式名称；Fn 本身通常不独立上报。
 11. `RegisterHotKey` 模式下使用被其他程序占用的组合，确认应用设置时显示注册失败，没有将录入成功当作生效成功。
 
-本次修改保留原有低级钩子的修饰键匹配语义：要求配置中的修饰键按下，但允许额外修饰键。它与 `RegisterHotKey` 的匹配行为不同。
+以上历史版本曾允许额外修饰键。当前实现已改为完整组合键精确匹配：音频、Prompt 和 Menu 仅在主键与 Ctrl/Shift/Alt/Win 修饰键集合全部一致时触发，只有完整组合键重复才判冲突。`Ctrl+Q`、`Shift+Q`、`Alt+Q` 可分别绑定；未绑定的 `Ctrl+Shift+Q` 不触发这些操作。
+
+本次回归覆盖同主键的全部 16 种修饰键集合、不同动作 ID 的独立派发、多按或少按修饰键不匹配、长按期间变更修饰键不重复派发，以及两个设置保存入口的同主键绑定与重复组合检查。Alt 菜单遮蔽、录入暂停、注入事件跳过和 RegisterHotKey 的 Rewrite 复制保护继续保留。实际 Windows 键盘操作仍需实机回测。
+
+本次验证通过：工作区 439 项自动测试、`cargo fmt --all --check`、Linux 与 Windows 目标的全工作区 Clippy（`-D warnings`），以及启用静态 FFmpeg 的 Windows GUI／CLI 发布版编译和链接。
