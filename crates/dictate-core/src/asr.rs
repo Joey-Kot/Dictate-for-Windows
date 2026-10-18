@@ -16,6 +16,37 @@ use crate::jsonpath;
 const USER_AGENT: &str = "dictate-client/1.0";
 const ASR_RESPONSE_HAVE_NO_WORDS: &str = "ASR_RESPONSE_HAVE_NO_WORDS";
 
+/// `Content-Type` for the Legacy Audio API upload part.
+///
+/// The part must carry one. Multipart parsers classify a part as text when it has no
+/// `Content-Type` and a charset-less `Content-Disposition` (n8n's parser does exactly
+/// that), decode the audio as UTF-8 and corrupt it irreversibly before the ASR engine
+/// ever sees it -- the caller gets a 500/502 "failed to decode audio" that looks like a
+/// server fault. The prepared file's extension is the container the user configured, so
+/// it is also the honest media type to advertise.
+fn audio_content_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("opus" | "ogg" | "oga" | "spx" | "speex") => "audio/ogg",
+        Some("mp3" | "mp2" | "mpeg" | "mpg") => "audio/mpeg",
+        Some("wav" | "wave") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("m4a" | "mp4" | "aac" | "mov") => "audio/mp4",
+        Some("amr") => "audio/amr",
+        Some("wma" | "asf") => "audio/x-ms-wma",
+        Some("aiff" | "aif") => "audio/aiff",
+        Some("wv") => "audio/x-wavpack",
+        Some("mka") => "audio/x-matroska",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("flv") => "video/x-flv",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Transcription {
     pub text: String,
@@ -476,7 +507,10 @@ impl AsrClient {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "audio".into());
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let part = Part::stream(body).file_name(file_name);
+        let part = Part::stream(body)
+            .file_name(file_name)
+            .mime_str(audio_content_type(file_path))
+            .map_err(AsrError::Client)?;
         let mut form = Form::new().part("file", part);
         for (key, value) in self.request_fields() {
             form = form.text(key, value);
@@ -1004,5 +1038,98 @@ mod tests {
 
         assert!(error.is_retry_exhausted());
         assert!(error.last_response().is_empty());
+    }
+
+    #[test]
+    fn upload_content_type_follows_the_prepared_container() {
+        use std::path::Path;
+        for (name, expected) in [
+            ("RecordTemp_1.opus", "audio/ogg"),
+            ("a.ogg", "audio/ogg"),
+            ("a.mp3", "audio/mpeg"),
+            ("a.MP3", "audio/mpeg"),
+            ("a.wav", "audio/wav"),
+            ("a.flac", "audio/flac"),
+            ("a.m4a", "audio/mp4"),
+            ("a.amr", "audio/amr"),
+            ("a.wma", "audio/x-ms-wma"),
+            ("a.mkv", "video/x-matroska"),
+            ("audio", "application/octet-stream"),
+            ("a.unknown", "application/octet-stream"),
+        ] {
+            assert_eq!(
+                super::audio_content_type(Path::new(name)),
+                expected,
+                "wrong content type for {name}"
+            );
+        }
+    }
+
+    /// A part without `Content-Type` is classified as text by servers such as n8n, which
+    /// then decode the audio as UTF-8 and fail with "could not decode audio". Assert the
+    /// header is really on the wire, not just in the helper above.
+    #[tokio::test]
+    async fn upload_part_carries_a_content_type_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (file_name, expected) in [
+            ("audio.opus", "content-type: audio/ogg"),
+            ("audio.mp3", "content-type: audio/mpeg"),
+            ("audio", "content-type: application/octet-stream"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|s| s.strip_prefix("content-length: "))
+                            .and_then(|s| s.trim().parse::<usize>().ok());
+                        if length.is_some_and(|n| request.len() >= end + 4 + n)
+                            || request.ends_with(b"0\r\n\r\n")
+                        {
+                            break;
+                        }
+                    }
+                }
+                let body = r#"{"text":"done"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                request
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let audio = dir.path().join(file_name);
+            std::fs::write(&audio, b"audio").unwrap();
+            let client = super::AsrClient::new(crate::Config {
+                api_endpoint: format!("http://{address}"),
+                max_retry: 1,
+                retry_base_delay: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+            client
+                .transcribe_with_retry_prepare(
+                    &tokio_util::sync::CancellationToken::new(),
+                    &audio,
+                    || async { Ok(()) },
+                )
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&server.await.unwrap()).to_lowercase();
+            assert!(
+                request.contains(expected),
+                "upload of {file_name} must carry '{expected}', got: {request}"
+            );
+        }
     }
 }
