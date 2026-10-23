@@ -20,10 +20,10 @@ LAME_SHA256="ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e"
 OPENCORE_AMR_VERSION="${OPENCORE_AMR_VERSION:-0.1.6}"
 SPEEX_VERSION="${SPEEX_VERSION:-1.2.1}"
 VO_AMRWBENC_VERSION="${VO_AMRWBENC_VERSION:-0.1.3}"
-FFMPEG_VERSION="8.1"
+FFMPEG_VERSION="8.1.3"
 FFMPEG_ARCHIVE="ffmpeg-$FFMPEG_VERSION.tar.xz"
 FFMPEG_URL="https://ffmpeg.org/releases/$FFMPEG_ARCHIVE"
-FFMPEG_SHA256="b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a"
+FFMPEG_SHA256="7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3"
 
 mkdir -p "$BUILD_DIR" "$PREFIX"
 
@@ -106,6 +106,7 @@ build_autotools "$BUILD_DIR/vo-amrwbenc-$VO_AMRWBENC_VERSION"
 fetch_tarball "$FFMPEG_URL" "$BUILD_DIR/$FFMPEG_ARCHIVE"
 printf '%s  %s\n' "$FFMPEG_SHA256" "$BUILD_DIR/$FFMPEG_ARCHIVE" | sha256sum --check --strict
 extract_once "$BUILD_DIR/$FFMPEG_ARCHIVE" "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION"
+"$ROOT_DIR/scripts/apply-ffmpeg-security-patch.sh" "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION"
 cd "$BUILD_DIR/ffmpeg-$FFMPEG_VERSION"
 
 # These are configure component names, not filename extensions or runtime aliases.

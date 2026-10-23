@@ -26,18 +26,24 @@ pub enum Provider {
     Google,
     #[serde(rename = "google_vertex_ai")]
     VertexAi,
-    #[serde(rename = "xai_grok")]
-    Xai,
+    #[serde(rename = "xai_grok_responses")]
+    XaiResponses,
+    #[serde(rename = "xai_grok_chat_completions")]
+    XaiChatCompletions,
     #[serde(rename = "alibaba_qwen_text")]
     QwenText,
     #[serde(rename = "alibaba_qwen_multimodal")]
     QwenMultimodal,
-    #[serde(rename = "moonshot_ai_kimi")]
-    Kimi,
+    #[serde(rename = "moonshot_kimi_responses")]
+    KimiResponses,
+    #[serde(rename = "moonshot_kimi_chat_completions")]
+    KimiChatCompletions,
     #[serde(rename = "z_ai_glm")]
     Glm,
-    #[serde(rename = "deepseek_deepseek")]
-    Deepseek,
+    #[serde(rename = "deepseek_responses")]
+    DeepseekResponses,
+    #[serde(rename = "deepseek_chat_completions")]
+    DeepseekChatCompletions,
     #[serde(rename = "volcengine_ark_chat_completions")]
     VolcengineArkChatCompletions,
     #[serde(rename = "volcengine_ark_responses")]
@@ -68,7 +74,7 @@ enum WireFormat {
 }
 
 impl Provider {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 25] = [
         Self::OpenaiCompatible,
         Self::OpenaiResponses,
         Self::OpenaiCompletions,
@@ -77,12 +83,15 @@ impl Provider {
         Self::Anthropic,
         Self::Google,
         Self::VertexAi,
-        Self::Xai,
+        Self::XaiResponses,
+        Self::XaiChatCompletions,
         Self::QwenText,
         Self::QwenMultimodal,
-        Self::Kimi,
+        Self::KimiResponses,
+        Self::KimiChatCompletions,
         Self::Glm,
-        Self::Deepseek,
+        Self::DeepseekResponses,
+        Self::DeepseekChatCompletions,
         Self::VolcengineArkChatCompletions,
         Self::VolcengineArkResponses,
         Self::BaiduQianfan,
@@ -103,12 +112,15 @@ impl Provider {
             Self::Anthropic => "Anthropic / Claude",
             Self::Google => "Google / Gemini",
             Self::VertexAi => "Google / Vertex AI",
-            Self::Xai => "xAI / Grok",
+            Self::XaiResponses => "xAI Grok / Responses",
+            Self::XaiChatCompletions => "xAI Grok / Chat Completions",
             Self::QwenText => "Alibaba / Qwen Text",
             Self::QwenMultimodal => "Alibaba / Qwen Multimodal",
-            Self::Kimi => "Moonshot AI / Kimi",
+            Self::KimiResponses => "Moonshot Kimi / Responses",
+            Self::KimiChatCompletions => "Moonshot Kimi / Chat Completions",
             Self::Glm => "Z.AI / GLM",
-            Self::Deepseek => "DeepSeek / DeepSeek",
+            Self::DeepseekResponses => "DeepSeek / Responses",
+            Self::DeepseekChatCompletions => "DeepSeek / Chat Completions",
             Self::VolcengineArkChatCompletions => "Volcengine / Ark / Chat Completions",
             Self::VolcengineArkResponses => "Volcengine / Ark / Responses",
             Self::BaiduQianfan => "Baidu / Qianfan",
@@ -122,9 +134,12 @@ impl Provider {
 
     const fn wire_format(self) -> WireFormat {
         match self {
-            Self::OpenaiResponses | Self::AzureOpenaiResponses | Self::VolcengineArkResponses => {
-                WireFormat::OpenaiResponses
-            }
+            Self::OpenaiResponses
+            | Self::AzureOpenaiResponses
+            | Self::XaiResponses
+            | Self::KimiResponses
+            | Self::DeepseekResponses
+            | Self::VolcengineArkResponses => WireFormat::OpenaiResponses,
             Self::Google | Self::VertexAi => WireFormat::Gemini,
             Self::Anthropic => WireFormat::Anthropic,
             Self::QwenText => WireFormat::DashscopeText,
@@ -518,7 +533,7 @@ fn endpoint(base: &str, provider: Provider, model: &str) -> Result<reqwest::Url,
         };
         if path.is_empty() {
             path = match provider {
-                Provider::Deepseek => "",
+                Provider::DeepseekResponses | Provider::DeepseekChatCompletions => "",
                 Provider::QwenText | Provider::QwenMultimodal => "/api/v1",
                 Provider::Glm => "/api/paas/v4",
                 Provider::AzureOpenaiResponses | Provider::AzureOpenaiChatCompletions => {
@@ -1299,7 +1314,16 @@ mod tests {
             ),
             (Provider::Google, "google_gemini", "Google / Gemini"),
             (Provider::VertexAi, "google_vertex_ai", "Google / Vertex AI"),
-            (Provider::Xai, "xai_grok", "xAI / Grok"),
+            (
+                Provider::XaiResponses,
+                "xai_grok_responses",
+                "xAI Grok / Responses",
+            ),
+            (
+                Provider::XaiChatCompletions,
+                "xai_grok_chat_completions",
+                "xAI Grok / Chat Completions",
+            ),
             (
                 Provider::QwenText,
                 "alibaba_qwen_text",
@@ -1310,12 +1334,26 @@ mod tests {
                 "alibaba_qwen_multimodal",
                 "Alibaba / Qwen Multimodal",
             ),
-            (Provider::Kimi, "moonshot_ai_kimi", "Moonshot AI / Kimi"),
+            (
+                Provider::KimiResponses,
+                "moonshot_kimi_responses",
+                "Moonshot Kimi / Responses",
+            ),
+            (
+                Provider::KimiChatCompletions,
+                "moonshot_kimi_chat_completions",
+                "Moonshot Kimi / Chat Completions",
+            ),
             (Provider::Glm, "z_ai_glm", "Z.AI / GLM"),
             (
-                Provider::Deepseek,
-                "deepseek_deepseek",
-                "DeepSeek / DeepSeek",
+                Provider::DeepseekResponses,
+                "deepseek_responses",
+                "DeepSeek / Responses",
+            ),
+            (
+                Provider::DeepseekChatCompletions,
+                "deepseek_chat_completions",
+                "DeepSeek / Chat Completions",
             ),
             (
                 Provider::VolcengineArkChatCompletions,
@@ -1366,6 +1404,13 @@ mod tests {
         assert!(
             serde_json::from_value::<Provider>(Value::String("openai_compatible".into())).is_err()
         );
+        assert!(serde_json::from_value::<Provider>(Value::String("xai_grok".into())).is_err());
+        assert!(
+            serde_json::from_value::<Provider>(Value::String("moonshot_ai_kimi".into())).is_err()
+        );
+        assert!(
+            serde_json::from_value::<Provider>(Value::String("deepseek_deepseek".into())).is_err()
+        );
     }
 
     #[test]
@@ -1388,7 +1433,12 @@ mod tests {
                 "/v1beta/models/override:generateContent",
                 "x-goog-api-key",
             ),
-            (Provider::Deepseek, "/chat/completions", "Authorization"),
+            (Provider::DeepseekResponses, "/responses", "Authorization"),
+            (
+                Provider::DeepseekChatCompletions,
+                "/chat/completions",
+                "Authorization",
+            ),
             (
                 Provider::QwenText,
                 "/api/v1/services/aigc/text-generation/generation",
@@ -1419,7 +1469,12 @@ mod tests {
                 "/v1/projects/project/locations/global/publishers/google/models/override:generateContent",
                 "Authorization",
             ),
-            (Provider::Kimi, "/v1/chat/completions", "Authorization"),
+            (Provider::KimiResponses, "/v1/responses", "Authorization"),
+            (
+                Provider::KimiChatCompletions,
+                "/v1/chat/completions",
+                "Authorization",
+            ),
             (
                 Provider::VolcengineArkChatCompletions,
                 "/api/v3/chat/completions",
@@ -1446,7 +1501,12 @@ mod tests {
                 "Authorization",
             ),
             (Provider::Mistral, "/v1/chat/completions", "Authorization"),
-            (Provider::Xai, "/v1/chat/completions", "Authorization"),
+            (Provider::XaiResponses, "/v1/responses", "Authorization"),
+            (
+                Provider::XaiChatCompletions,
+                "/v1/chat/completions",
+                "Authorization",
+            ),
             (
                 Provider::Groq,
                 "/openai/v1/chat/completions",
@@ -1480,6 +1540,230 @@ mod tests {
             assert_eq!(request.body["metadata"]["source"], "test");
             assert!(request.body.to_string().contains("hello"));
             assert!(request.body.to_string().contains("Translate"));
+        }
+    }
+
+    #[test]
+    fn xai_apis_use_distinct_native_requests_and_visible_responses() {
+        let prompt = RewritePrompt {
+            prompt: "Translate".into(),
+            ..Default::default()
+        };
+        for (provider, suffix, payload, response) in [
+            (
+                Provider::XaiResponses,
+                "/responses",
+                json!({"model":"grok-test","instructions":"Translate","input":[{"role":"user","content":"hello"}]}),
+                json!({"status":"completed","output":[
+                    {"type":"reasoning","summary":[{"type":"summary_text","text":"hidden"}]},
+                    {"type":"message","content":[{"type":"output_text","text":"你好"}]}
+                ]}),
+            ),
+            (
+                Provider::XaiChatCompletions,
+                "/chat/completions",
+                json!({"model":"grok-test","messages":[{"role":"system","content":"Translate"},{"role":"user","content":"hello"}]}),
+                json!({"choices":[{"message":{"content":"你好","reasoning_content":"hidden"},"finish_reason":"stop"}]}),
+            ),
+        ] {
+            for base_url in [
+                "https://api.x.ai".to_owned(),
+                "https://api.x.ai/v1/".to_owned(),
+                format!("https://api.x.ai/v1{suffix}"),
+            ] {
+                let api = RewriteConfig {
+                    base_url,
+                    model: "grok-test".into(),
+                    ..config(provider)
+                };
+                let request = build_request(&api, &prompt, "hello").unwrap();
+                assert_eq!(request.url.as_str(), format!("https://api.x.ai/v1{suffix}"));
+                assert_eq!(
+                    request.headers,
+                    vec![("Authorization", "Bearer key".into())]
+                );
+                assert_eq!(request.body, payload);
+            }
+            assert_eq!(parse_text(provider, &response).unwrap(), "你好");
+        }
+        let stream = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hidden\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"draft\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}]}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(
+            parse_stream(Provider::XaiResponses, stream).unwrap(),
+            "你好"
+        );
+        assert!(
+            parse_stream(
+                Provider::XaiResponses,
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kimi_apis_use_native_requests_and_return_only_visible_final_text() {
+        for (provider, suffix, extra, payload, response) in [
+            (
+                Provider::KimiResponses,
+                "/responses",
+                r#"{"tools":[{"type":"web_search"}],"reasoning":{"effort":"low"}}"#,
+                json!({
+                    "model":"kimi-k3","instructions":"Translate",
+                    "input":[{"role":"user","content":"hello"}],
+                    "tools":[{"type":"web_search"}],"reasoning":{"effort":"low"}
+                }),
+                json!({"status":"completed","output":[
+                    {"type":"web_search_call","status":"completed","action":{"type":"search","query":"news"}},
+                    {"type":"reasoning","summary":[{"type":"summary_text","text":"hidden"}]},
+                    {"type":"message","content":[{"type":"output_text","text":"你好"}]}
+                ]}),
+            ),
+            (
+                Provider::KimiChatCompletions,
+                "/chat/completions",
+                r#"{"reasoning_effort":"low"}"#,
+                json!({
+                    "model":"kimi-k3",
+                    "messages":[{"role":"system","content":"Translate"},{"role":"user","content":"hello"}],
+                    "reasoning_effort":"low"
+                }),
+                json!({"choices":[{"message":{"content":"你好","reasoning_content":"hidden"},"finish_reason":"stop"}]}),
+            ),
+        ] {
+            let prompt = RewritePrompt {
+                prompt: "Translate".into(),
+                extra_config: extra.into(),
+                ..Default::default()
+            };
+            for base_url in [
+                "https://api.moonshot.ai".to_owned(),
+                "https://api.moonshot.ai/v1/".to_owned(),
+                format!("https://api.moonshot.ai/v1{suffix}"),
+            ] {
+                let request = build_request(
+                    &RewriteConfig {
+                        base_url,
+                        model: "kimi-k3".into(),
+                        ..config(provider)
+                    },
+                    &prompt,
+                    "hello",
+                )
+                .unwrap();
+                assert_eq!(
+                    request.url.as_str(),
+                    format!("https://api.moonshot.ai/v1{suffix}")
+                );
+                assert_eq!(
+                    request.headers,
+                    vec![("Authorization", "Bearer key".into())]
+                );
+                assert_eq!(request.body, payload);
+            }
+            assert_eq!(
+                endpoint("https://gateway.example/proxy/v1/", provider, "kimi-k3")
+                    .unwrap()
+                    .as_str(),
+                format!("https://gateway.example/proxy/v1{suffix}")
+            );
+            assert_eq!(parse_text(provider, &response).unwrap(), "你好");
+
+            let (events, completed) = if provider == Provider::KimiResponses {
+                (
+                    vec![
+                        json!({"type":"response.web_search_call.completed","sequence_number":1}),
+                        json!({"type":"response.reasoning_summary_text.delta","sequence_number":2,"delta":"hidden"}),
+                        json!({"type":"response.output_text.delta","sequence_number":3,"delta":"draft"}),
+                    ],
+                    json!({"type":"response.completed","sequence_number":4,"response":response}),
+                )
+            } else {
+                (
+                    vec![json!({"choices":[{"index":0,"delta":{"reasoning_content":"hidden"}}]})],
+                    json!({"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":"stop"}]}),
+                )
+            };
+            let mut stream: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            assert!(parse_stream(provider, &stream).is_err());
+            stream.push_str(&format!("data: {completed}\n\n"));
+            assert_eq!(parse_stream(provider, &stream).unwrap(), "你好");
+        }
+    }
+
+    #[test]
+    fn responses_reject_incomplete_and_failed_output() {
+        for provider in [Provider::KimiResponses, Provider::DeepseekResponses] {
+            for status in ["incomplete", "failed"] {
+                let response = json!({
+                    "status":status,
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]
+                });
+                assert!(parse_text(provider, &response).is_err());
+                let event = json!({"type":format!("response.{status}"),"response":response});
+                assert!(parse_stream(provider, &format!("data: {event}\n\n")).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_apis_preserve_endpoint_prefixes_and_use_distinct_payloads() {
+        let prompt = RewritePrompt {
+            prompt: "Translate".into(),
+            ..Default::default()
+        };
+        for (provider, suffix, payload, response) in [
+            (
+                Provider::DeepseekResponses,
+                "/responses",
+                json!({"model":"custom-model","instructions":"Translate","input":[{"role":"user","content":"hello"}]}),
+                json!({"status":"completed","output":[
+                    {"type":"reasoning","content":[{"type":"reasoning_text","text":"hidden"}]},
+                    {"type":"message","content":[{"type":"output_text","text":"你好"}]}
+                ]}),
+            ),
+            (
+                Provider::DeepseekChatCompletions,
+                "/chat/completions",
+                json!({"model":"custom-model","messages":[{"role":"system","content":"Translate"},{"role":"user","content":"hello"}]}),
+                json!({"choices":[{"message":{"content":"你好","reasoning_content":"hidden"},"finish_reason":"stop"}]}),
+            ),
+        ] {
+            for prefix in ["", "/v1", "/proxy/v1"] {
+                let base = format!("https://api.deepseek.com{prefix}");
+                for base_url in [base.clone(), format!("{base}/"), format!("{base}{suffix}")] {
+                    let api = RewriteConfig {
+                        base_url,
+                        model: "custom-model".into(),
+                        ..config(provider)
+                    };
+                    let request = build_request(&api, &prompt, "hello").unwrap();
+                    assert_eq!(request.url.as_str(), format!("{base}{suffix}"));
+                    assert_eq!(
+                        request.headers,
+                        vec![("Authorization", "Bearer key".into())]
+                    );
+                    assert_eq!(request.body, payload);
+                }
+            }
+            assert_eq!(parse_text(provider, &response).unwrap(), "你好");
+            if provider == Provider::DeepseekResponses {
+                let partial = concat!(
+                    "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"hidden\"}\n\n",
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"draft\"}\n\n",
+                );
+                assert!(parse_stream(provider, partial).is_err());
+                let completed = json!({"type":"response.completed","response":response});
+                let stream = format!("{partial}event: response.completed\ndata: {completed}\n\n");
+                assert_eq!(parse_stream(provider, &stream).unwrap(), "你好");
+            }
         }
     }
 
@@ -1608,10 +1892,10 @@ mod tests {
     fn completion_fixture(provider: Provider, reason: Value) -> (Value, String) {
         let (response, events) = match provider.wire_format() {
             WireFormat::OpenaiResponses => (
-                json!({"status":"completed","output_text":"rewritten"}),
+                json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"rewritten"}]}]}),
                 vec![
                     json!({"type":"response.output_text.delta","delta":"rewritten"}),
-                    json!({"type":"response.completed","response":{"status":"completed","output_text":"rewritten"}}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"rewritten"}]}]}}),
                 ],
             ),
             WireFormat::Anthropic => (
@@ -1705,17 +1989,17 @@ mod tests {
                 &["length", "content_filter", "tool_calls", "function_call"][..],
             ),
             (Provider::OpenaiCompletions, &["length"][..]),
-            (Provider::Kimi, &["length"][..]),
+            (Provider::KimiChatCompletions, &["length", "tool_calls"][..]),
             (Provider::VolcengineArkChatCompletions, &["length"][..]),
             (Provider::BaiduQianfan, &["length"][..]),
             (Provider::TencentTokenHub, &["length"][..]),
             (Provider::MinimaxChatCompletionV2, &["length"][..]),
             (Provider::Mistral, &["length"][..]),
-            (Provider::Xai, &["length"][..]),
+            (Provider::XaiChatCompletions, &["length"][..]),
             (Provider::Groq, &["length"][..]),
             (Provider::Cohere, &["length"][..]),
             (
-                Provider::Deepseek,
+                Provider::DeepseekChatCompletions,
                 &["length", "insufficient_system_resource", "aborted"][..],
             ),
             (Provider::QwenText, &["length"][..]),
