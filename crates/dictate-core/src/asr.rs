@@ -7,6 +7,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
@@ -18,24 +19,35 @@ const ASR_RESPONSE_HAVE_NO_WORDS: &str = "ASR_RESPONSE_HAVE_NO_WORDS";
 
 /// `Content-Type` for the Legacy Audio API upload part.
 ///
-/// The part must carry one. Multipart parsers classify a part as text when it has no
-/// `Content-Type` and a charset-less `Content-Disposition` (n8n's parser does exactly
-/// that), decode the audio as UTF-8 and corrupt it irreversibly before the ASR engine
-/// ever sees it -- the caller gets a 500/502 "failed to decode audio" that looks like a
-/// server fault. The prepared file's extension is the container the user configured, so
-/// it is also the honest media type to advertise.
-fn audio_content_type(path: &Path) -> &'static str {
+/// Label file parts explicitly so multipart parsers do not treat audio as text.
+/// Use the prepared container's extension, except for AMR-NB/WB, which share `.amr`.
+async fn audio_content_type(path: &Path, file: &mut File) -> std::io::Result<&'static str> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase());
-    match extension.as_deref() {
+    Ok(match extension.as_deref() {
         Some("opus" | "ogg" | "oga" | "spx" | "speex") => "audio/ogg",
-        Some("mp3" | "mp2" | "mpeg" | "mpg") => "audio/mpeg",
+        Some("mp3" | "mp2") => "audio/mpeg",
+        Some("mpeg" | "mpg") => "video/mpeg",
         Some("wav" | "wave") => "audio/wav",
         Some("flac") => "audio/flac",
-        Some("m4a" | "mp4" | "aac" | "mov") => "audio/mp4",
-        Some("amr") => "audio/amr",
+        Some("m4a" | "mp4") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("mov") => "video/quicktime",
+        Some("amr") => {
+            // Inspect only the longest AMR magic string, then preserve the complete upload.
+            let mut magic = Vec::with_capacity(15);
+            file.take(15).read_to_end(&mut magic).await?;
+            file.rewind().await?;
+            if magic.starts_with(b"#!AMR-WB\n") || magic.starts_with(b"#!AMR-WB_MC1.0\n") {
+                "audio/amr-wb"
+            } else if magic.starts_with(b"#!AMR\n") || magic.starts_with(b"#!AMR_MC1.0\n") {
+                "audio/amr"
+            } else {
+                "application/octet-stream"
+            }
+        }
         Some("wma" | "asf") => "audio/x-ms-wma",
         Some("aiff" | "aif") => "audio/aiff",
         Some("wv") => "audio/x-wavpack",
@@ -44,7 +56,7 @@ fn audio_content_type(path: &Path) -> &'static str {
         Some("avi") => "video/x-msvideo",
         Some("flv") => "video/x-flv",
         _ => "application/octet-stream",
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -499,7 +511,10 @@ impl AsrClient {
         ));
         let started = Instant::now();
         // The file and multipart body are reconstructed for every retry.
-        let file = File::open(file_path)
+        let mut file = File::open(file_path)
+            .await
+            .map_err(AsrError::PreparedAudio)?;
+        let content_type = audio_content_type(file_path, &mut file)
             .await
             .map_err(AsrError::PreparedAudio)?;
         let file_name = file_path
@@ -509,7 +524,7 @@ impl AsrClient {
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
         let part = Part::stream(body)
             .file_name(file_name)
-            .mime_str(audio_content_type(file_path))
+            .mime_str(content_type)
             .map_err(AsrError::Client)?;
         let mut form = Form::new().part("file", part);
         for (key, value) in self.request_fields() {
@@ -1040,28 +1055,69 @@ mod tests {
         assert!(error.last_response().is_empty());
     }
 
-    #[test]
-    fn upload_content_type_follows_the_prepared_container() {
-        use std::path::Path;
+    #[tokio::test]
+    async fn upload_content_type_follows_the_prepared_container() {
+        let dir = tempfile::tempdir().unwrap();
         for (name, expected) in [
             ("RecordTemp_1.opus", "audio/ogg"),
             ("a.ogg", "audio/ogg"),
             ("a.mp3", "audio/mpeg"),
             ("a.MP3", "audio/mpeg"),
+            ("a.mp2", "audio/mpeg"),
+            ("a.mpeg", "video/mpeg"),
+            ("a.mpg", "video/mpeg"),
             ("a.wav", "audio/wav"),
             ("a.flac", "audio/flac"),
             ("a.m4a", "audio/mp4"),
-            ("a.amr", "audio/amr"),
+            ("a.mp4", "audio/mp4"),
+            ("a.aac", "audio/aac"),
+            ("a.AAC", "audio/aac"),
+            ("a.mov", "video/quicktime"),
             ("a.wma", "audio/x-ms-wma"),
             ("a.mkv", "video/x-matroska"),
             ("audio", "application/octet-stream"),
             ("a.unknown", "application/octet-stream"),
         ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"audio").unwrap();
+            let mut file = tokio::fs::File::open(&path).await.unwrap();
             assert_eq!(
-                super::audio_content_type(Path::new(name)),
+                super::audio_content_type(&path, &mut file).await.unwrap(),
                 expected,
                 "wrong content type for {name}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn amr_content_type_uses_file_magic_without_consuming_audio() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio.AMR");
+        for (bytes, expected) in [
+            (b"#!AMR\n\x3c\xff\x00audio".as_slice(), "audio/amr"),
+            (b"#!AMR-WB\n\x3c\xff\x00audio".as_slice(), "audio/amr-wb"),
+            (
+                b"#!AMR_MC1.0\n\x00\x00\x00\x02audio".as_slice(),
+                "audio/amr",
+            ),
+            (
+                b"#!AMR-WB_MC1.0\n\x00\x00\x00\x02audio".as_slice(),
+                "audio/amr-wb",
+            ),
+            (b"#!AMR-WB".as_slice(), "application/octet-stream"),
+            (b"not AMR".as_slice(), "application/octet-stream"),
+            (b"".as_slice(), "application/octet-stream"),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let mut file = tokio::fs::File::open(&path).await.unwrap();
+            assert_eq!(
+                super::audio_content_type(&path, &mut file).await.unwrap(),
+                expected
+            );
+            let mut uploaded = Vec::new();
+            file.read_to_end(&mut uploaded).await.unwrap();
+            assert_eq!(uploaded, bytes, "MIME detection must preserve every byte");
         }
     }
 
@@ -1071,10 +1127,29 @@ mod tests {
     #[tokio::test]
     async fn upload_part_carries_a_content_type_on_the_wire() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (file_name, expected) in [
-            ("audio.opus", "content-type: audio/ogg"),
-            ("audio.mp3", "content-type: audio/mpeg"),
-            ("audio", "content-type: application/octet-stream"),
+        for (file_name, payload, expected) in [
+            ("audio.opus", b"audio\xff\x00".as_slice(), "audio/ogg"),
+            ("audio.mp3", b"audio\xff\x00".as_slice(), "audio/mpeg"),
+            ("audio.aac", b"audio\xff\x00".as_slice(), "audio/aac"),
+            ("audio.m4a", b"audio\xff\x00".as_slice(), "audio/mp4"),
+            ("audio.mov", b"audio\xff\x00".as_slice(), "video/quicktime"),
+            ("audio.mpeg", b"audio\xff\x00".as_slice(), "video/mpeg"),
+            ("audio.mpg", b"audio\xff\x00".as_slice(), "video/mpeg"),
+            (
+                "nb.amr",
+                b"#!AMR\n\x3c\xff\x00audio".as_slice(),
+                "audio/amr",
+            ),
+            (
+                "wb.AMR",
+                b"#!AMR-WB\n\x3c\xff\x00audio".as_slice(),
+                "audio/amr-wb",
+            ),
+            (
+                "audio",
+                b"audio\xff\x00".as_slice(),
+                "application/octet-stream",
+            ),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1109,11 +1184,12 @@ mod tests {
             });
             let dir = tempfile::tempdir().unwrap();
             let audio = dir.path().join(file_name);
-            std::fs::write(&audio, b"audio").unwrap();
+            std::fs::write(&audio, payload).unwrap();
             let client = super::AsrClient::new(crate::Config {
                 api_endpoint: format!("http://{address}"),
                 max_retry: 1,
                 retry_base_delay: 0.0,
+                request_timeout: 5,
                 ..Default::default()
             })
             .unwrap();
@@ -1125,9 +1201,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let request = String::from_utf8_lossy(&server.await.unwrap()).to_lowercase();
+            let bytes = server.await.unwrap();
             assert!(
-                request.contains(expected),
+                bytes.windows(payload.len()).any(|part| part == payload),
+                "upload of {file_name} must preserve the binary audio"
+            );
+            let request = String::from_utf8_lossy(&bytes).to_lowercase();
+            assert!(request.contains("content-type: multipart/form-data; boundary="));
+            assert!(
+                request.contains(&format!("\r\ncontent-type: {expected}\r\n")),
                 "upload of {file_name} must carry '{expected}', got: {request}"
             );
         }
