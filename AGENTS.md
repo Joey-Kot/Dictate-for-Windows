@@ -294,7 +294,7 @@ stateDiagram-v2
 
 ### Developing from source
 
-- Rust 1.97 or later.
+- Rust 1.99.1 (pinned in `rust-toolchain.toml`).
 - The `x86_64-pc-windows-gnu` Rust target.
 - MinGW-w64, C/C++ build tools, `pkg-config`, Autoconf, Automake, Libtool, NASM, YASM, and XZ tools.
 - Access to FFmpeg and codec source code when building the static audio dependencies.
@@ -852,12 +852,15 @@ Selecting a separate Provider does not inherit individual fields from the main c
 | Anthropic / Claude | `anthropic_claude` | `/v1/messages` | `x-api-key` and `anthropic-version: 2023-06-01` |
 | Google / Gemini | `google_gemini` | `/v1beta/models/{model}:generateContent` | `x-goog-api-key` |
 | Google / Vertex AI | `google_vertex_ai` | Base URL must include `/v1/projects/{project}/locations/{location}/publishers/google`; then appends `/models/{model}:generateContent` | OAuth Bearer access token |
-| xAI / Grok | `xai_grok` | `/v1/chat/completions` | Bearer |
+| xAI Grok / Responses | `xai_grok_responses` | `/v1/responses` | Bearer |
+| xAI Grok / Chat Completions | `xai_grok_chat_completions` | `/v1/chat/completions` | Bearer |
 | Alibaba / Qwen Text | `alibaba_qwen_text` | `/api/v1/services/aigc/text-generation/generation` | Bearer; `X-DashScope-SSE: enable` |
 | Alibaba / Qwen Multimodal | `alibaba_qwen_multimodal` | `/api/v1/services/aigc/multimodal-generation/generation` | Bearer; `X-DashScope-SSE: enable` |
-| Moonshot AI / Kimi | `moonshot_ai_kimi` | `/v1/chat/completions` | Bearer |
+| Moonshot Kimi / Responses | `moonshot_kimi_responses` | `/v1/responses` | Bearer |
+| Moonshot Kimi / Chat Completions | `moonshot_kimi_chat_completions` | `/v1/chat/completions` | Bearer |
 | Z.AI / GLM | `z_ai_glm` | `/api/paas/v4/chat/completions` | Bearer |
-| DeepSeek / DeepSeek | `deepseek_deepseek` | `/chat/completions` | Bearer |
+| DeepSeek / Responses | `deepseek_responses` | `/responses` | Bearer |
+| DeepSeek / Chat Completions | `deepseek_chat_completions` | `/chat/completions` | Bearer |
 | Volcengine / Ark / Chat Completions | `volcengine_ark_chat_completions` | `/api/v3/chat/completions` | Bearer |
 | Volcengine / Ark / Responses | `volcengine_ark_responses` | `/api/v3/responses` | Bearer |
 | Baidu / Qianfan | `baidu_qianfan` | `/v2/chat/completions` | Bearer |
@@ -1210,11 +1213,13 @@ Rewrite does not create an audio cache or a persistent request/response cache, a
 
 Official releases are cross-compiled using Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` target.
 
-### Installing the Rust target
+### Installing the Rust toolchain
+
+Local builds and CI use Rust 1.99.1, with `rustfmt`, `clippy`, and the Windows GNU target.
 
 ```bash
-rustup target add x86_64-pc-windows-gnu
-rustup component add rustfmt clippy
+rustup toolchain install 1.99.1 --profile minimal \
+  --component rustfmt --component clippy --target x86_64-pc-windows-gnu
 ```
 
 ### Tests and static checks
@@ -1279,7 +1284,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1 source archive and verifies its SHA-256, `b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a`, before extraction. The source is placed in a versioned directory to avoid reusing old Git sources; Linux embedded audio tests use the same source archive.
+Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1.3 source archive and verifies its SHA-256, `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`, before extraction. The source is placed in a versioned directory to avoid reusing old Git sources; Linux embedded audio tests use the same source archive. Both builds apply the vendored CVE-2026-107678 backport from [upstream PR 24593](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24593), fixing MOV `pssh` parsing and encryption-info list handling.
 
 The Opus 1.5.2 and LAME 3.100 source archives are also checked against fixed SHA-256 hashes before extraction, including downloads already in the cache. The hashes are recorded in the build scripts and third-party component notices.
 
@@ -1346,7 +1351,7 @@ After a successful build, the workflow updates the `Latest` tag and Release, and
 | 32 / 64-bit floating-point PCM | `pcm_f32le`, `pcm_f32be`, `pcm_f64le`, `pcm_f64be` |
 | PCM A-law / μ-law | `pcm_alaw`, `pcm_mulaw` |
 
-FFmpeg 8.1 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoders are separate components, so `pcm_s64le`, for example, can write to WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
+FFmpeg 8.1.3 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoders are separate components, so `pcm_s64le`, for example, can write to WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
 
 ## Security and privacy
 
@@ -1401,7 +1406,7 @@ For automated format/VAD tests for this capture update, user-reported manual Win
 
 Both release packages statically link:
 
-- FFmpeg/libav 8.1
+- FFmpeg/libav 8.1.3
 - Opus v1.5.2
 - LAME 3.100
 - libogg 1.3.5

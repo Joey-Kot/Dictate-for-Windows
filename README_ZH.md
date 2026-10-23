@@ -51,7 +51,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 ### 从源码开发
 
-- Rust 1.97 或更新版本。
+- Rust 1.99.1（由 `rust-toolchain.toml` 固定版本）。
 - `x86_64-pc-windows-gnu` Rust 目标。
 - MinGW-w64、C/C++ 构建工具、`pkg-config`、Autoconf、Automake、Libtool、NASM、YASM 和 XZ 工具。
 - 构建静态音频依赖时需要能够获取 FFmpeg 和编解码器源码。
@@ -368,12 +368,15 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 | Anthropic / Claude | `anthropic_claude` | `/v1/messages` | `x-api-key` 与 `anthropic-version: 2023-06-01` |
 | Google / Gemini | `google_gemini` | `/v1beta/models/{model}:generateContent` | `x-goog-api-key` |
 | Google / Vertex AI | `google_vertex_ai` | Base URL 必须包含 `/v1/projects/{project}/locations/{location}/publishers/google`，再补全 `/models/{model}:generateContent` | OAuth Bearer access token |
-| xAI / Grok | `xai_grok` | `/v1/chat/completions` | Bearer |
+| xAI Grok / Responses | `xai_grok_responses` | `/v1/responses` | Bearer |
+| xAI Grok / Chat Completions | `xai_grok_chat_completions` | `/v1/chat/completions` | Bearer |
 | Alibaba / Qwen Text | `alibaba_qwen_text` | `/api/v1/services/aigc/text-generation/generation` | Bearer；`X-DashScope-SSE: enable` |
 | Alibaba / Qwen Multimodal | `alibaba_qwen_multimodal` | `/api/v1/services/aigc/multimodal-generation/generation` | Bearer；`X-DashScope-SSE: enable` |
-| Moonshot AI / Kimi | `moonshot_ai_kimi` | `/v1/chat/completions` | Bearer |
+| Moonshot Kimi / Responses | `moonshot_kimi_responses` | `/v1/responses` | Bearer |
+| Moonshot Kimi / Chat Completions | `moonshot_kimi_chat_completions` | `/v1/chat/completions` | Bearer |
 | Z.AI / GLM | `z_ai_glm` | `/api/paas/v4/chat/completions` | Bearer |
-| DeepSeek / DeepSeek | `deepseek_deepseek` | `/chat/completions` | Bearer |
+| DeepSeek / Responses | `deepseek_responses` | `/responses` | Bearer |
+| DeepSeek / Chat Completions | `deepseek_chat_completions` | `/chat/completions` | Bearer |
 | Volcengine / Ark / Chat Completions | `volcengine_ark_chat_completions` | `/api/v3/chat/completions` | Bearer |
 | Volcengine / Ark / Responses | `volcengine_ark_responses` | `/api/v3/responses` | Bearer |
 | Baidu / Qianfan | `baidu_qianfan` | `/v2/chat/completions` | Bearer |
@@ -590,11 +593,13 @@ multipart 内容：
 
 正式发布使用 Ubuntu、MinGW-w64 和 Rust `x86_64-pc-windows-gnu` 目标交叉构建。
 
-### 安装 Rust 目标
+### 安装 Rust 工具链
+
+本地构建与 CI 统一使用 Rust 1.99.1，并安装 `rustfmt`、`clippy` 和 Windows GNU 目标。
 
 ```bash
-rustup target add x86_64-pc-windows-gnu
-rustup component add rustfmt clippy
+rustup toolchain install 1.99.1 --profile minimal \
+  --component rustfmt --component clippy --target x86_64-pc-windows-gnu
 ```
 
 ### 测试与静态检查
@@ -640,7 +645,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 8.1 官方源码包，解压前校验 SHA-256 `b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a`。源码放在带版本号的目录中，避免复用旧 Git 源码；Linux 内嵌音频测试也使用此源码包。
+采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 8.1.3 官方源码包；Linux 内嵌音频测试也使用此源码包。
 
 裁剪构建启用文件读写，以及 PCM（含 A-law/μ-law）、WAV、MP3、Opus、Speex、AAC、AMR-NB/WB、AVI、FLAC、FLV、M4A、MKV、MOV、MP4、MPEG、Ogg、WebM、ASF（WMA）、AIFF 和 WavPack 所需的编解码器、解析器与封装器。Speex 使用 `libspeex`，AMR-WB 使用 `libvo_amrwbenc`。FLV 保留 AAC/MP3 音频支持，移除 FLV1、H.264 编解码器。启用 WMA v1/v2 编解码，移除 Theora 和 WMV 视频编解码器；本构建不包含 WMA Pro、WMA Lossless、WMV3、VC-1。
 
@@ -692,7 +697,7 @@ dist/dictate-gui-windows-amd64.zip
 | 32 / 64 位浮点 PCM | `pcm_f32le`, `pcm_f32be`, `pcm_f64le`, `pcm_f64be` |
 | PCM A-law / μ-law | `pcm_alaw`, `pcm_mulaw` |
 
-FFmpeg 8.1 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独立组件，例如 `pcm_s64le` 可以写入 WAV。实际输出还受采样率、声道数、码率及容器规则限制。
+FFmpeg 8.1.3 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独立组件，例如 `pcm_s64le` 可以写入 WAV。实际输出还受采样率、声道数、码率及容器规则限制。
 
 ## 安全与隐私
 
@@ -709,7 +714,7 @@ FFmpeg 8.1 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独�
 
 两个发布包均静态链接：
 
-- FFmpeg/libav 8.1
+- FFmpeg/libav 8.1.3
 - Opus v1.5.2
 - LAME 3.100
 - libogg 1.3.5
