@@ -645,7 +645,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 8.1.3 官方源码包，解压前校验 SHA-256 `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`。源码放在带版本号的目录中，避免复用旧 Git 源码；Linux 内嵌音频测试也使用此源码包。构建脚本会应用仓库内的 CVE-2026-107678 补丁，回补上游 PR 24593 对 MOV `pssh` 解析和加密信息链表的修复。
+采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 8.1.3 官方源码包；Linux 内嵌音频测试也使用此源码包。
 
 裁剪构建启用文件读写，以及 PCM（含 A-law/μ-law）、WAV、MP3、Opus、Speex、AAC、AMR-NB/WB、AVI、FLAC、FLV、M4A、MKV、MOV、MP4、MPEG、Ogg、WebM、ASF（WMA）、AIFF 和 WavPack 所需的编解码器、解析器与封装器。Speex 使用 `libspeex`，AMR-WB 使用 `libvo_amrwbenc`。FLV 保留 AAC/MP3 音频支持，移除 FLV1、H.264 编解码器。启用 WMA v1/v2 编解码，移除 Theora 和 WMV 视频编解码器；本构建不包含 WMA Pro、WMA Lossless、WMV3、VC-1。
 

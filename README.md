@@ -649,7 +649,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-Capture uses Windows WASAPI directly, with no PortAudio build or link requirement. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1.3 source archive and verifies SHA-256 `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3` before extraction. Sources reside in a versioned directory to avoid reusing an old Git checkout; Linux embedded-audio tests use the same archive. Both builds apply the vendored CVE-2026-107678 backport from [upstream PR 24593](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24593), fixing MOV `pssh` parsing and encryption-info list handling.
+Capture uses Windows WASAPI directly, with no PortAudio build or link requirement. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1.3 source archive; Linux embedded-audio tests use the same archive.
 
 The trimmed build enables file I/O and the codecs, parsers, and muxers required by PCM (including A-law/μ-law), WAV, MP3, Opus, Speex, AAC, AMR-NB/WB, AVI, FLAC, FLV, M4A, MKV, MOV, MP4, MPEG, Ogg, WebM, ASF (WMA), AIFF, and WavPack. Speex uses `libspeex`; AMR-WB uses `libvo_amrwbenc`. FLV retains AAC/MP3 audio support while removing FLV1 and H.264 codecs. WMA v1/v2 codecs are enabled while Theora and WMV video codecs are removed; this build does not include WMA Pro, WMA Lossless, WMV3, or VC-1.
 
