@@ -649,7 +649,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-Capture uses Windows WASAPI directly, with no PortAudio build or link requirement. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1.3 source archive; Linux embedded-audio tests use the same archive.
+Capture uses Windows WASAPI directly, with no PortAudio build or link requirement. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 9.0.2 source archive; Linux embedded-audio tests use the same archive.
 
 The trimmed build enables file I/O and the codecs, parsers, and muxers required by PCM (including A-law/μ-law), WAV, MP3, Opus, Speex, AAC, AMR-NB/WB, AVI, FLAC, FLV, M4A, MKV, MOV, MP4, MPEG, Ogg, WebM, ASF (WMA), AIFF, and WavPack. Speex uses `libspeex`; AMR-WB uses `libvo_amrwbenc`. FLV retains AAC/MP3 audio support while removing FLV1 and H.264 codecs. WMA v1/v2 codecs are enabled while Theora and WMV video codecs are removed; this build does not include WMA Pro, WMA Lossless, WMV3, or VC-1.
 
@@ -701,7 +701,7 @@ Build component names can differ from extensions: bare PCM muxers use `pcm_*`; S
 | 32 / 64-bit floating-point PCM | `pcm_f32le`, `pcm_f32be`, `pcm_f64le`, `pcm_f64be` |
 | PCM A-law / μ-law | `pcm_alaw`, `pcm_mulaw` |
 
-FFmpeg 8.1.3 has no dedicated bare 64-bit integer PCM muxer. PCM encoders are separate components; for example, `pcm_s64le` can write WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
+FFmpeg 9.0.2 has no dedicated bare 64-bit integer PCM muxer. PCM encoders are separate components; for example, `pcm_s64le` can write WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
 
 ## Security and privacy
 
@@ -718,7 +718,7 @@ FFmpeg 8.1.3 has no dedicated bare 64-bit integer PCM muxer. PCM encoders are se
 
 Both release packages statically link:
 
-- FFmpeg/libav 8.1.3
+- FFmpeg/libav 9.0.2
 - Opus v1.5.2
 - LAME 3.100
 - libogg 1.3.5

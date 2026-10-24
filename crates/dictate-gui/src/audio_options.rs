@@ -18,7 +18,7 @@ pub const BITRATES: &[i32] = &[
     144, 160, 180, 190, 192, 200, 224, 240, 250, 256, 288, 320, 352, 384, 448, 500, 510, 512, 576,
     640,
 ];
-// GUI output combinations target the embedded FFmpeg 8.1 build.
+// GUI output combinations target the embedded FFmpeg 9.0.2 build.
 pub const CODECS: &[(&str, &str)] = &[
     ("opus", "Opus"),
     ("mp3", "MP3"),

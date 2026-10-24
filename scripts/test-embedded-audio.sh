@@ -4,11 +4,13 @@
 # for libopus, libmp3lame and libvorbis. Nothing is installed globally.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-task_dir="${DICTATE_NATIVE_TEST_DIR:-$root/native-audio-test-tmp/ffmpeg-8.1.3}"
-source_archive="${DICTATE_FFMPEG_ARCHIVE:-$root/build/ffmpeg/ffmpeg-8.1.3.tar.xz}"
+ffmpeg_version=9.0.2
+ffmpeg_sha256=84960df915059e8754fef2cd7c9afeb614062b1b5458ec471eecee619ee04e98
+task_dir="${DICTATE_NATIVE_TEST_DIR:-$root/native-audio-test-tmp/ffmpeg-$ffmpeg_version}"
+source_archive="${DICTATE_FFMPEG_ARCHIVE:-$root/build/ffmpeg/ffmpeg-$ffmpeg_version.tar.gz}"
+printf '%s  %s\n' "$ffmpeg_sha256" "$source_archive" | sha256sum --check --strict
 mkdir -p "$task_dir/source" "$task_dir/build"
 tar -xf "$source_archive" --strip-components=1 -C "$task_dir/source"
-"$root/scripts/apply-ffmpeg-security-patch.sh" "$task_dir/source"
 cd "$task_dir/build"
 ../source/configure \
     --prefix="$task_dir/install" --disable-programs --disable-doc --disable-debug \

@@ -645,7 +645,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 8.1.3 官方源码包；Linux 内嵌音频测试也使用此源码包。
+采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 9.0.2 官方源码包；Linux 内嵌音频测试也使用此源码包。
 
 裁剪构建启用文件读写，以及 PCM（含 A-law/μ-law）、WAV、MP3、Opus、Speex、AAC、AMR-NB/WB、AVI、FLAC、FLV、M4A、MKV、MOV、MP4、MPEG、Ogg、WebM、ASF（WMA）、AIFF 和 WavPack 所需的编解码器、解析器与封装器。Speex 使用 `libspeex`，AMR-WB 使用 `libvo_amrwbenc`。FLV 保留 AAC/MP3 音频支持，移除 FLV1、H.264 编解码器。启用 WMA v1/v2 编解码，移除 Theora 和 WMV 视频编解码器；本构建不包含 WMA Pro、WMA Lossless、WMV3、VC-1。
 
@@ -697,7 +697,7 @@ dist/dictate-gui-windows-amd64.zip
 | 32 / 64 位浮点 PCM | `pcm_f32le`, `pcm_f32be`, `pcm_f64le`, `pcm_f64be` |
 | PCM A-law / μ-law | `pcm_alaw`, `pcm_mulaw` |
 
-FFmpeg 8.1.3 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独立组件，例如 `pcm_s64le` 可以写入 WAV。实际输出还受采样率、声道数、码率及容器规则限制。
+FFmpeg 9.0.2 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独立组件，例如 `pcm_s64le` 可以写入 WAV。实际输出还受采样率、声道数、码率及容器规则限制。
 
 ## 安全与隐私
 
@@ -714,7 +714,7 @@ FFmpeg 8.1.3 没有专用 64 位整数 PCM 裸流封装器；PCM 编码器是独
 
 两个发布包均静态链接：
 
-- FFmpeg/libav 8.1.3
+- FFmpeg/libav 9.0.2
 - Opus v1.5.2
 - LAME 3.100
 - libogg 1.3.5

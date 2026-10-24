@@ -63,12 +63,19 @@ static void dictate_set_av_error(char *errbuf, int errbuf_size, const char *pref
 }
 
 static int dictate_pick_sample_fmt(const AVCodec *codec, const char *requested) {
+    const void *configs = NULL;
+    int ret = avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                          0, &configs, NULL);
+    if (ret < 0) {
+        return ret;
+    }
+    const enum AVSampleFormat *sample_fmts = configs;
     enum AVSampleFormat fmt = AV_SAMPLE_FMT_NONE;
     if (requested != NULL && requested[0] != '\0') {
         fmt = av_get_sample_fmt(requested);
     }
-    if (fmt != AV_SAMPLE_FMT_NONE && codec->sample_fmts != NULL) {
-        const enum AVSampleFormat *p = codec->sample_fmts;
+    if (fmt != AV_SAMPLE_FMT_NONE && sample_fmts != NULL) {
+        const enum AVSampleFormat *p = sample_fmts;
         while (*p != AV_SAMPLE_FMT_NONE) {
             if (*p == fmt) {
                 return fmt;
@@ -76,11 +83,11 @@ static int dictate_pick_sample_fmt(const AVCodec *codec, const char *requested) 
             p++;
         }
     }
-    if (fmt != AV_SAMPLE_FMT_NONE && codec->sample_fmts == NULL) {
+    if (fmt != AV_SAMPLE_FMT_NONE && sample_fmts == NULL) {
         return fmt;
     }
-    if (codec->sample_fmts != NULL) {
-        return codec->sample_fmts[0];
+    if (sample_fmts != NULL) {
+        return sample_fmts[0] == AV_SAMPLE_FMT_NONE ? AVERROR(EINVAL) : sample_fmts[0];
     }
     return AV_SAMPLE_FMT_S16;
 }
@@ -534,7 +541,12 @@ int dictate_ffmpeg_convert(
             goto cleanup;
         }
         enc_ctx->sample_rate = sample_rate;
-        enc_ctx->sample_fmt = dictate_pick_sample_fmt(encoder, sample_fmt_name);
+        ret = dictate_pick_sample_fmt(encoder, sample_fmt_name);
+        if (ret < 0) {
+            dictate_set_av_error(errbuf, errbuf_size, "could not query encoder sample formats", ret);
+            goto cleanup;
+        }
+        enc_ctx->sample_fmt = ret;
         enc_ctx->time_base = (AVRational){1, sample_rate};
         if (codec_has_bitrate) {
             enc_ctx->bit_rate = (int64_t)bitrate_kbps * 1000;
@@ -1543,7 +1555,12 @@ static int dictate_open_segment_output(
         return ret;
     }
     output->enc_ctx->sample_rate = sample_rate;
-    output->enc_ctx->sample_fmt = dictate_pick_sample_fmt(encoder, sample_fmt_name);
+    ret = dictate_pick_sample_fmt(encoder, sample_fmt_name);
+    if (ret < 0) {
+        dictate_set_av_error(errbuf, errbuf_size, "could not query segment encoder sample formats", ret);
+        return ret;
+    }
+    output->enc_ctx->sample_fmt = ret;
     output->enc_ctx->time_base = (AVRational){1, sample_rate};
     if (codec_has_bitrate) output->enc_ctx->bit_rate = (int64_t)bitrate_kbps * 1000;
     av_channel_layout_default(&output->enc_ctx->ch_layout, channels);

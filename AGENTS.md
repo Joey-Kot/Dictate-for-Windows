@@ -156,7 +156,7 @@ sequenceDiagram
             Core->>API: Run one complete ASR workflow per segment (bounded concurrency)
             API-->>Core: Final result for each segment
             Core->>Core: Merge in source order after the batch completes
-            Note over Core,API: Interactive: omit empty text, retain eligible failure placeholders; CLI file mode requires all segments to succeed
+            Note over Core,API: Interactive: omit empty text, retain eligible failure placeholders - CLI file mode requires all segments to succeed
         else Non-realtime complete-file path
             Core->>Audio: Prepare audio for the selected delivery
             Note over Core,Audio: Optional Earshot VAD trimming and format conversion with embedded libav
@@ -176,12 +176,12 @@ sequenceDiagram
         else GUI menu
             User->>Core: Press Menu key
             Core->>Menu: Post toggle with the trigger-time pointer position
-            Menu-->>User: Show without activation; keep the target application's focus
+            Menu-->>User: Show without activation - keep the target application's focus
             User->>Menu: Click a prompt
             Menu->>Menu: Hide and release capture / input ownership
             Menu->>Core: try_rewrite(selected Prompt ID)
         end
-        Note over Core,App: The existing task guard runs before reading input; no target window or insertion position is saved
+        Note over Core,App: The existing task guard runs before reading input - no target window or insertion position is saved
         Core->>Clipboard: Back up and clear
         Core->>Core: Wait for Paste delay
         Core->>App: Ctrl+C
@@ -198,7 +198,7 @@ sequenceDiagram
 
     Core->>Core: Extract and validate the complete result using the selected Audio extractor or Rewrite Provider
     opt Audio recognition completed normally with no text
-        Core-->>User: Idle; no automatic retry, insertion, or failure placeholder
+        Core-->>User: Idle - no automatic retry, insertion, or failure placeholder
     end
     opt Text is available for insertion and the task has not been canceled
         alt USE_SENDINPUT=true
@@ -1284,7 +1284,7 @@ dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
 ```
 
-Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 8.1.3 source archive and verifies its SHA-256, `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`, before extraction. The source is placed in a versioned directory to avoid reusing old Git sources; Linux embedded audio tests use the same source archive. Both builds apply the vendored CVE-2026-107678 backport from [upstream PR 24593](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24593), fixing MOV `pssh` parsing and encryption-info list handling.
+Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows-amd64.sh` downloads `https://www.ffmpeg.org/releases/ffmpeg-9.0.2.tar.gz` and verifies its SHA-256, `84960df915059e8754fef2cd7c9afeb614062b1b5458ec471eecee619ee04e98`, before extraction. The source is placed in a versioned directory to avoid reusing old Git sources; Linux embedded audio tests verify and use the same unmodified source archive. The MOV demuxer remains enabled for existing M4A/MP4 audio-file input support; this configuration does not isolate parsing to PCM as the Android build does.
 
 The Opus 1.5.2 and LAME 3.100 source archives are also checked against fixed SHA-256 hashes before extraction, including downloads already in the cache. The hashes are recorded in the build scripts and third-party component notices.
 
@@ -1351,7 +1351,7 @@ After a successful build, the workflow updates the `Latest` tag and Release, and
 | 32 / 64-bit floating-point PCM | `pcm_f32le`, `pcm_f32be`, `pcm_f64le`, `pcm_f64be` |
 | PCM A-law / μ-law | `pcm_alaw`, `pcm_mulaw` |
 
-FFmpeg 8.1.3 has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoders are separate components, so `pcm_s64le`, for example, can write to WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
+The build has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoders are separate components, so `pcm_s64le`, for example, can write to WAV. Actual output is also constrained by sample rate, channel count, bitrate, and container rules.
 
 ## Security and privacy
 
@@ -1406,7 +1406,7 @@ For automated format/VAD tests for this capture update, user-reported manual Win
 
 Both release packages statically link:
 
-- FFmpeg/libav 8.1.3
+- FFmpeg/libav 9.0.2
 - Opus v1.5.2
 - LAME 3.100
 - libogg 1.3.5
