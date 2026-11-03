@@ -9,8 +9,6 @@ use std::time::Instant;
 #[cfg(test)]
 mod tests;
 #[cfg(windows)]
-mod windows_clipboard;
-#[cfg(windows)]
 mod windows_copy;
 
 #[cfg(windows)]
@@ -91,7 +89,7 @@ trait CopyBackend {
     type Snapshot;
     fn target_is_current(&self) -> Result<bool, String>;
     fn keys_pressed(&self) -> bool;
-    fn backup_and_clear(&self) -> Result<(Self::Snapshot, u32), String>;
+    fn backup_and_clear(&self) -> Result<(Self::Snapshot, u32), SelectionError>;
     fn send_copy(&self) -> Result<(), String>;
     // None means unchanged/busy. A read error is returned only after fresh
     // clipboard data is advertised and the copy writer has released its lock.
@@ -141,7 +139,7 @@ fn read_with(
         }
         backend.sleep(Duration::from_millis(10));
     }
-    let (snapshot, sequence) = backend.backup_and_clear().map_err(SelectionError::Read)?;
+    let (snapshot, sequence) = backend.backup_and_clear()?;
     let mut copy_attempted = false;
     let mut result = (|| {
         // Reuse the same delay as the clipboard output path: allow our write

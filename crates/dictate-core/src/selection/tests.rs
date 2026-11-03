@@ -136,11 +136,11 @@ impl CopyBackend for FakeCopy {
         state.elapsed < state.keys_until
     }
 
-    fn backup_and_clear(&self) -> Result<(Clipboard, u32), String> {
+    fn backup_and_clear(&self) -> Result<(Clipboard, u32), SelectionError> {
         let mut state = self.state.borrow_mut();
         state.record(Event::Backup);
         if state.backup_fails {
-            return Err("backup failed".into());
+            return Err(SelectionError::Read("backup failed".into()));
         }
         let snapshot = state.clipboard.clone();
         state.clipboard = Clipboard {

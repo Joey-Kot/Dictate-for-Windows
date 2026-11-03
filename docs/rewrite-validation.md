@@ -1,5 +1,21 @@
 # Rewrite 验证记录
 
+## 剪贴板格式与历史记录（2026-11-03）
+
+剪贴板输出和 Rewrite 选区读取共用多格式快照；临时输出、读取前的标记及恢复内容使用 Windows 历史记录排除格式。输出期间检测到更新的剪贴板时保留新内容。目标应用响应 Rewrite 的 `Ctrl+C` 时仍可能自行添加历史记录。
+
+Linux 工作区测试通过；Windows 核心测试程序已交叉编译及链接。用户实机反馈语音输入链路正常；Rewrite 后，改写前选中的原文出现在 `Win+V` 的最新一条，与目标应用响应 `Ctrl+C` 的写入相符。测试的 Windows 版本和目标应用尚未记录。
+
+以下 Windows 原生回归测试尚未在桌面执行，覆盖文本、图片、注册格式、空剪贴板、排除标记、新复制的内容、Scintilla 列选区与整行选区标记和无消息循环的复制；会操作当前剪贴板，应在停止其他剪贴板操作后分别运行：
+
+```sh
+cargo test -p dictate-core native_output_restores_image_text_and_history_markers -- --ignored --test-threads=1
+cargo test -p dictate-core native_copy_without_message_pump_preserves_clipboard_formats -- --ignored --test-threads=1
+cargo test -p dictate-core native_selection_markers_survive_copy_and_paste_transactions -- --ignored --test-threads=1
+```
+
+实机还需分别以文本、图片和空剪贴板作为原始内容，重复进行听写输出及 Rewrite，检查恢复后的粘贴内容和 `Win+V` 历史记录；确认应用自身写入和恢复没有增加空白或重复条目。设置较长的恢复延迟，并在粘贴后退出应用，验证退出等待恢复完成。
+
 ## 原生 Rewrite 菜单
 
 菜单、可空快捷键和图标导入的本次验证单独记录在 [Rewrite 菜单验收记录](rewrite-menu-validation.md)。该记录分别列出自动检查、Windows 功能检查及四张参考图的视觉验收，Windows 10 实机部分由用户完成。下方是历史记录，不表示新增菜单已经经过 Windows 实机验证。
@@ -74,7 +90,7 @@ cargo build --workspace --target x86_64-pc-windows-gnu --features dictate-gui/na
 1. 在 Windows 10/11 的 EmEditor、VS Code、记事本、浏览器文本框和 Word 中选中文本，分别使用剪贴板和 SendInput 写入模式改写；两种模式均应通过 `Ctrl+C` 读取。记录应用版本，分别验证普通权限、双方管理员权限及目标应用权限高于 Dictate 的场景；受权限限制时不得发送旧剪贴板文本。
 2. 验证无选区、只读文本、密码框、禁用复制或自定义 `Ctrl+C` 的控件，以及读取期间切换窗口/控件。读取失败或没有新的非空白文本时不发送请求、不写入；无选区时结果遵循应用 Copy 行为，例如 VS Code 可能复制当前行，不能以“未选中”统一预期失败，也不能假定本程序能识别密码框。
 3. 请求超时、401、429、5xx、空结果、非法 JSON、SSE 中途断开，以及 `length` / `max_tokens` / `MAX_TOKENS` 截断：失败前不输出部分结果。Rewrite 失败不写入占位符；合格的终态音频请求失败会写入安全占位符。取消、配置与本地媒体错误仍不写入占位符。
-4. 原剪贴板分别放入空内容、文本、HTML/RTF、图片和文件列表，验证成功、复制失败、取消及读取期间退出时均尝试恢复；请求只能在恢复成功后开始。测试超过 64 MiB、超过 256 种格式或不支持备份的格式应在清空前拒绝。模拟剪贴板占用和恢复失败，确认错误不被取消消息掩盖；检查松键等待、延迟复制及恢复后是否被迟到复制覆盖。修改 Paste delay 和 Restore delay，确认 Rewrite 读取共用这两个值；开启 SendInput 后两个字段仍可编辑，读取等待仍生效，音频写入行为保持不变。
+4. 原剪贴板分别放入空内容、文本、HTML/RTF、图片和文件列表，验证成功、复制失败、取消及读取期间退出时均尝试恢复；请求只能在恢复成功后开始。测试超过 256 MiB、超过 256 种格式或不支持备份的格式应在清空前拒绝。模拟剪贴板占用和恢复失败，确认错误不被取消消息掩盖；检查松键等待、延迟复制及恢复后是否被迟到复制覆盖。修改 Paste delay 和 Restore delay，确认 Rewrite 读取共用这两个值；开启 SendInput 后两个字段仍可编辑，读取等待仍生效，音频写入行为保持不变。
 5. 在选区读取、请求、退避、写入等待阶段取消，随后启动新任务。确认输入读取清理完成前保持互斥，退出等待原生工作线程恢复剪贴板；迟到结果不写入。写入已开始后的行为遵循原有输出通道限制。
 6. 录音、暂停、转写、Rewrite、连接测试期间连续触发其他任务：不并发、不排队。任务结束后 Retry 只重发上一段音频。
 7. 两个 API 页面的连接测试使用当前草稿；Rewrite 测试不读取选区、不回填。测试期间关闭设置窗口或退出程序，确认取消、清理和重新打开窗口行为正常。

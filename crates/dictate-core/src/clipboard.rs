@@ -1,9 +1,37 @@
-use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(any(windows, test))]
+static ACTIVE_TRANSACTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(windows, test))]
+struct ActiveTransaction;
+
+#[cfg(any(windows, test))]
+impl ActiveTransaction {
+    fn new() -> Self {
+        ACTIVE_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for ActiveTransaction {
+    fn drop(&mut self) {
+        ACTIVE_TRANSACTIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Keep the async executor alive until any temporary clipboard is restored.
+pub(crate) fn wait_for_cleanup() {
+    #[cfg(any(windows, test))]
+    while ACTIVE_TRANSACTIONS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ClipboardError {
@@ -40,8 +68,11 @@ impl ClipboardError {
 
 #[async_trait]
 pub trait ClipboardOperations: Send + Sync {
-    fn read_text(&self) -> Result<String, String>;
-    fn write_text(&self, text: &str) -> Result<(), String>;
+    type Snapshot: Send;
+
+    fn backup_and_write(&self, text: &str) -> Result<Self::Snapshot, ClipboardError>;
+    fn temporary_is_current(&self, snapshot: &Self::Snapshot) -> Result<bool, String>;
+    fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
     fn send_paste(&self) -> Result<(), String>;
 
     async fn wait(
@@ -53,6 +84,10 @@ pub trait ClipboardOperations: Send + Sync {
             _ = cancellation.cancelled() => Err(ClipboardError::Canceled),
             _ = tokio::time::sleep(duration) => Ok(()),
         }
+    }
+
+    async fn wait_after_paste(&self, _cancellation: &CancellationToken, duration: Duration) {
+        tokio::time::sleep(duration).await;
     }
 }
 
@@ -87,30 +122,54 @@ pub async fn paste_text_with<O: ClipboardOperations + ?Sized>(
     restore_delay: Duration,
     operations: &O,
 ) -> Result<(), ClipboardError> {
+    // Register before checking cancellation so shutdown cannot miss a paste
+    // transaction that has already decided to touch the clipboard.
+    #[cfg(any(windows, test))]
+    let _transaction = ActiveTransaction::new();
     if cancellation.is_cancelled() {
         return Err(ClipboardError::Canceled);
     }
-    let original = operations.read_text().map_err(ClipboardError::Read)?;
-    if cancellation.is_cancelled() {
-        return Err(ClipboardError::Canceled);
-    }
+    // Back up all formats and install the temporary text while the clipboard
+    // is held open, so another copy cannot be lost between the two steps.
+    let original = operations.backup_and_write(text)?;
 
     let mut paste_sent = false;
-    let operation = async {
-        operations.write_text(text).map_err(ClipboardError::Write)?;
-        operations.wait(cancellation, write_delay).await?;
-        if cancellation.is_cancelled() {
-            return Err(ClipboardError::Canceled);
-        }
-        operations.send_paste().map_err(ClipboardError::Send)?;
-        paste_sent = true;
-        operations.wait(cancellation, restore_delay).await
+    let mut operation = operations.wait(cancellation, write_delay).await;
+    if operation.is_ok() && cancellation.is_cancelled() {
+        operation = Err(ClipboardError::Canceled);
     }
-    .await;
+    if operation.is_ok() {
+        operation = match operations.temporary_is_current(&original) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ClipboardError::Write(
+                "Clipboard changed before the paste shortcut".into(),
+            )),
+            Err(error) => Err(ClipboardError::Write(error)),
+        };
+    }
+    // Opening and checking the clipboard can block; cancellation may have
+    // arrived after the earlier check while another process held it open.
+    if operation.is_ok() && cancellation.is_cancelled() {
+        operation = Err(ClipboardError::Canceled);
+    }
+    if operation.is_ok() {
+        operation = operations.send_paste().map_err(ClipboardError::Send);
+    }
+    if operation.is_ok() {
+        paste_sent = true;
+        // Once Ctrl+V has been sent, let the target consume the temporary
+        // clipboard even if the task is canceled during the restore delay.
+        operations
+            .wait_after_paste(cancellation, restore_delay)
+            .await;
+        if cancellation.is_cancelled() {
+            operation = Err(ClipboardError::Canceled);
+        }
+    }
 
-    // Restoration is deliberately unconditional after the original text has
-    // been read, including failure and cancellation paths.
-    let restore = operations.write_text(&original);
+    // Restoration is required after every successful temporary write,
+    // including failure and cancellation paths.
+    let restore = operations.restore(&original);
     match (operation, restore) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(message)) => Err(ClipboardError::Restore {
@@ -132,12 +191,29 @@ struct WindowsClipboard;
 #[cfg(windows)]
 #[async_trait]
 impl ClipboardOperations for WindowsClipboard {
-    fn read_text(&self) -> Result<String, String> {
-        windows_clipboard::read_text()
+    type Snapshot = crate::windows_clipboard::ClipboardSnapshot;
+
+    fn backup_and_write(&self, text: &str) -> Result<Self::Snapshot, ClipboardError> {
+        use crate::windows_clipboard::BeginError;
+        crate::windows_clipboard::backup_and_write(text).map_err(|error| match error {
+            BeginError::Backup(message) => ClipboardError::Read(message),
+            BeginError::Replace(message) => ClipboardError::Write(message),
+            BeginError::ReplaceAndRestore { operation, restore } => {
+                ClipboardError::OperationAndRestore {
+                    operation: Box::new(ClipboardError::Write(operation)),
+                    paste_sent: false,
+                    restore,
+                }
+            }
+        })
     }
 
-    fn write_text(&self, text: &str) -> Result<(), String> {
-        windows_clipboard::write_text(text)
+    fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
+        snapshot.restore()
+    }
+
+    fn temporary_is_current(&self, snapshot: &Self::Snapshot) -> Result<bool, String> {
+        snapshot.temporary_is_current()
     }
 
     fn send_paste(&self) -> Result<(), String> {
@@ -145,175 +221,115 @@ impl ClipboardOperations for WindowsClipboard {
     }
 }
 
-#[cfg(windows)]
-mod windows_clipboard {
-    use std::ffi::c_void;
-    use std::ptr;
-    use std::time::{Duration, Instant};
-
-    const CF_UNICODETEXT: u32 = 13;
-    const GMEM_MOVEABLE: u32 = 0x0002;
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn OpenClipboard(owner: isize) -> i32;
-        fn CloseClipboard() -> i32;
-        fn EmptyClipboard() -> i32;
-        fn GetClipboardData(format: u32) -> isize;
-        fn SetClipboardData(format: u32, memory: isize) -> isize;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
-        fn GlobalFree(memory: isize) -> isize;
-        fn GlobalLock(memory: isize) -> *mut c_void;
-        fn GlobalUnlock(memory: isize) -> i32;
-        fn GetLastError() -> u32;
-        fn SetLastError(error: u32);
-    }
-
-    struct ClipboardGuard;
-
-    impl Drop for ClipboardGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseClipboard();
-            }
-        }
-    }
-
-    struct GlobalMemory(isize);
-
-    impl Drop for GlobalMemory {
-        fn drop(&mut self) {
-            if self.0 != 0 {
-                unsafe {
-                    let _ = GlobalFree(self.0);
-                }
-            }
-        }
-    }
-
-    fn last_error(operation: &str) -> String {
-        format!("{operation} failed with Win32 error {}", unsafe {
-            GetLastError()
-        })
-    }
-
-    fn open_clipboard() -> Result<ClipboardGuard, String> {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            if unsafe { OpenClipboard(0) } != 0 {
-                return Ok(ClipboardGuard);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        Err(last_error("OpenClipboard"))
-    }
-
-    pub(super) fn read_text() -> Result<String, String> {
-        // A clipboard without Unicode text is treated as an empty previous value.
-        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
-            return Ok(String::new());
-        }
-        let _clipboard = open_clipboard()?;
-        let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
-        if handle == 0 {
-            return Err(last_error("GetClipboardData"));
-        }
-        let pointer = unsafe { GlobalLock(handle) }.cast::<u16>();
-        if pointer.is_null() {
-            return Err(last_error("GlobalLock"));
-        }
-        let mut length = 0;
-        unsafe {
-            while *pointer.add(length) != 0 {
-                length += 1;
-            }
-        }
-        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, length) });
-        unsafe {
-            SetLastError(0);
-            if GlobalUnlock(handle) == 0 && GetLastError() != 0 {
-                return Err(last_error("GlobalUnlock"));
-            }
-        }
-        Ok(text)
-    }
-
-    pub(super) fn write_text(text: &str) -> Result<(), String> {
-        let _clipboard = open_clipboard()?;
-        if unsafe { EmptyClipboard() } == 0 {
-            return Err(last_error("EmptyClipboard"));
-        }
-        let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let bytes = utf16.len() * std::mem::size_of::<u16>();
-        let mut memory = GlobalMemory(unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) });
-        if memory.0 == 0 {
-            return Err(last_error("GlobalAlloc"));
-        }
-        let pointer = unsafe { GlobalLock(memory.0) }.cast::<u16>();
-        if pointer.is_null() {
-            return Err(last_error("GlobalLock"));
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(utf16.as_ptr(), pointer, utf16.len());
-            SetLastError(0);
-            if GlobalUnlock(memory.0) == 0 && GetLastError() != 0 {
-                return Err(last_error("GlobalUnlock"));
-            }
-        }
-        if unsafe { SetClipboardData(CF_UNICODETEXT, memory.0) } == 0 {
-            return Err(last_error("SetClipboardData"));
-        }
-        memory.0 = 0; // Ownership transfers to the system.
-        Ok(())
-    }
-}
-
-impl fmt::Display for dyn ClipboardOperations + '_ {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("clipboard operations")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct Content {
+        text: Option<String>,
+        image: Vec<u8>,
+        custom: Vec<u8>,
+    }
+
+    struct Snapshot {
+        original: Content,
+        temporary: Content,
+    }
+
     #[derive(Default)]
     struct Fake {
+        clipboard: Mutex<Content>,
         calls: Mutex<Vec<String>>,
         durations: Mutex<Vec<Duration>>,
         cancel_on_wait: Mutex<Option<usize>>,
+        cancel_on_check: Mutex<Option<CancellationToken>>,
+        change_on_wait: Mutex<Option<usize>>,
         waits: Mutex<usize>,
-        fail_write_at: Mutex<Option<usize>>,
-        writes: Mutex<usize>,
+        pause_after_paste: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        backup_error: Mutex<bool>,
+        restore_error: Mutex<bool>,
         send_error: Mutex<bool>,
+    }
+
+    impl Fake {
+        fn record_wait(&self, cancellation: &CancellationToken, duration: Duration) -> bool {
+            self.calls.lock().unwrap().push("wait".into());
+            self.durations.lock().unwrap().push(duration);
+            let mut waits = self.waits.lock().unwrap();
+            *waits += 1;
+            if self
+                .change_on_wait
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at == *waits)
+            {
+                *self.clipboard.lock().unwrap() = Content {
+                    text: Some("new user copy".into()),
+                    ..Content::default()
+                };
+            }
+            if self
+                .cancel_on_wait
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at == *waits)
+            {
+                cancellation.cancel();
+                return true;
+            }
+            false
+        }
     }
 
     #[async_trait]
     impl ClipboardOperations for Fake {
-        fn read_text(&self) -> Result<String, String> {
-            self.calls.lock().unwrap().push("read".into());
-            Ok("original".into())
-        }
+        type Snapshot = Snapshot;
 
-        fn write_text(&self, text: &str) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("write:{text}"));
-            let mut writes = self.writes.lock().unwrap();
-            *writes += 1;
-            if self
-                .fail_write_at
+        fn backup_and_write(&self, text: &str) -> Result<Snapshot, ClipboardError> {
+            self.calls
                 .lock()
                 .unwrap()
-                .is_some_and(|at| at == *writes)
-            {
-                return Err("write failed".into());
+                .push(format!("backup/write:{text}"));
+            if *self.backup_error.lock().unwrap() {
+                return Err(ClipboardError::Read("backup failed".into()));
+            }
+            let mut clipboard = self.clipboard.lock().unwrap();
+            let original = clipboard.clone();
+            let temporary = Content {
+                text: Some(text.into()),
+                ..Content::default()
+            };
+            *clipboard = temporary.clone();
+            Ok(Snapshot {
+                original,
+                temporary,
+            })
+        }
+
+        fn temporary_is_current(&self, snapshot: &Snapshot) -> Result<bool, String> {
+            self.calls.lock().unwrap().push("check".into());
+            if let Some(cancellation) = self.cancel_on_check.lock().unwrap().take() {
+                cancellation.cancel();
+            }
+            Ok(*self.clipboard.lock().unwrap() == snapshot.temporary)
+        }
+
+        fn restore(&self, snapshot: &Snapshot) -> Result<(), String> {
+            self.calls.lock().unwrap().push("restore".into());
+            if *self.restore_error.lock().unwrap() {
+                return Err("restore failed".into());
+            }
+            let mut clipboard = self.clipboard.lock().unwrap();
+            if *clipboard == snapshot.temporary {
+                *clipboard = snapshot.original.clone();
             }
             Ok(())
         }
@@ -331,56 +347,79 @@ mod tests {
             cancellation: &CancellationToken,
             duration: Duration,
         ) -> Result<(), ClipboardError> {
-            self.calls.lock().unwrap().push("wait".into());
-            self.durations.lock().unwrap().push(duration);
-            let mut waits = self.waits.lock().unwrap();
-            *waits += 1;
-            if self
-                .cancel_on_wait
-                .lock()
-                .unwrap()
-                .is_some_and(|at| at == *waits)
-            {
-                cancellation.cancel();
+            if self.record_wait(cancellation, duration) {
                 return Err(ClipboardError::Canceled);
             }
             Ok(())
         }
+
+        async fn wait_after_paste(&self, cancellation: &CancellationToken, duration: Duration) {
+            let pause = self.pause_after_paste.lock().unwrap().take();
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            self.record_wait(cancellation, duration);
+        }
     }
 
     #[tokio::test]
-    async fn writes_sends_and_restores_in_order() {
-        let fake = Fake::default();
-        paste_text_with(
-            "transcription",
-            &CancellationToken::new(),
-            Duration::from_millis(25),
-            Duration::from_millis(75),
-            &fake,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            *fake.calls.lock().unwrap(),
-            [
-                "read",
-                "write:transcription",
-                "wait",
-                "send",
-                "wait",
-                "write:original"
-            ]
-        );
-        assert_eq!(
-            *fake.durations.lock().unwrap(),
-            [Duration::from_millis(25), Duration::from_millis(75)]
-        );
+    async fn restores_empty_text_image_and_multiple_formats() {
+        for original in [
+            Content::default(),
+            Content {
+                text: Some("original".into()),
+                ..Content::default()
+            },
+            Content {
+                image: vec![1, 2, 3],
+                ..Content::default()
+            },
+            Content {
+                text: Some("original".into()),
+                image: vec![4, 5],
+                custom: vec![6, 7],
+            },
+        ] {
+            let fake = Fake::default();
+            *fake.clipboard.lock().unwrap() = original.clone();
+            paste_text_with(
+                "transcription",
+                &CancellationToken::new(),
+                Duration::from_millis(25),
+                Duration::from_millis(75),
+                &fake,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*fake.clipboard.lock().unwrap(), original);
+            assert_eq!(
+                *fake.calls.lock().unwrap(),
+                [
+                    "backup/write:transcription",
+                    "wait",
+                    "check",
+                    "send",
+                    "wait",
+                    "restore"
+                ]
+            );
+            assert_eq!(
+                *fake.durations.lock().unwrap(),
+                [Duration::from_millis(25), Duration::from_millis(75)]
+            );
+        }
     }
 
     #[tokio::test]
     async fn cancellation_before_and_after_send_restores() {
         for wait in [1, 2] {
             let fake = Fake::default();
+            let original = Content {
+                image: vec![1, 2, 3],
+                ..Content::default()
+            };
+            *fake.clipboard.lock().unwrap() = original.clone();
             *fake.cancel_on_wait.lock().unwrap() = Some(wait);
             let error = paste_text_with(
                 "transcription",
@@ -392,12 +431,133 @@ mod tests {
             .await
             .unwrap_err();
             assert!(matches!(error, ClipboardError::Canceled));
-            assert!(
-                fake.calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|call| call == "write:original")
+            assert_eq!(*fake.clipboard.lock().unwrap(), original);
+            if wait == 2 {
+                assert_eq!(
+                    fake.durations.lock().unwrap().last(),
+                    Some(&Duration::from_millis(120))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_clipboard_check_restores_without_pasting() {
+        let fake = Fake::default();
+        let original = Content {
+            text: Some("original".into()),
+            image: vec![1, 2, 3],
+            ..Content::default()
+        };
+        *fake.clipboard.lock().unwrap() = original.clone();
+        let cancellation = CancellationToken::new();
+        *fake.cancel_on_check.lock().unwrap() = Some(cancellation.clone());
+
+        let result = paste_text_with(
+            "transcription",
+            &cancellation,
+            Duration::ZERO,
+            Duration::ZERO,
+            &fake,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ClipboardError::Canceled)));
+        assert_eq!(*fake.clipboard.lock().unwrap(), original);
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            ["backup/write:transcription", "wait", "check", "restore"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_paste_to_restore_clipboard() {
+        let fake = Arc::new(Fake::default());
+        let original = Content {
+            image: vec![1, 2, 3],
+            ..Content::default()
+        };
+        *fake.clipboard.lock().unwrap() = original.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *fake.pause_after_paste.lock().unwrap() = Some((started_tx, release_rx));
+        let cancellation = CancellationToken::new();
+        let paste_token = cancellation.clone();
+        let paste_fake = Arc::clone(&fake);
+        let paste = tokio::spawn(async move {
+            paste_text_with(
+                "transcription",
+                &paste_token,
+                Duration::ZERO,
+                Duration::ZERO,
+                paste_fake.as_ref(),
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        cancellation.cancel();
+
+        let mut cleanup = tokio::task::spawn_blocking(wait_for_cleanup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut cleanup)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            paste.await.unwrap(),
+            Err(ClipboardError::Canceled)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("shutdown did not finish after clipboard restoration")
+            .unwrap();
+        assert_eq!(*fake.clipboard.lock().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn failed_backup_does_not_write_or_restore() {
+        let fake = Fake::default();
+        *fake.backup_error.lock().unwrap() = true;
+        let error = paste_text_with(
+            "transcription",
+            &CancellationToken::new(),
+            Duration::ZERO,
+            Duration::ZERO,
+            &fake,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ClipboardError::Read(_)));
+        assert_eq!(*fake.calls.lock().unwrap(), ["backup/write:transcription"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_user_copy_is_preserved_before_and_after_paste() {
+        for change_at in [1, 2] {
+            let fake = Fake::default();
+            *fake.clipboard.lock().unwrap() = Content {
+                image: vec![1, 2, 3],
+                ..Content::default()
+            };
+            *fake.change_on_wait.lock().unwrap() = Some(change_at);
+            let result = paste_text_with(
+                "transcription",
+                &CancellationToken::new(),
+                Duration::ZERO,
+                Duration::ZERO,
+                &fake,
+            )
+            .await;
+            if change_at == 1 {
+                assert!(matches!(result, Err(ClipboardError::Write(_))));
+                assert!(!fake.calls.lock().unwrap().iter().any(|call| call == "send"));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(
+                fake.clipboard.lock().unwrap().text.as_deref(),
+                Some("new user copy")
             );
         }
     }
@@ -405,12 +565,12 @@ mod tests {
     #[tokio::test]
     async fn restore_after_sent_is_a_distinct_error() {
         let fake = Fake::default();
-        *fake.fail_write_at.lock().unwrap() = Some(2);
+        *fake.restore_error.lock().unwrap() = true;
         let error = paste_text_with(
             "transcription",
             &CancellationToken::new(),
-            Duration::from_millis(80),
-            Duration::from_millis(120),
+            Duration::ZERO,
+            Duration::ZERO,
             &fake,
         )
         .await
@@ -422,12 +582,12 @@ mod tests {
     async fn send_and_restore_errors_are_both_preserved() {
         let fake = Fake::default();
         *fake.send_error.lock().unwrap() = true;
-        *fake.fail_write_at.lock().unwrap() = Some(2);
+        *fake.restore_error.lock().unwrap() = true;
         let error = paste_text_with(
             "transcription",
             &CancellationToken::new(),
-            Duration::from_millis(80),
-            Duration::from_millis(120),
+            Duration::ZERO,
+            Duration::ZERO,
             &fake,
         )
         .await

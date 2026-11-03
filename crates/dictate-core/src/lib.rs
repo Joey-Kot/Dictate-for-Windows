@@ -18,6 +18,8 @@ pub mod runtime;
 pub(crate) mod segmented_upload;
 pub mod selection;
 pub mod text_input;
+#[cfg(windows)]
+mod windows_clipboard;
 
 pub use config::Config;
 

@@ -204,11 +204,11 @@ sequenceDiagram
         alt USE_SENDINPUT=true
             Core->>App: Insert Unicode text with SendInput
         else Clipboard output
-            Core->>Clipboard: Save the original text and write the result
+            Core->>Clipboard: Back up supported formats and write the result
             Core->>Core: Wait for Paste delay
             Core->>App: Ctrl+V
             Core->>Core: Wait for Restore delay
-            Core->>Clipboard: Restore the original clipboard text
+            Core->>Clipboard: Restore the original clipboard formats
         end
     end
     Core-->>User: Finish and update the state
@@ -1164,14 +1164,16 @@ Both backends use `binding_definitions()`: audio IDs are 1–3, the menu uses `R
 
 ## Clipboard and automatic paste
 
-By default (`USE_SENDINPUT=false`), the Windows GUI and hotkey mode use `CF_UNICODETEXT`:
+By default (`USE_SENDINPUT=false`), the Windows GUI and hotkey mode use the clipboard:
 
-1. Read and save the current clipboard text.
-2. Write the recognition result or successful Rewrite result.
+1. Materialize and save the current clipboard's supported formats.
+2. Write the recognition result or successful Rewrite result as `CF_UNICODETEXT`.
 3. Wait `CLIPBOARD_WRITE_DELAY` milliseconds; the default is 80.
 4. Use `keybd_event` to send `Ctrl+V`.
 5. Wait `CLIPBOARD_RESTORE_DELAY` milliseconds; the default is 120.
-6. Attempt to restore the original clipboard text, regardless of whether the preceding steps succeeded.
+6. Attempt to restore the original clipboard formats, including after failure or cancellation. If another application has replaced the temporary clipboard, retain that newer content instead.
+
+The output and Rewrite input paths share the same snapshot implementation. It preserves supported text, images, file lists and registered formats up to 256 MiB and 256 formats; backup failures leave the existing clipboard unchanged. Scintilla's column and whole-line selection markers are retained even when advertised without data; real data on those formats is copied when available. Temporary output, the pre-Copy marker and restored contents carry Windows' `ExcludeClipboardContentFromMonitorProcessing` format, so these writes do not add duplicate or empty Windows clipboard-history items. The target application's actual `Ctrl+C` write is outside Dictate's control and can itself appear in history. If a clipboard change is detected before `Ctrl+V`, output stops. Once `Ctrl+V` is sent, the restore delay completes even if the task is canceled. Normal application shutdown waits for active Copy and Paste transactions to finish restoring the clipboard.
 
 Both delays are shared with Rewrite reads and correspond to **Paste delay** and **Restore delay** on the GUI's `Audio Hotkeys` page. They can also be set through the JSON fields or CLI arguments of the same names. If the fields are missing from the configuration, 80 ms and 120 ms are still used.
 

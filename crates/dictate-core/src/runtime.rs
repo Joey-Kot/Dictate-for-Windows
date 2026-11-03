@@ -720,6 +720,9 @@ impl Runtime {
         // Copy may already be queued in another application. The native worker
         // restores the clipboard independently of the async task/executor.
         crate::selection::wait_for_cleanup();
+        // A paste already sent to the target must finish its restore delay and
+        // restore the clipboard before the GUI shuts down the async executor.
+        crate::clipboard::wait_for_cleanup();
 
         let deadline = Instant::now() + SHUTDOWN_GRACE_PERIOD;
         while Instant::now() < deadline {

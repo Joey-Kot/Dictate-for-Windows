@@ -1,4 +1,4 @@
-//! Materialized clipboard snapshots for the short Ctrl+C selection transaction.
+//! Materialized clipboard snapshots for temporary Copy and Paste transactions.
 //!
 //! Do not retain an IDataObject here: its delayed formats can become unavailable
 //! as soon as EmptyClipboard tells the original owner to release its data.
@@ -23,7 +23,7 @@ use windows::{
             DataExchange::{
                 CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
                 GetClipboardSequenceNumber, IsClipboardFormatAvailable, METAFILEPICT,
-                OpenClipboard, SetClipboardData,
+                OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
             },
             Memory::{
                 GMEM_MOVEABLE, GlobalAlloc, GlobalFlags, GlobalLock, GlobalSize, GlobalUnlock,
@@ -35,7 +35,9 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+// Windows can expose a single large image in several bitmap/DIB formats.
+// Allow typical 4K screenshots while still bounding all duplicated formats.
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FORMATS: usize = 256;
 const MAX_TEXT_BYTES: usize = 1_000_000;
 const UNICODE_TEXT: u32 = 13;
@@ -59,7 +61,7 @@ impl OwnerWindow {
             CreateWindowExW(
                 Default::default(),
                 w!("STATIC"),
-                w!("Dictate selection clipboard"),
+                w!("Dictate temporary clipboard"),
                 WS_OVERLAPPED,
                 0,
                 0,
@@ -186,6 +188,22 @@ struct ClipboardData {
 }
 
 impl ClipboardData {
+    fn from_bytes(format: u32, bytes: &[u8]) -> Result<Self, String> {
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }
+            .map_err(|error| format!("Cannot allocate clipboard data: {error}"))?;
+        let data = Self {
+            format,
+            kind: DataKind::Global,
+            handle: Cell::new(HANDLE(memory.0)),
+        };
+        let lock = GlobalLockGuard::new(memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), lock.pointer.cast(), bytes.len());
+        }
+        drop(lock);
+        Ok(data)
+    }
+
     fn duplicate(format: u32, kind: DataKind, source: HANDLE) -> Result<Self, String> {
         let handle = unsafe {
             match kind {
@@ -217,6 +235,14 @@ impl ClipboardData {
             kind,
             handle: Cell::new(handle),
         })
+    }
+
+    fn set(&self) -> Result<(), String> {
+        unsafe { SetClipboardData(self.format, Some(self.handle.get())) }
+            .map_err(|error| format!("format {}: {error}", self.format))?;
+        // Ownership transfers to Windows only after SetClipboardData succeeds.
+        self.handle.set(HANDLE::default());
+        Ok(())
     }
 }
 
@@ -272,16 +298,43 @@ impl Drop for GlobalLockGuard {
     }
 }
 
-pub(super) struct ClipboardSnapshot {
+pub(crate) struct ClipboardSnapshot {
     data: Vec<ClipboardData>,
+    history_marker: ClipboardData,
     restored: Cell<bool>,
+    temporary_id: Option<[u8; 16]>,
 }
 
-pub(super) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), String> {
-    // Clearing needs no owner. Keeping an owner window on this worker without
-    // a message loop would block the target's Copy in WM_DESTROYCLIPBOARD while
-    // we wait for it to release the clipboard.
-    let _clipboard = open(None, Duration::from_millis(300))?;
+// The snapshot exclusively owns duplicated process-wide HGLOBAL/GDI handles.
+// It contains no HWND or borrowed clipboard data; an owner window is created
+// and destroyed within each synchronous write on the thread performing it.
+unsafe impl Send for ClipboardSnapshot {}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BeginError {
+    #[error("{0}")]
+    Backup(String),
+    #[error("{0}")]
+    Replace(String),
+    #[error("{operation}; restoring clipboard failed: {restore}")]
+    ReplaceAndRestore { operation: String, restore: String },
+}
+
+fn is_presence_only_marker(format: u32) -> bool {
+    // Scintilla advertises these formats with a null handle. Their presence
+    // alone indicates a rectangular or whole-line selection.
+    unsafe {
+        format != 0
+            && (format == RegisterClipboardFormatW(w!("MSDEVColumnSelect"))
+                || format == RegisterClipboardFormatW(w!("MSDEVLineSelect"))
+                || format
+                    == RegisterClipboardFormatW(w!(
+                        "VisualStudioEditorOperationsLineCutCopyClipboardTag"
+                    )))
+    }
+}
+
+fn snapshot(history_marker: ClipboardData) -> Result<ClipboardSnapshot, String> {
     let mut formats = Vec::new();
     let mut previous = 0;
     loop {
@@ -305,32 +358,106 @@ pub(super) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), String> {
     let mut total = 0usize;
     for (format, kind) in formats {
         // Materialize delayed formats while the original clipboard owner exists.
-        let handle = unsafe { GetClipboardData(format) }
-            .map_err(|error| format!("Cannot read clipboard format {format}: {error}"))?;
+        let handle = match unsafe { GetClipboardData(format) } {
+            Ok(handle) => handle,
+            Err(_) if is_presence_only_marker(format) => {
+                // A real, nonempty handle keeps the marker available after the
+                // original clipboard owner has gone away.
+                data.push(ClipboardData::from_bytes(format, &[0])?);
+                continue;
+            }
+            Err(error) => return Err(format!("Cannot read clipboard format {format}: {error}")),
+        };
         total = total.saturating_add(kind.size(handle)?);
         if total > MAX_SNAPSHOT_BYTES {
             return Err(
-                "Clipboard backup exceeds the 64 MiB limit; clipboard was left unchanged"
+                "Clipboard backup exceeds the 256 MiB limit; clipboard was left unchanged"
                     .to_owned(),
             );
         }
         data.push(ClipboardData::duplicate(format, kind, handle)?);
     }
-    // All data has independent, owned storage before the destructive operation.
-    unsafe { EmptyClipboard() }.map_err(|error| format!("Cannot clear clipboard: {error}"))?;
-    // Capture the baseline only after our own clipboard transaction is closed.
-    drop(_clipboard);
-    let sequence = unsafe { GetClipboardSequenceNumber() };
-    Ok((
-        ClipboardSnapshot {
-            data,
-            restored: Cell::new(false),
-        },
-        sequence,
-    ))
+    Ok(ClipboardSnapshot {
+        data,
+        history_marker,
+        // Until EmptyClipboard succeeds there is nothing to restore.
+        restored: Cell::new(true),
+        temporary_id: None,
+    })
 }
 
-pub(super) fn read_changed(sequence: u32) -> Result<Option<String>, String> {
+fn begin(temporary_text: Option<&str>) -> Result<(ClipboardSnapshot, u32), BeginError> {
+    // Windows checks this registered format when processing clipboard changes.
+    // Allocate both markers and the text before touching the existing clipboard,
+    // including a spare marker for restoration if the temporary write fails.
+    let marker_format =
+        unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
+    if marker_format == 0 {
+        return Err(BeginError::Replace(
+            "Cannot register clipboard history exclusion format".into(),
+        ));
+    }
+    // The exclusion format accepts arbitrary bytes. A unique value lets us
+    // distinguish the temporary output from a later normal clipboard copy.
+    let temporary_id = temporary_text.map(|_| *uuid::Uuid::new_v4().as_bytes());
+    let temporary_marker = ClipboardData::from_bytes(
+        marker_format,
+        temporary_id.as_ref().map_or(&[0][..], |id| &id[..]),
+    )
+    .map_err(BeginError::Replace)?;
+    let restore_marker =
+        ClipboardData::from_bytes(marker_format, &[0]).map_err(BeginError::Replace)?;
+    let text = temporary_text
+        .map(|text| {
+            let bytes: Vec<u8> = text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            ClipboardData::from_bytes(UNICODE_TEXT, &bytes)
+        })
+        .transpose()
+        .map_err(BeginError::Replace)?;
+
+    // The window must be gone before waiting for another process to Copy; a
+    // live owner on a worker without a message loop can block that process.
+    let owner = OwnerWindow::new().map_err(BeginError::Replace)?;
+    let clipboard = open(Some(owner.0), Duration::from_millis(1000)).map_err(BeginError::Backup)?;
+    let mut snapshot = snapshot(restore_marker).map_err(BeginError::Backup)?;
+    unsafe { EmptyClipboard() }
+        .map_err(|error| BeginError::Replace(format!("Cannot clear clipboard: {error}")))?;
+    snapshot.restored.set(false);
+
+    let write = temporary_marker
+        .set()
+        .and_then(|()| text.as_ref().map_or(Ok(()), ClipboardData::set));
+    if let Err(operation) = write {
+        let restore = snapshot.restore_open();
+        // If restoration failed before clearing, release the open clipboard
+        // before the snapshot's Drop makes a final best-effort attempt.
+        drop(clipboard);
+        drop(owner);
+        return match restore {
+            Ok(()) => Err(BeginError::Replace(operation)),
+            Err(restore) => Err(BeginError::ReplaceAndRestore { operation, restore }),
+        };
+    }
+    snapshot.temporary_id = temporary_id;
+    drop(clipboard);
+    drop(owner);
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    Ok((snapshot, sequence))
+}
+
+pub(crate) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), BeginError> {
+    begin(None)
+}
+
+pub(crate) fn backup_and_write(text: &str) -> Result<ClipboardSnapshot, BeginError> {
+    begin(Some(text)).map(|(snapshot, _)| snapshot)
+}
+
+pub(crate) fn read_changed(sequence: u32) -> Result<Option<String>, String> {
     if unsafe { OpenClipboard(None) }.is_err() {
         return Ok(None);
     }
@@ -366,7 +493,31 @@ pub(super) fn read_changed(sequence: u32) -> Result<Option<String>, String> {
 }
 
 impl ClipboardSnapshot {
-    pub(super) fn restore(&self) -> Result<(), String> {
+    // Called only while the clipboard is open.
+    fn temporary_is_current_open(&self) -> Result<bool, String> {
+        let Some(id) = self.temporary_id else {
+            return Ok(true);
+        };
+        if unsafe { IsClipboardFormatAvailable(self.history_marker.format) }.is_err() {
+            return Ok(false);
+        }
+        let handle = unsafe { GetClipboardData(self.history_marker.format) }
+            .map_err(|error| format!("Cannot check temporary clipboard: {error}"))?;
+        let memory = HGLOBAL(handle.0);
+        if unsafe { GlobalSize(memory) } < id.len() {
+            return Ok(false);
+        }
+        let lock = GlobalLockGuard::new(memory)?;
+        let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), id.len()) };
+        Ok(bytes == id)
+    }
+
+    pub(crate) fn temporary_is_current(&self) -> Result<bool, String> {
+        let _clipboard = open(None, Duration::from_secs(1))?;
+        self.temporary_is_current_open()
+    }
+
+    pub(crate) fn restore(&self) -> Result<(), String> {
         if self.restored.get() {
             return Ok(());
         }
@@ -375,13 +526,34 @@ impl ClipboardSnapshot {
         // Declare the owner first so the clipboard closes before it is destroyed.
         let owner = OwnerWindow::new()?;
         let _clipboard = open(Some(owner.0), Duration::from_secs(1))?;
+        if !self.temporary_is_current_open()? {
+            // Another application has replaced our temporary output. Keep the
+            // newer clipboard rather than putting the older snapshot over it.
+            self.restored.set(true);
+            return Ok(());
+        }
+        self.restore_open()
+    }
+
+    // Called only while a clipboard owner has the clipboard open.
+    fn restore_open(&self) -> Result<(), String> {
         unsafe { EmptyClipboard() }
             .map_err(|error| format!("Cannot restore clipboard: {error}"))?;
         let mut failures = Vec::new();
+        // Reuse an original exclusion format if present. Otherwise add one so
+        // restoring an old item does not create another history/cloud entry.
+        let original_marker = self
+            .data
+            .iter()
+            .find(|data| data.format == self.history_marker.format);
+        if let Err(error) = original_marker.unwrap_or(&self.history_marker).set() {
+            failures.push(error);
+        }
         for data in &self.data {
-            match unsafe { SetClipboardData(data.format, Some(data.handle.get())) } {
-                Ok(_) => data.handle.set(HANDLE::default()), // Ownership transfers to Windows.
-                Err(error) => failures.push(format!("format {}: {error}", data.format)),
+            if data.format != self.history_marker.format
+                && let Err(error) = data.set()
+            {
+                failures.push(error);
             }
         }
         // Never clear a partially restored clipboard on a subsequent call.
@@ -393,6 +565,15 @@ impl ClipboardSnapshot {
                 "Cannot fully restore clipboard ({})",
                 failures.join("; ")
             ))
+        }
+    }
+}
+
+impl Drop for ClipboardSnapshot {
+    fn drop(&mut self) {
+        // A dropped async output task must still make a best effort to restore.
+        if !self.restored.get() {
+            let _ = self.restore();
         }
     }
 }

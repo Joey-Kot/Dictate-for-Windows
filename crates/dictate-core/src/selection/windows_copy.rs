@@ -8,7 +8,8 @@ use windows::Win32::{
     },
 };
 
-use super::{CopyBackend, windows_clipboard};
+use super::{CopyBackend, SelectionError};
+use crate::windows_clipboard::{self, BeginError};
 
 pub(super) struct WindowsCopy {
     foreground: usize,
@@ -65,8 +66,11 @@ impl CopyBackend for WindowsCopy {
             .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) < 0 })
     }
 
-    fn backup_and_clear(&self) -> Result<(Self::Snapshot, u32), String> {
-        windows_clipboard::backup_and_clear()
+    fn backup_and_clear(&self) -> Result<(Self::Snapshot, u32), SelectionError> {
+        windows_clipboard::backup_and_clear().map_err(|error| match error {
+            BeginError::ReplaceAndRestore { .. } => SelectionError::Restore(error.to_string()),
+            _ => SelectionError::Read(error.to_string()),
+        })
     }
 
     fn send_copy(&self) -> Result<(), String> {

@@ -584,6 +584,8 @@ An appended selector operates on every already matched JSON value; it does not i
 
 By default, text is inserted through the clipboard because clipboard writing is fast for large text and preserves prior clipboard content. With Use SendInput enabled, text is injected through SendInput. This option suits inputs that cannot use the clipboard, but SendInput is slower than the clipboard for large one-shot text because it must wait for every character event.
 
+Clipboard output and Rewrite reading back up supported clipboard formats, including text and images. The temporary output and restored contents are excluded from Windows clipboard history; the target application's Copy during Rewrite may still appear there. If the clipboard changes during output, the newer content is kept. Backups are limited to 256 MiB and 256 formats, and unsupported formats stop the operation before the clipboard is changed.
+
 ## Cache and temporary files
 
 The application has two audio caches:

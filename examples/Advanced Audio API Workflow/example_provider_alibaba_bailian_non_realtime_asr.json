@@ -1,0 +1,255 @@
+{
+  "schema_version": 2,
+  "name": "Alibaba Bailian Non-Realtime ASR",
+  "parameters": [
+    {
+      "id": "workspace_id",
+      "label": "Workspace ID",
+      "required": true,
+      "default": null,
+      "description": "Alibaba Cloud Bailian workspace ID used in the regional endpoint.",
+      "type": "text"
+    },
+    {
+      "id": "model",
+      "label": "ASR Model",
+      "required": true,
+      "default": "qwen-audio-3.1-asr-flash",
+      "description": null,
+      "type": "select",
+      "options": [
+        {
+          "value": "qwen-audio-3.1-asr-flash",
+          "label": "Qwen Audio 3.1 ASR Flash"
+        },
+        {
+          "value": "qwen-audio-3.0-asr-flash",
+          "label": "Qwen Audio 3.0 ASR Flash"
+        },
+        {
+          "value": "fun-asr-flash-2026-06-15",
+          "label": "Fun ASR Flash (2026-06-15)"
+        }
+      ]
+    },
+    {
+      "id": "audio_format",
+      "label": "Audio Format",
+      "required": true,
+      "default": "wav",
+      "description": "Actual audio format, for example wav, mp3, or opus.",
+      "type": "text"
+    },
+    {
+      "id": "sample_rate",
+      "label": "Sample Rate (Hz)",
+      "required": true,
+      "default": "16000",
+      "description": "Audio sample rate in Hz.",
+      "type": "text"
+    },
+    {
+      "id": "language_hints",
+      "label": "Language Hints",
+      "required": true,
+      "default": "[\"zh\"]",
+      "description": "Select likely recognition languages. Qwen Audio 3.x supports up to four values; Fun ASR Flash uses only the first value.",
+      "type": "multi_select",
+      "options": [
+        {
+          "value": "zh",
+          "label": "Chinese"
+        },
+        {
+          "value": "en",
+          "label": "English"
+        },
+        {
+          "value": "ja",
+          "label": "Japanese"
+        },
+        {
+          "value": "ko",
+          "label": "Korean"
+        },
+        {
+          "value": "vi",
+          "label": "Vietnamese"
+        },
+        {
+          "value": "th",
+          "label": "Thai"
+        },
+        {
+          "value": "id",
+          "label": "Indonesian"
+        },
+        {
+          "value": "ms",
+          "label": "Malay"
+        },
+        {
+          "value": "tl",
+          "label": "Filipino"
+        },
+        {
+          "value": "hi",
+          "label": "Hindi"
+        },
+        {
+          "value": "ar",
+          "label": "Arabic"
+        },
+        {
+          "value": "fr",
+          "label": "French"
+        },
+        {
+          "value": "de",
+          "label": "German"
+        },
+        {
+          "value": "es",
+          "label": "Spanish"
+        },
+        {
+          "value": "pt",
+          "label": "Portuguese"
+        },
+        {
+          "value": "ru",
+          "label": "Russian"
+        },
+        {
+          "value": "it",
+          "label": "Italian"
+        },
+        {
+          "value": "nl",
+          "label": "Dutch"
+        },
+        {
+          "value": "sv",
+          "label": "Swedish"
+        },
+        {
+          "value": "da",
+          "label": "Danish"
+        },
+        {
+          "value": "fi",
+          "label": "Finnish"
+        },
+        {
+          "value": "no",
+          "label": "Norwegian"
+        },
+        {
+          "value": "el",
+          "label": "Greek"
+        },
+        {
+          "value": "pl",
+          "label": "Polish"
+        },
+        {
+          "value": "cs",
+          "label": "Czech"
+        },
+        {
+          "value": "hu",
+          "label": "Hungarian"
+        },
+        {
+          "value": "ro",
+          "label": "Romanian"
+        },
+        {
+          "value": "bg",
+          "label": "Bulgarian"
+        },
+        {
+          "value": "hr",
+          "label": "Croatian"
+        },
+        {
+          "value": "sk",
+          "label": "Slovak"
+        }
+      ]
+    },
+    {
+      "id": "instant_hotwords",
+      "label": "Instant Hotwords",
+      "required": true,
+      "default": "{}",
+      "description": "JSON object mapping hotword text to an integer weight from 1 through 5, or 50 for a super hotword.",
+      "type": "json_object"
+    }
+  ],
+  "secrets": [
+    {
+      "id": "api_key",
+      "label": "DashScope API Key",
+      "required": true,
+      "description": null
+    }
+  ],
+  "audio": {
+    "delivery": {
+      "type": "data_uri"
+    },
+    "mime": null
+  },
+  "recognition": {
+    "mode": "request",
+    "request": {
+      "method": "POST",
+      "url": "https://{{var:workspace_id}}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+      "query": {},
+      "headers": {
+        "Authorization": "Bearer {{secret:api_key}}",
+        "Content-Type": "application/json",
+        "X-DashScope-SSE": "disable"
+      },
+      "body": {
+        "type": "json",
+        "value": {
+          "input": {
+            "messages": [
+              {
+                "content": [
+                  {
+                    "input_audio": {
+                      "data": "{{audio:data_uri}}"
+                    },
+                    "type": "input_audio"
+                  }
+                ],
+                "role": "user"
+              }
+            ]
+          },
+          "model": "{{var:model}}",
+          "parameters": {
+            "format": "{{var:audio_format}}",
+            "language_hints": "{{var:language_hints}}",
+            "sample_rate": "{{var:sample_rate}}",
+            "vocabulary": "{{var:instant_hotwords}}"
+          }
+        }
+      },
+      "accepted_statuses": [
+        200
+      ],
+      "signer": {
+        "type": "none"
+      },
+      "captures": []
+    },
+    "final_text": {
+      "type": "json_path",
+      "path": "$.output.text"
+    }
+  }
+}

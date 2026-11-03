@@ -206,15 +206,15 @@ limits. Input is bounded to 1,000,000 UTF-8 bytes. Cancellation or focus changes
 during the pre-copy delay restore without copying; after Copy, the configured
 restore delay completes even when canceled.
 
-The backup/clear phase uses a null clipboard owner. The native worker has no
-window message loop, so retaining an owner window while waiting for Copy would
-block the target application's `EmptyClipboard` in `WM_DESTROYCLIPBOARD` and
-leave the clipboard locked. Restoration alone uses a temporary owner window for
-`SetClipboardData`, closing the clipboard before destroying the window. All
+The backup/clear phase uses a temporary owner window to install the history
+exclusion marker, then closes the clipboard and destroys that window before
+waiting for Copy. Retaining an owner window on the native worker, which has no
+message loop, could block the target application's `EmptyClipboard` in
+`WM_DESTROYCLIPBOARD`. Restoration also uses a temporary owner window. All
 restored formats are materialized and need no delayed-rendering window.
 
 Snapshots preserve supported materializable text, HTML/RTF, image and file-list
-formats, up to 64 MiB and 256 formats. Unsupported or unmaterializable formats
+formats, up to 256 MiB and 256 formats. Unsupported or unmaterializable formats
 fail before the original clipboard is cleared. Cancellation and normal shutdown
 wait for the single native worker to attempt restoration; the shared task stays
 busy during cleanup. Restore failures remain visible even after cancellation
@@ -347,13 +347,16 @@ The default clipboard channel uses `keybd_event` for `Ctrl+V`. The exact v1.1.2 
 3. virtual-key Ctrl up: `(0x11, 0x91, KEYEVENTF_KEYUP)`;
 4. scan-code V up: `(47, 175, KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE)`.
 
-Clipboard transport is `CF_UNICODETEXT`. Opening waits for up to one second
-and the open/close transaction stays on one OS thread. The runtime reads the
-old text, writes the transcription, waits `CLIPBOARD_WRITE_DELAY` milliseconds,
-sends Ctrl+V, waits `CLIPBOARD_RESTORE_DELAY` milliseconds, and unconditionally
-tries to restore the old text. The defaults remain 80 ms and 120 ms. Both waits
-are cancellable. “Paste sent; clipboard restore failed” remains distinct from
-pre-paste failure.
+Clipboard output is `CF_UNICODETEXT`. Opening waits for up to one second and
+each open/close transaction stays on one OS thread. The runtime materializes
+the supported clipboard formats and writes temporary text in one transaction,
+waits `CLIPBOARD_WRITE_DELAY`, sends Ctrl+V, waits `CLIPBOARD_RESTORE_DELAY`,
+then restores the snapshot unless a newer copy has replaced the temporary text.
+The defaults remain 80 ms and 120 ms. The first wait is cancellable; after Ctrl+V
+the full restore delay completes even on cancellation. Temporary and restored
+contents carry the Windows history exclusion marker. The target application's
+Copy for Rewrite can still appear in history. “Paste sent; clipboard restore
+failed” remains distinct from pre-paste failure.
 
 The current optional `USE_SENDINPUT` setting supersedes the original prohibition
 on SendInput. It defaults to false, including in older configuration files.
