@@ -1271,6 +1271,8 @@ The option defaults to six items and accepts 0–1000. `F8` toggles at the point
 
 ### Building native dependencies and applications
 
+The FFmpeg dependency build requires `aria2c` to download source archives.
+
 ```bash
 scripts/build-ffmpeg-windows-amd64.sh
 scripts/build-rust-windows-amd64.sh

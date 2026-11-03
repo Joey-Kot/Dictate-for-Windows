@@ -636,6 +636,8 @@ For log receiving, buffering, request redaction, and native FFmpeg forwarding te
 
 ### Building native dependencies and applications
 
+The FFmpeg dependency build requires `aria2c` to download source archives.
+
 ```bash
 scripts/build-ffmpeg-windows-amd64.sh
 scripts/build-rust-windows-amd64.sh

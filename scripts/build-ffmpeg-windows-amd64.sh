@@ -36,9 +36,27 @@ export LDFLAGS="-L$PREFIX/lib"
 fetch_tarball() {
 	local url="$1"
 	local out="$2"
+	local attempt status
 	if [ ! -f "$out" ]; then
-		curl --fail --location "$url" -o "$out.part"
-		mv "$out.part" "$out"
+		# Retry whole invocations because aria2 does not retry some TLS errors.
+		for attempt in {1..6}; do
+			if aria2c -s16 -x16 -k1M --file-allocation=none \
+				--max-tries=1 --connect-timeout=30 --timeout=300 \
+				--allow-overwrite=true --auto-file-renaming=false \
+				--dir="$(dirname "$out")" --out="$(basename "$out").part" \
+				"$url"; then
+				mv "$out.part" "$out"
+				return $?
+			else
+				status=$?
+			fi
+			if [ "$attempt" -lt 6 ]; then
+				echo "Download failed (attempt $attempt/6); retrying in 3 seconds: $url" >&2
+				sleep 3
+			fi
+		done
+		echo "Download failed after 6 attempts: $url" >&2
+		return "$status"
 	fi
 }
 

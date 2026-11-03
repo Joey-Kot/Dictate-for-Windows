@@ -632,6 +632,8 @@ Rewrite 的自动化结果及待执行的选区读取、真实写入、Provider 
 
 ### 构建原生依赖与程序
 
+构建 FFmpeg 依赖时，需要使用 `aria2c` 下载源码包。
+
 ```bash
 scripts/build-ffmpeg-windows-amd64.sh
 scripts/build-rust-windows-amd64.sh
