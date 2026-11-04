@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="spinner-title">
+  <title id="spinner-title">处理中</title>
+  <circle cx="64" cy="64" r="60" fill="#1f2937" />
+  <g fill="#ffffff">
+    <circle cx="64" cy="36" r="4" opacity="0.15" />
+    <circle cx="78" cy="39.751" r="4" opacity="0.22" />
+    <circle cx="88.249" cy="50" r="4" opacity="0.30" />
+    <circle cx="92" cy="64" r="4" opacity="0.38" />
+    <circle cx="88.249" cy="78" r="4" opacity="0.46" />
+    <circle cx="78" cy="88.249" r="4" opacity="0.54" />
+    <circle cx="64" cy="92" r="4" opacity="0.62" />
+    <circle cx="50" cy="88.249" r="4" opacity="0.70" />
+    <circle cx="39.751" cy="78" r="4" opacity="0.78" />
+    <circle cx="36" cy="64" r="4" opacity="0.86" />
+    <circle cx="39.751" cy="50" r="4" opacity="0.94" />
+    <circle cx="50" cy="39.751" r="4" opacity="1" />
+    <animateTransform attributeName="transform" type="rotate" from="0 64 64" to="360 64 64" dur="1.2s" repeatCount="indefinite" />
+  </g>
+</svg>

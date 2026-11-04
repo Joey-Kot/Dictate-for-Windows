@@ -170,12 +170,31 @@ impl Recorder {
         }
     }
 
+    /// A key held on focus entry may be released before the recorder hook sees
+    /// its key-up. Reconcile only this entry wait, never an in-progress chord.
+    /// The caller must include keys swallowed by the hook: Windows need not
+    /// report those keys as down in its asynchronous keyboard state.
+    pub fn reconcile_entry_keys(&mut self, mut is_down: impl FnMut(u32) -> bool) {
+        if self.priming {
+            for (vk, down) in self.down.iter_mut().enumerate() {
+                if *down && !is_down(vk as u32) {
+                    *down = false;
+                }
+            }
+            self.priming = self.down.iter().any(|down| *down);
+        }
+    }
+
     pub fn event(&mut self, vk: u32, pressed: bool) -> Update {
         if vk >= 256 {
             return Update::Invalid;
         }
         if self.down[vk as usize] == pressed {
-            return self.preview();
+            return if self.priming {
+                Update::Waiting
+            } else {
+                self.preview()
+            };
         }
         self.down[vk as usize] = pressed;
         if self.priming {
@@ -338,6 +357,71 @@ mod tests {
         assert_eq!(
             r.event(0x70, false),
             Update::Complete(parse_hotkey("f1").unwrap())
+        );
+    }
+
+    #[test]
+    fn missed_entry_release_does_not_block_single_keys_or_modifier_chords() {
+        for modifiers in 0..8 {
+            for vk in [0x41, 0x70, 0x1b, 0x61, 0xbb] {
+                let mut r = Recorder::default();
+                r.seed([0x09, 0xa0]);
+                // Both entry keys were released before their key-up reached
+                // the capture hook. The next physical event reconciles them.
+                r.reconcile_entry_keys(|_| false);
+                let keys: Vec<_> = [(2, 0xa2), (4, 0xa0), (1, 0xa4)]
+                    .into_iter()
+                    .filter_map(|(mask, vk)| (modifiers & mask != 0).then_some(vk))
+                    .chain([vk])
+                    .collect();
+                for key in &keys {
+                    assert!(matches!(r.event(*key, true), Update::Preview(_)));
+                }
+                for key in &keys[..keys.len() - 1] {
+                    r.event(*key, false);
+                }
+                assert_eq!(
+                    r.event(vk, false),
+                    Update::Complete(ParsedHotkey {
+                        modifiers,
+                        virtual_key: vk,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn entry_wait_preserves_held_keys_and_repeats_until_every_key_is_released() {
+        let mut r = Recorder::default();
+        r.seed([0xa0, 9]);
+        r.reconcile_entry_keys(|_| true);
+        assert_eq!(r.event(9, true), Update::Waiting);
+        assert_eq!(r.event(0x41, true), Update::Waiting);
+        r.reconcile_entry_keys(|vk| vk == 0xa0 || vk == 0x41);
+        assert_eq!(r.event(0xa0, false), Update::Waiting);
+        // A is still held and swallowed, even if Windows reports it as up.
+        r.reconcile_entry_keys(|vk| vk == 0x41);
+        assert_eq!(r.event(0x41, true), Update::Waiting);
+        assert_eq!(r.event(0x41, false), Update::Waiting);
+        r.event(0x70, true);
+        assert_eq!(
+            r.event(0x70, false),
+            Update::Complete(parse_hotkey("f1").unwrap())
+        );
+    }
+
+    #[test]
+    fn asynchronous_state_cannot_erase_a_chord_swallowed_by_the_hook() {
+        let mut r = Recorder::default();
+        r.event(0xa2, true);
+        r.reconcile_entry_keys(|_| false);
+        r.event(0x41, true);
+        r.reconcile_entry_keys(|_| false);
+        r.event(0xa2, false);
+        assert_eq!(
+            r.event(0x41, false),
+            Update::Complete(parse_hotkey("ctrl+a").unwrap())
         );
     }
 }

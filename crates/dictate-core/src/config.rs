@@ -17,6 +17,24 @@ pub const DEFAULT_SENDINPUT_BATCH_SIZE: u32 = 128;
 /// Keep one injected batch bounded even when a configuration file is edited by hand.
 pub const MAX_SENDINPUT_BATCH_SIZE: u32 = 4_096;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BatchTranscriptionConfig {
+    /// Empty selects the GUI's Documents/Transcripts default.
+    pub output_dir: String,
+    /// Concurrent files; Network's MAX_UPLOAD_CONCURRENCY separately caps all workflows.
+    pub batch_size: u32,
+}
+
+impl Default for BatchTranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: String::new(),
+            batch_size: 1,
+        }
+    }
+}
+
 pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
     if !(0.5..=1.0).contains(&value) {
         return Err(ConfigError::Invalid(
@@ -30,6 +48,8 @@ pub fn validate_vad_start_threshold(value: f64) -> Result<(), ConfigError> {
 #[serde(default)]
 #[allow(non_snake_case)]
 pub struct Config {
+    #[serde(rename = "BATCH_TRANSCRIPTION")]
+    pub batch_transcription: BatchTranscriptionConfig,
     #[serde(rename = "REWRITE")]
     pub rewrite: crate::rewrite::RewriteConfig,
     /// Optional declarative protocol used only when explicitly enabled. Keep
@@ -131,6 +151,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            batch_transcription: BatchTranscriptionConfig::default(),
             rewrite: crate::rewrite::RewriteConfig::default(),
             advanced_audio_api: crate::advanced_audio::AdvancedAudioConfig::default(),
             api_endpoint: String::new(),
@@ -248,6 +269,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.batch_transcription.batch_size == 0 {
+            return Err(ConfigError::Invalid(
+                "invalid BATCH_TRANSCRIPTION.batch_size (must be > 0)".into(),
+            ));
+        }
         self.rewrite.validate().map_err(ConfigError::Invalid)?;
         crate::advanced_audio::validate_advanced_audio_config(&self.advanced_audio_api)
             .map_err(|error| ConfigError::Invalid(format!("Advanced Audio API: {error}")))?;
@@ -607,6 +633,8 @@ mod tests {
     fn missing_and_unknown_fields_are_compatible() {
         let cfg: Config = serde_json::from_str(r#"{"UNKNOWN":1,"CHANNELS":2}"#).unwrap();
         assert_eq!(cfg.channels, 2);
+        assert_eq!(cfg.batch_transcription.batch_size, 1);
+        assert!(cfg.batch_transcription.output_dir.is_empty());
         assert_eq!(cfg.text_path, "$.text");
         assert_eq!(cfg.codecs, "opus");
         assert_eq!(cfg.clipboard_write_delay, 80);
@@ -623,6 +651,30 @@ mod tests {
         assert_eq!(cfg.window_scale, 1.0);
         assert!(!cfg.advanced_audio_api.enabled);
         assert!(cfg.advanced_audio_api.workflow.is_none());
+    }
+
+    #[test]
+    fn batch_settings_roundtrip_and_reject_invalid_file_counts() {
+        let mut config: Config = serde_json::from_str(
+            r#"{"BATCH_TRANSCRIPTION":{"output_dir":"C:\\Transcripts","batch_size":5}}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.batch_transcription.output_dir, "C:\\Transcripts");
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        config.batch_transcription.batch_size = 0;
+        assert!(config.validate().is_err());
+        for value in ["-1", "1.5", "4294967296"] {
+            assert!(
+                serde_json::from_str::<Config>(&format!(
+                    r#"{{"BATCH_TRANSCRIPTION":{{"batch_size":{value}}}}}"#
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]

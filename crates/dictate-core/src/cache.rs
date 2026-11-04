@@ -121,7 +121,12 @@ pub fn handle_cache(
     }
 
     let directory = Path::new(&config.cache_dir);
-    let base = format!("audio-{}", Local::now().format("%Y-%m-%d-%H.%M.%S"));
+    let id = Uuid::new_v4().simple().to_string();
+    let base = format!(
+        "audio-{}-{}",
+        Local::now().format("%Y-%m-%d-%H.%M.%S"),
+        &id[..8]
+    );
     let mut cached_wav = None;
     if let Some(path) = wav_path {
         let target = directory.join(format!("{base}{}", extension_with_dot(path)));
@@ -276,6 +281,42 @@ mod tests {
         handle_cache(&Config::default(), Some(&wav), Some(&output), true, b"{}");
         assert!(!wav.exists());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn simultaneous_file_archives_keep_distinct_audio_and_response_pairs() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: root.path().to_string_lossy().into_owned(),
+            keep_cache: true,
+            ..Config::default()
+        };
+        for index in 0..4 {
+            let input = root.path().join(format!("RecordTemp_{index}.wav"));
+            fs::write(&input, format!("audio-{index}")).unwrap();
+            handle_cache(
+                &config,
+                None,
+                Some(&input),
+                true,
+                format!("response-{index}").as_bytes(),
+            );
+        }
+        let paths: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 8);
+        for audio in paths
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "wav"))
+        {
+            let text = fs::read_to_string(audio).unwrap();
+            assert_eq!(
+                fs::read_to_string(audio.with_extension("json")).unwrap(),
+                text.replace("audio", "response")
+            );
+        }
     }
 
     #[test]

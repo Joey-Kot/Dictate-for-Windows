@@ -83,6 +83,33 @@ fn lookup(table: &'static [(&'static str, &'static str)], key: &str) -> Option<&
 }
 
 const ENGLISH: &[(&str, &str)] = &[
+    ("batch_transcription", "Batch Transcription"),
+    ("batch_files", "Files"),
+    ("batch_folders", "Folders"),
+    ("batch_transcribe", "Transcribe"),
+    ("batch_retry", "Retry"),
+    ("batch_output_directory", "Output directory"),
+    ("batch_size", "Batch Size"),
+    ("batch_processing", "Processing"),
+    ("batch_completed", "Completed"),
+    ("batch_failed", "Failed"),
+    (
+        "batch_invalid_size",
+        "Batch Size must be a positive integer.",
+    ),
+    ("batch_output_required", "Output directory is required."),
+    ("batch_busy", "A task is already running."),
+    (
+        "batch_worker_stopped",
+        "The batch worker stopped unexpectedly.",
+    ),
+    ("batch_import_errors", "Some paths could not be read:"),
+    ("batch_audio_files", "Audio files"),
+    ("Batch transcription", "Batch transcription"),
+    (
+        "Batch transcription completed",
+        "Batch transcription completed",
+    ),
     (
         "rewrite_menu_key_required",
         "Enter a Menu key before saving enabled menu settings.",
@@ -387,6 +414,24 @@ const ENGLISH: &[(&str, &str)] = &[
 ];
 
 const CHINESE: &[(&str, &str)] = &[
+    ("batch_transcription", "批量转写"),
+    ("batch_files", "文件"),
+    ("batch_folders", "文件夹"),
+    ("batch_transcribe", "转写"),
+    ("batch_retry", "重试"),
+    ("batch_output_directory", "输出目录"),
+    ("batch_size", "批量大小"),
+    ("batch_processing", "处理中"),
+    ("batch_completed", "已完成"),
+    ("batch_failed", "失败"),
+    ("batch_invalid_size", "批量大小必须是正整数。"),
+    ("batch_output_required", "请填写输出目录。"),
+    ("batch_busy", "已有任务正在运行。"),
+    ("batch_worker_stopped", "批量转写任务意外停止。"),
+    ("batch_import_errors", "部分路径无法读取："),
+    ("batch_audio_files", "音频文件"),
+    ("Batch transcription", "批量转写中"),
+    ("Batch transcription completed", "批量转写已结束"),
     (
         "rewrite_menu_key_required",
         "启用菜单后，请先填写菜单快捷键再保存设置。",
@@ -661,6 +706,39 @@ const CHINESE: &[(&str, &str)] = &[
 ];
 
 const GERMAN: &[(&str, &str)] = &[
+    ("batch_transcription", "Stapeltranskription"),
+    ("batch_files", "Dateien"),
+    ("batch_folders", "Ordner"),
+    ("batch_transcribe", "Transkribieren"),
+    ("batch_retry", "Wiederholen"),
+    ("batch_output_directory", "Ausgabeordner"),
+    ("batch_size", "Stapelgröße"),
+    ("batch_processing", "In Arbeit"),
+    ("batch_completed", "Fertig"),
+    ("batch_failed", "Fehler"),
+    (
+        "batch_invalid_size",
+        "Die Stapelgröße muss eine positive ganze Zahl sein.",
+    ),
+    (
+        "batch_output_required",
+        "Ein Ausgabeordner ist erforderlich.",
+    ),
+    ("batch_busy", "Eine Aufgabe wird bereits ausgeführt."),
+    (
+        "batch_worker_stopped",
+        "Die Stapelverarbeitung wurde unerwartet beendet.",
+    ),
+    (
+        "batch_import_errors",
+        "Einige Pfade konnten nicht gelesen werden:",
+    ),
+    ("batch_audio_files", "Audiodateien"),
+    ("Batch transcription", "Stapeltranskription"),
+    (
+        "Batch transcription completed",
+        "Stapeltranskription abgeschlossen",
+    ),
     ("hotkey_duplicate", "Tastenkürzel kollidiert mit"),
     ("hotkey_press", "Tastenkürzel drücken…"),
     (
@@ -934,6 +1012,33 @@ const GERMAN: &[(&str, &str)] = &[
 ];
 
 const JAPANESE: &[(&str, &str)] = &[
+    ("batch_transcription", "一括文字起こし"),
+    ("batch_files", "ファイル"),
+    ("batch_folders", "フォルダー"),
+    ("batch_transcribe", "文字起こし"),
+    ("batch_retry", "再試行"),
+    ("batch_output_directory", "出力先フォルダー"),
+    ("batch_size", "バッチサイズ"),
+    ("batch_processing", "処理中"),
+    ("batch_completed", "完了"),
+    ("batch_failed", "失敗"),
+    (
+        "batch_invalid_size",
+        "バッチサイズには正の整数を入力してください。",
+    ),
+    (
+        "batch_output_required",
+        "出力先フォルダーを指定してください。",
+    ),
+    ("batch_busy", "別の処理が実行中です。"),
+    ("batch_worker_stopped", "一括処理が予期せず停止しました。"),
+    ("batch_import_errors", "一部のパスを読み取れませんでした："),
+    ("batch_audio_files", "音声ファイル"),
+    ("Batch transcription", "一括文字起こし中"),
+    (
+        "Batch transcription completed",
+        "一括文字起こしが終了しました",
+    ),
     ("hotkey_duplicate", "ショートカットが競合しています"),
     ("hotkey_press", "ショートカットを押してください…"),
     (
@@ -1189,6 +1294,36 @@ const JAPANESE: &[(&str, &str)] = &[
 ];
 
 const FRENCH: &[(&str, &str)] = &[
+    ("batch_transcription", "Transcription par lot"),
+    ("batch_files", "Fichiers"),
+    ("batch_folders", "Dossiers"),
+    ("batch_transcribe", "Transcrire"),
+    ("batch_retry", "Réessayer"),
+    ("batch_output_directory", "Dossier de sortie"),
+    ("batch_size", "Taille du lot"),
+    ("batch_processing", "En cours"),
+    ("batch_completed", "Terminé"),
+    ("batch_failed", "Échec"),
+    (
+        "batch_invalid_size",
+        "La taille du lot doit être un entier positif.",
+    ),
+    ("batch_output_required", "Un dossier de sortie est requis."),
+    ("batch_busy", "Une tâche est déjà en cours."),
+    (
+        "batch_worker_stopped",
+        "Le traitement par lot s’est arrêté de manière inattendue.",
+    ),
+    (
+        "batch_import_errors",
+        "Certains chemins n’ont pas pu être lus :",
+    ),
+    ("batch_audio_files", "Fichiers audio"),
+    ("Batch transcription", "Transcription par lot"),
+    (
+        "Batch transcription completed",
+        "Transcription par lot terminée",
+    ),
     ("hotkey_duplicate", "Le raccourci entre en conflit avec"),
     ("hotkey_press", "Appuyez sur un raccourci…"),
     (

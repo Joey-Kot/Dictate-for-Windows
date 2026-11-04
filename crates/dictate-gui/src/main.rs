@@ -6,6 +6,10 @@ mod advanced_audio_prompt;
 #[cfg(any(windows, test))]
 mod audio_options;
 #[cfg(any(windows, test))]
+mod batch_layout;
+#[cfg(any(windows, test))]
+mod batch_queue;
+#[cfg(any(windows, test))]
 mod debug_log;
 #[cfg(all(test, not(windows)))]
 mod dropdown_scrollbar;
@@ -33,6 +37,9 @@ mod rewrite_menu_preview;
 mod settings;
 #[cfg(windows)]
 mod taskbar;
+#[cfg(any(windows, test))]
+#[cfg_attr(all(test, not(windows)), allow(dead_code))]
+mod test_status_icons;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]

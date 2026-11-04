@@ -261,6 +261,23 @@ unsafe extern "system" fn hover_proc(
 unsafe fn draw_buffered(parent: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+        with_buffered_item(item, |buffered| {
+            SendMessageW(
+                parent,
+                WM_DRAWITEM,
+                Some(wparam),
+                Some(LPARAM(buffered as *const DRAWITEMSTRUCT as isize)),
+            )
+        })
+    }
+}
+
+/// Paint an owner-drawn row offscreen, then present its complete pixels once.
+pub(super) unsafe fn with_buffered_item(
+    item: &DRAWITEMSTRUCT,
+    paint: impl FnOnce(&DRAWITEMSTRUCT) -> LRESULT,
+) -> LRESULT {
+    unsafe {
         let rect = item.rcItem;
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
@@ -272,7 +289,7 @@ unsafe fn draw_buffered(parent: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
         if dc.0.is_null() || bitmap.0.is_null() {
             let _ = DeleteDC(dc);
             let _ = DeleteObject(HGDIOBJ(bitmap.0));
-            return SendMessageW(parent, WM_DRAWITEM, Some(wparam), Some(lparam));
+            return paint(item);
         }
         let old = SelectObject(dc, HGDIOBJ(bitmap.0));
         let _ = SetViewportOrgEx(dc, -rect.left, -rect.top, None);
@@ -281,12 +298,7 @@ unsafe fn draw_buffered(parent: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
         FillRect(dc, &rect, HBRUSH(GetStockObject(DC_BRUSH).0));
         let mut buffered = *item;
         buffered.hDC = dc;
-        let result = SendMessageW(
-            parent,
-            WM_DRAWITEM,
-            Some(wparam),
-            Some(LPARAM(&buffered as *const DRAWITEMSTRUCT as isize)),
-        );
+        let result = paint(&buffered);
         let _ = BitBlt(
             item.hDC,
             rect.left,

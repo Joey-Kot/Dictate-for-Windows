@@ -52,6 +52,7 @@ use crate::resources;
 
 mod advanced_audio;
 mod audio;
+mod batch_transcription;
 mod debug;
 mod dropdown;
 #[path = "dropdown_scrollbar.rs"]
@@ -60,6 +61,7 @@ pub(crate) use dropdown_scrollbar::Metrics as ScrollbarMetrics;
 mod hotkeys;
 mod microphone;
 mod rewrite;
+mod test_status;
 #[cfg(test)]
 mod text_tests;
 use microphone::{
@@ -116,11 +118,7 @@ const HOTKEY_INPUT_KEYS: [&str; 3] = [
     "CLIPBOARD_RESTORE_DELAY",
     "SENDINPUT_BATCH_SIZE",
 ];
-const SEGMENTED_UPLOAD_KEYS: [&str; 3] = [
-    "MAX_UPLOAD_SEGMENT_SECONDS",
-    "MIN_UPLOAD_PAUSE_MS",
-    "MAX_UPLOAD_CONCURRENCY",
-];
+const SEGMENTED_UPLOAD_KEYS: [&str; 2] = ["MAX_UPLOAD_SEGMENT_SECONDS", "MIN_UPLOAD_PAUSE_MS"];
 const CONNECTIVITY_TEST_SAMPLE_RATE: i32 = 16_000;
 const CONNECTIVITY_TEST_PCM: &str = include_str!("../../../scripts/connectivity_test.pcm.b64");
 
@@ -133,6 +131,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("Network", "network"),
     ("Hotkeys", "audio_hotkeys"),
     ("Cache", "cache"),
+    (batch_transcription::GROUP, "batch_transcription"),
     ("Debug", "debug"),
     ("About", "about"),
 ];
@@ -421,6 +420,7 @@ struct SettingsState {
     advanced_audio: advanced_audio::Page,
     rewrite: rewrite::Page,
     debug: debug::Page,
+    batch: batch_transcription::Page,
     language: Language,
     language_control: HWND,
     language_items: Vec<HWND>,
@@ -460,6 +460,7 @@ enum ConnectivityStatus {
 #[derive(Clone, Copy, Default)]
 pub(super) struct TestResultView {
     pub(super) editor: HWND,
+    pub(super) icon: HWND,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -486,6 +487,7 @@ struct InputFrame {
 
 pub struct SettingsWindow {
     hwnd: HWND,
+    batch_activity: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl SettingsFrameOverlay {
@@ -554,6 +556,16 @@ impl SettingsFrameOverlay {
 }
 
 impl SettingsWindow {
+    pub fn batch_running(&self) -> bool {
+        self.batch_activity.get()
+    }
+
+    pub fn request_close(&self) {
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+
     pub fn open(owner: HWND, runtime: Arc<Runtime>, language: Language) -> Result<Self, String> {
         let instance = unsafe { GetModuleHandleW(None).map_err(|error| error.to_string())? };
         let cursor: HCURSOR =
@@ -593,6 +605,7 @@ impl SettingsWindow {
             advanced_audio: advanced_audio::Page::new(&runtime.config()),
             rewrite: rewrite::Page::new(runtime.config().rewrite, &platform::config_path()?),
             debug: debug::Page::default(),
+            batch: batch_transcription::Page::default(),
             language,
             language_control: HWND::default(),
             language_items: Vec::new(),
@@ -616,6 +629,7 @@ impl SettingsWindow {
             small_font: create_font(dpi, 11, false),
             frame_overlay: None,
         });
+        let batch_activity = state.batch.activity.clone();
         let pointer = Box::into_raw(state);
         let hwnd = unsafe {
             CreateWindowExW(
@@ -655,7 +669,10 @@ impl SettingsWindow {
             let _ = ShowWindow(hwnd, SW_SHOW);
             sync_settings_frame(&mut *pointer, true);
         }
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd,
+            batch_activity,
+        })
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -715,6 +732,9 @@ unsafe extern "system" fn settings_proc(
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            if batch_transcription::command(state, id, notification) {
+                return LRESULT(0);
+            }
             if debug::command(state, id, notification) {
                 return LRESULT(0);
             }
@@ -795,9 +815,7 @@ unsafe extern "system" fn settings_proc(
             } else {
                 match id {
                     ID_SAVE => save(state),
-                    ID_CANCEL | ID_CLOSE => unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    },
+                    ID_CANCEL | ID_CLOSE => batch_transcription::request_close(state),
                     ID_TEST_CONNECTIVITY => test_connectivity(state),
                     _ => {}
                 }
@@ -823,6 +841,9 @@ unsafe extern "system" fn settings_proc(
         WM_ERASEBKGND => LRESULT(1),
         WM_DRAWITEM => {
             let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            if batch_transcription::draw(state, item) {
+                return LRESULT(1);
+            }
             if rewrite::draw(state, item) {
                 return LRESULT(1);
             }
@@ -852,6 +873,7 @@ unsafe extern "system" fn settings_proc(
                 LRESULT(1)
             } else if item.CtlID as usize == ID_MICROPHONE_LIST
                 || item.CtlID as usize == rewrite::ID_PROMPTS
+                || item.CtlID as usize == batch_transcription::ID_LIST
                 || (audio::ID_LIST_BASE..audio::ID_LIST_BASE + 6).contains(&(item.CtlID as usize))
             {
                 item.itemHeight = platform::scale(36, state.dpi) as u32;
@@ -1038,31 +1060,34 @@ unsafe extern "system" fn settings_proc(
             advanced_audio::poll_generation(state);
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER
+            if wparam.0 == batch_transcription::TIMER =>
+        {
+            batch_transcription::poll(state);
+            LRESULT(0)
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == debug::TIMER => {
             debug::refresh(&mut state.debug);
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
             if wparam.0 & 0xffff == 0 {
-                hotkeys::deactivate();
-            } else {
-                hotkeys::activate(unsafe { GetFocus() });
+                hotkeys::deactivate_window(hwnd);
+            } else if wparam.0 >> 16 == 0 && hotkeys::activate_window(hwnd) {
+                return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_CLOSE => {
-            if !state.saving {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
-            }
+            batch_transcription::request_close(state);
             LRESULT(0)
         }
         WM_DESTROY => {
+            batch_transcription::destroy(state);
             advanced_audio::destroy(state);
             state.connectivity_cancel.cancel();
             advanced_audio::cancel_generation(state);
-            hotkeys::deactivate();
+            hotkeys::deactivate_window(hwnd);
             unsafe {
                 let _ =
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), debug::TIMER);
@@ -1323,7 +1348,13 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
                     )?;
                     apply_dark_theme(hwnd);
                     if hotkeys::KEYS.contains(&field.key) {
-                        hotkeys::attach(hwnd, text, state.language, hotkey_status)?;
+                        hotkeys::attach(
+                            hwnd,
+                            text,
+                            state.language,
+                            hotkey_status,
+                            config.hotkey_debug,
+                        )?;
                     }
                     unsafe {
                         let margin = platform::scale(7, state.dpi) as u32;
@@ -1366,6 +1397,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
     advanced_audio::create(state, instance)?;
     rewrite::create(state, instance)?;
     debug::create(state, instance)?;
+    batch_transcription::create(state, instance)?;
     audio::refresh(state);
     let vad_hint = create_label(
         state,
@@ -1540,7 +1572,8 @@ fn create_test_result_view(
         );
     }
     dropdown_scrollbar::attach_edit(editor, state.dpi)?;
-    Ok(TestResultView { editor })
+    let icon = test_status::create(state.hwnd)?;
+    Ok(TestResultView { editor, icon })
 }
 
 fn resize_controls(state: &mut SettingsState) {
@@ -1566,6 +1599,7 @@ fn resize_controls(state: &mut SettingsState) {
             set_font(*hwnd, state.font);
         }
     }
+    batch_transcription::resize(state);
     rewrite::resize_list(state);
     rewrite::resize_page(state);
     debug::resize(&mut state.debug, state.dpi);
@@ -2346,6 +2380,7 @@ pub(super) fn sync_test_result_view(
     top: i32,
     right: i32,
     message: &str,
+    status: TestResultState,
 ) {
     if view.editor.is_invalid() {
         return;
@@ -2380,9 +2415,11 @@ pub(super) fn sync_test_result_view(
             SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
         );
     }
+    test_status::show(view.icon, status, scaled_rect(layout.icon, dpi));
 }
 
 pub(super) fn hide_test_result_view(view: TestResultView) {
+    test_status::hide(view.icon);
     if !view.editor.is_invalid() {
         unsafe {
             let _ = ShowWindow(view.editor, SW_HIDE);
@@ -2390,14 +2427,7 @@ pub(super) fn hide_test_result_view(view: TestResultView) {
     }
 }
 
-pub(super) fn paint_test_result(
-    hdc: HDC,
-    dpi: u32,
-    status: TestResultState,
-    layout: TestResultLayout,
-    focused: bool,
-) {
-    let scale = |value| platform::scale(value, dpi);
+pub(super) fn paint_test_result_frame(hdc: HDC, dpi: u32, layout: TestResultLayout, focused: bool) {
     unsafe {
         rounded_box(
             hdc,
@@ -2408,116 +2438,8 @@ pub(super) fn paint_test_result(
             } else {
                 rgb(54, 68, 74)
             },
-            scale(7),
+            platform::scale(7, dpi),
         );
-        match status {
-            TestResultState::Idle => {}
-            TestResultState::Testing => {
-                rounded_box(
-                    hdc,
-                    layout.icon,
-                    rgb(75, 99, 103),
-                    rgb(75, 99, 103),
-                    scale(10),
-                );
-                // Rendering the ellipsis glyph inherits font-side bearings and a
-                // baseline, so it is visibly off-centre inside the circular icon.
-                // Draw the three dots from the icon geometry instead.
-                let dot = scale(3).max(2);
-                let gap = scale(1).max(1);
-                let total_width = dot * 3 + gap * 2;
-                let left =
-                    layout.icon.left + (layout.icon.right - layout.icon.left - total_width) / 2;
-                let top = layout.icon.top + (layout.icon.bottom - layout.icon.top - dot) / 2;
-                for index in 0..3 {
-                    let dot_left = left + index * (dot + gap);
-                    rounded_box(
-                        hdc,
-                        RECT {
-                            left: dot_left,
-                            top,
-                            right: dot_left + dot,
-                            bottom: top + dot,
-                        },
-                        rgb(16, 28, 30),
-                        rgb(16, 28, 30),
-                        (dot / 2).max(1),
-                    );
-                }
-            }
-            TestResultState::Succeeded => {
-                rounded_box(
-                    hdc,
-                    layout.icon,
-                    rgb(104, 201, 88),
-                    rgb(104, 201, 88),
-                    scale(10),
-                );
-                let center_x = (layout.icon.left + layout.icon.right) / 2;
-                let center_y = (layout.icon.top + layout.icon.bottom) / 2;
-                stroke_polyline(
-                    hdc,
-                    &[
-                        POINT {
-                            x: center_x - scale(5),
-                            y: center_y,
-                        },
-                        POINT {
-                            x: center_x - scale(1),
-                            y: center_y + scale(4),
-                        },
-                        POINT {
-                            x: center_x + scale(6),
-                            y: center_y - scale(5),
-                        },
-                    ],
-                    rgb(8, 49, 35),
-                    scale(2).max(1),
-                );
-            }
-            TestResultState::Failed => {
-                rounded_box(
-                    hdc,
-                    layout.icon,
-                    rgb(239, 86, 91),
-                    rgb(239, 86, 91),
-                    scale(10),
-                );
-                let center_x = (layout.icon.left + layout.icon.right) / 2;
-                let center_y = (layout.icon.top + layout.icon.bottom) / 2;
-                let radius = scale(4);
-                stroke_polyline(
-                    hdc,
-                    &[
-                        POINT {
-                            x: center_x - radius,
-                            y: center_y - radius,
-                        },
-                        POINT {
-                            x: center_x + radius,
-                            y: center_y + radius,
-                        },
-                    ],
-                    rgb(57, 19, 23),
-                    scale(2).max(1),
-                );
-                stroke_polyline(
-                    hdc,
-                    &[
-                        POINT {
-                            x: center_x + radius,
-                            y: center_y - radius,
-                        },
-                        POINT {
-                            x: center_x - radius,
-                            y: center_y + radius,
-                        },
-                    ],
-                    rgb(57, 19, 23),
-                    scale(2).max(1),
-                );
-            }
-        }
     }
 }
 
@@ -2587,6 +2509,7 @@ fn sync_connectivity_result(state: &SettingsState) {
         top,
         right,
         &connectivity_result_message(state),
+        connectivity_result_state(state),
     );
     rewrite::position_test_result(state);
 }
@@ -2601,10 +2524,9 @@ unsafe fn paint_connectivity_status(state: &SettingsState, hdc: HDC) {
         frame: scaled_rect(layout.frame, state.dpi),
         editor: scaled_rect(layout.editor, state.dpi),
     };
-    paint_test_result(
+    paint_test_result_frame(
         hdc,
         state.dpi,
-        connectivity_result_state(state),
         layout,
         unsafe { GetFocus() } == state.connectivity_result.editor,
     );
@@ -2639,6 +2561,7 @@ fn refresh_language(state: &SettingsState) {
         let _ = InvalidateRect(Some(state.language_control), None, true);
         let _ = InvalidateRect(Some(state.hwnd), None, true);
     }
+    batch_transcription::refresh_language(state);
 }
 
 fn update_page_visibility(state: &SettingsState) {
@@ -2654,6 +2577,7 @@ fn update_page_visibility(state: &SettingsState) {
         }
     }
     advanced_audio::sync_visibility(state);
+    batch_transcription::resize(state);
     sync_connectivity_result(state);
     if active != "Display" || !state.language_open {
         unsafe {
@@ -2972,7 +2896,7 @@ fn poll_save(state: &mut SettingsState) {
 }
 
 fn save(state: &mut SettingsState) {
-    if state.saving {
+    if state.saving || state.batch.queue.running {
         return;
     }
     if !state.runtime.can_reload() {
@@ -3114,6 +3038,7 @@ fn read_config(state: &SettingsState) -> Result<Config, String> {
     let mut config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
     config.advanced_audio_api = advanced_audio::read(state)?;
     config.rewrite = rewrite::read(state);
+    config.batch_transcription = batch_transcription::read(state)?;
     dictate_core::additional_parameters::parse(&config.extra_config)
         .map_err(|e| format!("Extra config: {e}"))?;
     Ok(config)
@@ -3161,6 +3086,7 @@ fn enable_controls(state: &SettingsState, enabled: bool) {
 }
 
 fn update_input_controls(state: &SettingsState) {
+    batch_transcription::sync_controls(state);
     rewrite::update_menu_controls(state);
     for key in ["__test_connectivity", "__rewrite_test"] {
         if let Some(button) = state.controls.get(key) {

@@ -4040,6 +4040,7 @@ fn sync_workflow_test_result(state: &SettingsState) {
         STATUS_TOP,
         EDIT_LEFT + EDIT_WIDTH,
         &workflow_test_result_message(state),
+        workflow_test_result_state(state),
     );
 }
 
@@ -4673,10 +4674,9 @@ pub(super) fn paint(state: &SettingsState, hdc: HDC) {
             frame: scaled_rect(layout.frame, state.dpi),
             editor: scaled_rect(layout.editor, state.dpi),
         };
-        paint_test_result(
+        paint_test_result_frame(
             hdc,
             state.dpi,
-            workflow_test_result_state(state),
             layout,
             unsafe { GetFocus() } == state.advanced_audio.test_result.editor,
         );

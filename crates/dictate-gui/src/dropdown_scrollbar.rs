@@ -89,7 +89,7 @@ mod control {
         horizontal: bool,
         multiline: bool,
         viewport: bool,
-        viewport_background: COLORREF,
+        background: COLORREF,
         extent: i32,
         offset: i32,
     }
@@ -218,7 +218,7 @@ mod control {
                 horizontal,
                 multiline,
                 viewport,
-                viewport_background: viewport_background.unwrap_or_else(dropdown::background),
+                background: viewport_background.unwrap_or_else(dropdown::background),
                 extent: 0,
                 offset: 0,
             }));
@@ -255,6 +255,16 @@ mod control {
 
     pub(crate) fn thickness(dpi: u32) -> i32 {
         platform::scale(14, dpi)
+    }
+
+    pub(crate) fn set_background(bar: HWND, background: COLORREF) {
+        unsafe {
+            let mut data = 0;
+            if GetWindowSubclass(bar, Some(bar_proc), 1, Some(&mut data)).as_bool() {
+                (*(data as *mut State)).background = background;
+                let _ = InvalidateRect(Some(bar), None, false);
+            }
+        }
     }
 
     pub(crate) fn horizontal_offset(bar: HWND) -> i32 {
@@ -626,12 +636,10 @@ mod control {
                     let _ = GetClientRect(hwnd, &mut rect);
                     SetDCBrushColor(
                         dc,
-                        if state.viewport {
-                            state.viewport_background
-                        } else if state.multiline {
+                        if state.multiline {
                             rgb(26, 35, 39)
                         } else {
-                            dropdown::background()
+                            state.background
                         },
                     );
                     FillRect(dc, &rect, HBRUSH(GetStockObject(DC_BRUSH).0));

@@ -138,6 +138,17 @@ pub fn clear() {
     buffer().lock().clear();
 }
 
+/// Only the focused shortcut recorder calls this, under the saved Hotkey debug
+/// switch. Do not collect ordinary application input here.
+#[cfg(windows)]
+pub fn hotkey_capture(message: std::fmt::Arguments<'_>) {
+    buffer().lock().append(Record {
+        timestamp: std::time::SystemTime::now(),
+        category: dictate_core::debug_log::Category::Hotkey,
+        message: format!("[capture] {message}"),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

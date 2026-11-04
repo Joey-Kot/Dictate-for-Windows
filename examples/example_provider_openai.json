@@ -24,6 +24,7 @@
   "RETRY_BASE_DELAY": 0.5,
   "ENABLE_HTTP2": true,
   "VERIFY_SSL": true,
+  "BATCH_TRANSCRIPTION": {"output_dir": "", "batch_size": 1},
   "HOTKEY_HOOK": true,
   "START_KEY": "ctrl+alt+q",
   "PAUSE_KEY": "ctrl+alt+s",

@@ -2,9 +2,11 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::Config;
@@ -12,6 +14,28 @@ use crate::advanced_audio::LiveChunkSource;
 use crate::advanced_audio::schema::RealtimeAudioStream;
 use crate::advanced_audio::{AdvancedAudioClient, AdvancedAudioError};
 use crate::asr::{AsrClient, AsrError, Transcription};
+
+/// One shared budget for complete recognition workflows across every file and segment.
+#[derive(Clone)]
+pub(crate) struct UploadLimiter(Arc<Semaphore>);
+
+impl UploadLimiter {
+    pub(crate) fn new(concurrency: u32) -> Self {
+        Self(Arc::new(Semaphore::new(
+            (concurrency as usize).min(Semaphore::MAX_PERMITS),
+        )))
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedSemaphorePermit, AudioApiError> {
+        tokio::select! { biased;
+            _ = cancellation.cancelled() => Err(AudioApiError::Canceled),
+            permit = self.0.clone().acquire_owned() => permit.map_err(|_| AudioApiError::Canceled),
+        }
+    }
+}
 
 /// The runtime chooses exactly one client from config.  Frontends do not need
 /// to know whether a transcription uses multipart, polling, SSE, or another
@@ -98,6 +122,7 @@ impl AudioApiClient {
             file_paths,
             max_concurrency,
             true,
+            None,
         )
         .await
     }
@@ -117,6 +142,24 @@ impl AudioApiClient {
             file_paths,
             max_concurrency,
             false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn transcribe_segments_strict_limited(
+        &self,
+        cancellation: &CancellationToken,
+        file_paths: &[PathBuf],
+        max_concurrency: usize,
+        limiter: &UploadLimiter,
+    ) -> Result<Transcription, AudioApiError> {
+        self.transcribe_segments_with_failure_placeholders(
+            cancellation,
+            file_paths,
+            max_concurrency,
+            false,
+            Some(limiter),
         )
         .await
     }
@@ -127,6 +170,7 @@ impl AudioApiClient {
         file_paths: &[PathBuf],
         max_concurrency: usize,
         insert_failure_placeholders: bool,
+        limiter: Option<&UploadLimiter>,
     ) -> Result<Transcription, AudioApiError> {
         self.ensure_segmented_upload_available()?;
         let outcomes = run_segment_batch(
@@ -134,6 +178,11 @@ impl AudioApiClient {
             cancellation,
             max_concurrency,
             |_, file_path, segment_cancellation| async move {
+                // No outer file permit: each leaf workflow acquires exactly once.
+                let _permit = match limiter {
+                    Some(limiter) => Some(limiter.acquire(&segment_cancellation).await?),
+                    None => None,
+                };
                 match self.transcribe(&segment_cancellation, &file_path).await {
                     Ok(transcription) => Ok(SegmentTranscription::Text(transcription.text)),
                     Err(error) if error.is_canceled() => Err(error),

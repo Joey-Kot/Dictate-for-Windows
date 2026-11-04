@@ -35,7 +35,7 @@ It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
 |---|---|
 | Everyday desktop use with configuration and controls in a floating window | `Dictate.exe` GUI |
 | Automation, scripts, or terminal hotkey recording | `dictate-cli.exe` CLI |
-| Transcribing existing audio into a text file | `dictate-cli.exe` CLI |
+| Transcribing existing audio into text files | GUI Batch Transcription or CLI file mode |
 | No desire to install FFmpeg | GUI or CLI |
 
 ## Scope and limitations
@@ -102,6 +102,7 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 | Network | Timeouts, retries, HTTP/2, TLS validation, and optional non-real-time segmented uploads shared by Legacy Audio API, Advanced Audio API, and Rewrite API |
 | Audio Hotkeys | Three hotkeys, the low-level keyboard-hook switch, two clipboard wait times, and configurable SendInput batch size |
 | Cache | Cache directory and cache retention |
+| Batch Transcription | Audio file queue, output directory, file batch size, Transcribe/Cancel, and Retry |
 | Debug | FFmpeg, recording, hotkey, and upload debug switches, plus a live read-only output box with Copy All and Clear |
 | About | Project, author, license, and repository information |
 
@@ -112,7 +113,15 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 3. Choose an Icon and enter a Title, Prompt Content, optional Extra config, and an optional Hotkey. Save the prompt first, then save Settings for the complete draft to take effect.
 4. Select text in the input box and press the prompt shortcut. You can also check **Enable menu**, enter a **Menu key**, and save your settings. Then press the custom menu shortcut and select a quick action from the prompt list that appears at the mouse cursor.
 
-## Advanced Audio API
+### Batch transcription
+
+1. On **Batch Transcription**, use **Files** to select multiple audio files, **Folders** to select multiple folders and import audio recursively, or drag audio files onto the list.
+2. Choose an **Output directory**, which defaults to the `Transcripts` subfolder in Documents. Results are saved as `.txt` files, with numbered suffixes added to avoid overwriting existing files.
+3. Set **Batch Size** (default `1`) to control how many files are processed at once. All files and segments share the concurrency limit in **Network → Upload concurrency**.
+4. Click **Transcribe** to start; the button becomes a red **Cancel** button. If any files fail, use **Retry** after the run finishes to retry only those files.
+5. Select files and press **Delete** to remove them from the list. Use **Ctrl+click** for individual selections or **Shift+click** for a range. Source audio and completed output files are retained.
+
+### Advanced Audio API
 
 Advanced Audio API is an optional, constrained declarative ASR workflow. Once configured successfully, it creates a custom ASR provider.
 
@@ -264,6 +273,7 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "MAX_UPLOAD_SEGMENT_SECONDS": 300,
   "MIN_UPLOAD_PAUSE_MS": 700,
   "MAX_UPLOAD_CONCURRENCY": 1,
+  "BATCH_TRANSCRIPTION": {"output_dir": "", "batch_size": 1},
   "HOTKEY_HOOK": true,
   "START_KEY": "ctrl+alt+q",
   "PAUSE_KEY": "ctrl+alt+s",

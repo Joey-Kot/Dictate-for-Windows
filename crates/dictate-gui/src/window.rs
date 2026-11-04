@@ -43,6 +43,7 @@ const WM_RUNTIME_EVENT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 
 const WM_ESCAPE_COMMAND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
 const WM_TOGGLE_REWRITE_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
 const ANIMATION_TIMER_ID: usize = 0x7101;
+const BATCH_QUIT_TIMER: usize = 0x7102;
 const ANIMATION_INTERVAL_MS: u32 = 16;
 const ANIMATION_STEP_SECONDS: f32 = ANIMATION_INTERVAL_MS as f32 / 1_000.0;
 const HOVER_DURATION_SECONDS: f32 = 0.140;
@@ -55,6 +56,7 @@ struct WindowState {
     renderer: Renderer,
     tray: Option<TrayIcon>,
     settings: Option<SettingsWindow>,
+    quit_pending: bool,
     rewrite_menu: Option<RewriteMenu>,
     minimal: bool,
     rounded: bool,
@@ -144,6 +146,7 @@ fn run_inner() -> Result<(), String> {
         renderer,
         tray: None,
         settings: None,
+        quit_pending: false,
         rewrite_menu: None,
         minimal: false,
         rounded,
@@ -381,6 +384,17 @@ unsafe extern "system" fn window_proc(
         WM_MOUSELEAVE => {
             state.mouse_tracking = false;
             set_hovered_button(state, None);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == BATCH_QUIT_TIMER => {
+            if state.quit_pending
+                && !state
+                    .settings
+                    .as_ref()
+                    .is_some_and(SettingsWindow::batch_running)
+            {
+                finish_quit(state);
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == ANIMATION_TIMER_ID => {
@@ -701,24 +715,30 @@ fn open_settings(state: &mut WindowState) {
 }
 
 fn close_settings(state: &mut WindowState) -> bool {
-    let Some(settings) = state.settings.take() else {
+    let Some(settings) = state.settings.as_ref() else {
         return false;
     };
     if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(settings.hwnd())) }.as_bool()
     {
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(settings.hwnd());
-        }
+        settings.request_close();
         return true;
     }
+    state.settings = None;
     false
 }
 
 fn request_quit(state: &mut WindowState) {
+    if state.quit_pending {
+        return;
+    }
+    let batch_running = state
+        .settings
+        .as_ref()
+        .is_some_and(SettingsWindow::batch_running);
     let busy = matches!(
         state.runtime.snapshot().state,
         State::Recording | State::Paused | State::Uploading | State::Rewriting
-    );
+    ) || batch_running;
     if busy {
         let message = wide(state.language.text("quit_busy"));
         let title = wide(state.language.text("quit_title"));
@@ -733,6 +753,21 @@ fn request_quit(state: &mut WindowState) {
         if result != IDOK {
             return;
         }
+    }
+    if batch_running {
+        state.quit_pending = true;
+        close_settings(state);
+        unsafe {
+            SetTimer(Some(state.hwnd), BATCH_QUIT_TIMER, 50, None);
+        }
+        return;
+    }
+    finish_quit(state);
+}
+
+fn finish_quit(state: &mut WindowState) {
+    unsafe {
+        let _ = KillTimer(Some(state.hwnd), BATCH_QUIT_TIMER);
     }
     state.runtime.stop();
     unsafe {

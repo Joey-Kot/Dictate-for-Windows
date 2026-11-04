@@ -19,6 +19,7 @@ use crate::audio_segments::SegmentPlan;
 use crate::cache;
 use crate::clipboard::ClipboardError;
 use crate::converter::{AudioConverter, ConvertError, prepare_audio_for_upload};
+use crate::file_transcription::file_mode_preparation_config;
 use crate::hotkey::{self, HotkeyRegistration};
 use crate::recorder::{
     CapturePacketReceiver, Recorder, RecorderError, RecorderState, RecordingResult,
@@ -459,6 +460,88 @@ impl Runtime {
             ),
             Err(error) => self.set_state(State::Idle, "Rewrite failed", Some(&error)),
         }
+    }
+
+    /// A batch holds ordinary task admission through the last file's cleanup.
+    pub async fn transcribe_batch<F>(
+        self: &Arc<Self>,
+        config: Config,
+        jobs: Vec<crate::batch_transcription::BatchJob>,
+        external: CancellationToken,
+        update: F,
+    ) -> Result<crate::batch_transcription::BatchSummary, RuntimeError>
+    where
+        F: Fn(crate::batch_transcription::BatchUpdate) + Send + Sync,
+    {
+        self.transcribe_batch_controlled(
+            config,
+            jobs,
+            external,
+            crate::batch_transcription::BatchControl::default(),
+            update,
+        )
+        .await
+    }
+
+    /// Optional per-file removals retain ordinary batch admission, limits, and cleanup.
+    pub async fn transcribe_batch_controlled<F>(
+        self: &Arc<Self>,
+        config: Config,
+        jobs: Vec<crate::batch_transcription::BatchJob>,
+        external: CancellationToken,
+        control: crate::batch_transcription::BatchControl,
+        update: F,
+    ) -> Result<crate::batch_transcription::BatchSummary, RuntimeError>
+    where
+        F: Fn(crate::batch_transcription::BatchUpdate) + Send + Sync,
+    {
+        let _guard = self
+            .action_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| RuntimeError::Busy)?;
+        if self.is_stopped() {
+            return Err(RuntimeError::Stopped);
+        }
+        if !self.can_reload() {
+            return Err(RuntimeError::Busy);
+        }
+        // UI cancellation propagates directly, including during synchronous output commit.
+        // Register under the same mutex used by stop(), so shutdown cannot miss this child.
+        let cancellation = external.child_token();
+        {
+            let mut inner = self.inner.lock();
+            if self.is_stopped() {
+                cancellation.cancel();
+            }
+            inner.active_request_cancellation = Some(cancellation.clone());
+        }
+        let _operation = crate::debug_log::operation_scope("batch");
+        self.set_state(
+            State::Uploading,
+            "Batch transcription",
+            None::<&RuntimeError>,
+        );
+        let result = crate::batch_transcription::run_controlled(
+            config,
+            self.converter.clone(),
+            jobs,
+            cancellation.clone(),
+            control,
+            update,
+        )
+        .await;
+        self.clear_active_request();
+        self.set_state(
+            State::Idle,
+            if cancellation.is_cancelled() {
+                "Request canceled"
+            } else {
+                "Batch transcription completed"
+            },
+            result.as_ref().err(),
+        );
+        result
     }
 
     /// Connectivity probes share the same admission, cancellation and task lifetime.
@@ -2109,192 +2192,19 @@ pub async fn run_file_mode_with_cancellation(
     // happens to share the RecordTemp_ prefix used by stale-artifact cleanup.
     // Verify it first, then protect its resolved identity during cleanup.
     cache::cleanup_old_temp_items_excluding(&temp_dir, Some(input_path));
-    let client = AudioApiClient::new(config.clone())?;
-    if config.enable_segmented_upload && !client.is_realtime_workflow() {
-        return run_segmented_file_mode(
-            &config,
-            converter.as_ref(),
+    let output = output_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        let mut name = input_path.file_stem().unwrap_or_default().to_os_string();
+        name.push(".txt");
+        PathBuf::from(".").join(name)
+    });
+    crate::file_transcription::FileTranscriber::new(config, converter, temp_dir, None)?
+        .transcribe(
             input_path,
-            output_path,
-            &temp_dir,
-            &client,
+            &output,
             &cancellation,
+            crate::file_transcription::OutputPolicy::Overwrite,
         )
-        .await;
-    }
-    // Recorded realtime replay currently consumes a WAV and converts it into
-    // the workflow-declared PCM stream itself. Keep that preparation entirely
-    // within the normal --file path so all recognition modes still enter
-    // AudioApiClient through the same public interface.
-    let realtime_stream = client.realtime_audio_stream();
-    let preparation_config = file_mode_preparation_config(&config, realtime_stream.as_ref());
-    let temporary =
-        cache::temporary_output_path(&temp_dir, &preparation_config.container_extension());
-    if let Err(error) = prepare_audio_for_upload(
-        converter.as_ref(),
-        &cancellation,
-        &preparation_config,
-        input_path,
-        &temporary,
-        preparation_config.sampling_rate,
-    )
-    .await
-    {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    let transcription = match client
-        .transcribe_with_retry_prepare(&cancellation, &temporary, || async {
-            if !preparation_config.enable_vad {
-                return Ok(());
-            }
-            prepare_audio_for_upload(
-                converter.as_ref(),
-                &cancellation,
-                &preparation_config,
-                input_path,
-                &temporary,
-                preparation_config.sampling_rate,
-            )
-            .await
-            .map_err(AsrError::from)
-        })
         .await
-    {
-        Ok(transcription) => transcription,
-        Err(error) => {
-            let raw = error.last_response().to_vec();
-            cache::handle_cache(
-                &config,
-                None,
-                Some(&temporary),
-                error.is_text_extraction_error(),
-                &raw,
-            );
-            return Err(error.into());
-        }
-    };
-    let output = output_path.map(Path::to_path_buf).unwrap_or_else(|| {
-        PathBuf::from(".").join(format!(
-            "{}.txt",
-            input_path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy())
-                .unwrap_or_default()
-        ))
-    });
-    finish_file_mode_output(&config, &temporary, output, transcription)
-}
-
-async fn run_segmented_file_mode(
-    config: &Config,
-    converter: &dyn AudioConverter,
-    input_path: &Path,
-    output_path: Option<&Path>,
-    temporary_root: &Path,
-    client: &AudioApiClient,
-    cancellation: &CancellationToken,
-) -> Result<PathBuf, RuntimeError> {
-    let prepared = prepare_segmented_upload(
-        converter,
-        cancellation,
-        config,
-        input_path,
-        temporary_root,
-        None,
-        None,
-    )
-    .await?;
-    let max_concurrency = match segment_concurrency(config.max_upload_concurrency) {
-        Ok(value) => value,
-        Err(error) => {
-            prepared.remove_files();
-            return Err(error.into());
-        }
-    };
-    let transcription = match client
-        .transcribe_segments_strict(cancellation, &prepared.files, max_concurrency)
-        .await
-    {
-        Ok(transcription) => transcription,
-        Err(error) => {
-            prepared.remove_files();
-            return Err(error.into());
-        }
-    };
-    if cancellation.is_cancelled() {
-        prepared.remove_files();
-        return Err(ConvertError::Canceled.into());
-    }
-    let output = output_path.map(Path::to_path_buf).unwrap_or_else(|| {
-        PathBuf::from(".").join(format!(
-            "{}.txt",
-            input_path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy())
-                .unwrap_or_default()
-        ))
-    });
-    if let Err(source) = std::fs::write(&output, transcription.text) {
-        prepared.remove_files();
-        return Err(RuntimeError::OutputFile {
-            path: output,
-            source,
-        });
-    }
-    cache::handle_segmented_cache(config, None, &prepared.directory, true);
-    Ok(output)
-}
-
-/// Chooses the file preparation format before the unified AudioApiClient is
-/// invoked. HTTP-style and Legacy workflows retain their existing settings.
-/// A realtime replay is deliberately prepared as a PCM WAV whose shape comes
-/// from the validated workflow: `RecordedReplaySource` can then use the same
-/// decode/chunk/pacing path as retry and live-failure replay.
-fn file_mode_preparation_config(
-    config: &Config,
-    realtime_stream: Option<&crate::advanced_audio::schema::RealtimeAudioStream>,
-) -> Config {
-    let Some(stream) = realtime_stream else {
-        return config.clone();
-    };
-
-    let mut preparation = config.clone();
-    preparation.codecs = "pcm".into();
-    preparation.container = "wav".into();
-    preparation.channels = i32::from(stream.channels);
-    preparation.sampling_rate = stream.sample_rate as i32;
-    preparation.sampling_rate_depth = 16;
-    preparation
-}
-
-fn finish_file_mode_output(
-    config: &Config,
-    temporary: &Path,
-    output: PathBuf,
-    transcription: Transcription,
-) -> Result<PathBuf, RuntimeError> {
-    if let Err(source) = std::fs::write(&output, transcription.text) {
-        cache::handle_cache(
-            config,
-            None,
-            Some(temporary),
-            true,
-            &transcription.raw_response,
-        );
-        return Err(RuntimeError::OutputFile {
-            path: output,
-            source,
-        });
-    }
-    cache::handle_cache(
-        config,
-        None,
-        Some(temporary),
-        true,
-        &transcription.raw_response,
-    );
-    Ok(output)
 }
 
 fn discard_recording(result: &RecordingResult) {
@@ -3724,7 +3634,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let temporary = directory.path().join("RecordTemp_audio.ogg");
         std::fs::write(&temporary, b"converted").unwrap();
-        let result = finish_file_mode_output(
+        let result = crate::file_transcription::finish_file_mode_output(
             &Config::default(),
             &temporary,
             directory.path().to_path_buf(),
@@ -3732,6 +3642,8 @@ mod tests {
                 text: "hello".into(),
                 raw_response: br#"{"text":"hello"}"#.to_vec(),
             },
+            &CancellationToken::new(),
+            crate::file_transcription::OutputPolicy::Overwrite,
         );
         assert!(matches!(result, Err(RuntimeError::OutputFile { .. })));
         assert!(!temporary.exists());

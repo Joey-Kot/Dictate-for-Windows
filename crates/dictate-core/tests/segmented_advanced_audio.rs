@@ -803,3 +803,132 @@ async fn gui_test_workflow_entry_runs_the_same_advanced_segment_batch() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn gui_files_share_the_limit_through_remote_upload_poll_and_cleanup() {
+    use dictate_core::batch_transcription::BatchJob;
+    use dictate_core::runtime::Runtime;
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // With one shared permit, the next segment/file cannot upload until DELETE finishes.
+        for index in 0..6 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let upload = read_request(&mut stream).await;
+            assert_eq!(upload.method, "PUT");
+            write_response(&mut stream, "201 Created", b"").await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let submit = read_request(&mut stream).await;
+            assert_eq!(submit.target, "/submit");
+            write_response(
+                &mut stream,
+                "200 OK",
+                format!(r#"{{"task":"{index}"}}"#).as_bytes(),
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let poll = read_request(&mut stream).await;
+            assert_eq!(poll.target, "/poll");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&poll.body).unwrap()["task"],
+                index.to_string()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            write_response(
+                &mut stream,
+                "200 OK",
+                br#"{"state":"completed","text":"A"}"#,
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let cleanup = read_request(&mut stream).await;
+            assert_eq!(cleanup.method, "DELETE");
+            assert_eq!(cleanup.target, upload.target);
+            write_response(&mut stream, "204 No Content", b"").await;
+        }
+    });
+    let mut submit = stage(
+        HttpMethod::Post,
+        format!("http://{address}/submit"),
+        HttpBody::Json {
+            value: serde_json::json!({"audio": "{{audio:public_url}}"}),
+        },
+    );
+    submit.captures = vec![Capture {
+        id: "task".into(),
+        from: ResponseExtractor::JsonPath {
+            path: "$.task".into(),
+        },
+        sensitive: false,
+    }];
+    let mut config = advanced_config(
+        AudioDelivery::PublicHttpsUrl,
+        AdvancedRecognition::AsyncPoll {
+            prepare: None,
+            submit: Box::new(submit),
+            poll: Some(Box::new(PollStage {
+                request: stage(
+                    HttpMethod::Post,
+                    format!("http://{address}/poll"),
+                    HttpBody::Json {
+                        value: serde_json::json!({"task": "{{capture:task}}"}),
+                    },
+                ),
+                interval_ms: 100,
+                timeout_ms: 2000,
+                pending: vec![terminal_poll_condition("pending")],
+                success: vec![terminal_poll_condition("completed")],
+                failure: vec![terminal_poll_condition("failed")],
+            })),
+            result_steps: vec![],
+            final_text: ResponseExtractor::JsonPath {
+                path: "$.text".into(),
+            },
+        },
+    );
+    config.advanced_audio_api.remote_audio = RemoteAudioConfig::Webdav(WebDavRemoteAudioConfig {
+        upload_base_url: format!("http://{address}/private-dav"),
+        username: "user".into(),
+        password: "password".into(),
+        remote_path_prefix: "batch".into(),
+        public_download_base_url: "https://downloads.example.test/audio".into(),
+        delete_after_recognition: true,
+    });
+    let root = tempfile::tempdir().unwrap();
+    config.cache_dir = root.path().join("scratch").to_string_lossy().into_owned();
+    config.batch_transcription.output_dir = root.path().join("out").to_string_lossy().into_owned();
+    config.batch_transcription.batch_size = 3;
+    config.enable_segmented_upload = true;
+    config.max_upload_concurrency = 1;
+    config.max_upload_segment_seconds = 1;
+    config.min_upload_pause_ms = 1;
+    let jobs = (0..3)
+        .map(|id| {
+            let path = root.path().join(format!("source-{id}.wav"));
+            std::fs::write(&path, b"source").unwrap();
+            BatchJob { id, path }
+        })
+        .collect();
+    let runtime = Runtime::new(config.clone(), Arc::new(TestSegmentConverter::default())).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.transcribe_batch(config, jobs, CancellationToken::new(), |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.completed, 3);
+    assert_eq!(result.failed, 0);
+    server.await.unwrap();
+    for id in 0..3 {
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("out/source-{id}.txt"))).unwrap(),
+            "AA"
+        );
+    }
+}

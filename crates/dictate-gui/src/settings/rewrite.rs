@@ -243,8 +243,10 @@ pub fn position_test_result(state: &SettingsState) {
         state.hwnd
     };
     unsafe {
-        if GetParent(view.editor).ok() != Some(parent) {
-            let _ = SetParent(view.editor, Some(parent));
+        for control in [view.editor, view.icon] {
+            if GetParent(control).ok() != Some(parent) {
+                let _ = SetParent(control, Some(parent));
+            }
         }
     }
     if rewrite && connectivity_result_bounds(state).is_some() {
@@ -255,6 +257,11 @@ pub fn position_test_result(state: &SettingsState) {
             EDIT_LEFT + EDIT_WIDTH,
         );
         let rect = page_rect(state, layout.editor);
+        test_status::show(
+            view.icon,
+            connectivity_result_state(state),
+            page_rect(state, layout.icon),
+        );
         unsafe {
             let _ = SetWindowPos(
                 view.editor,
@@ -381,10 +388,9 @@ unsafe extern "system" fn page_proc(
                     REWRITE_TEST_RESULT_TOP,
                     EDIT_LEFT + EDIT_WIDTH,
                 );
-                paint_test_result(
+                paint_test_result_frame(
                     dc,
                     state.dpi,
-                    connectivity_result_state(state),
                     TestResultLayout {
                         icon: page_rect(state, layout.icon),
                         frame: page_rect(state, layout.frame),
@@ -779,7 +785,13 @@ pub fn create(
     state
         .localized_controls
         .push((status, "hotkey_optional_help"));
-    hotkeys::attach_optional(menu_key, config.menu_key.clone(), state.language, status)?;
+    hotkeys::attach_optional(
+        menu_key,
+        config.menu_key.clone(),
+        state.language,
+        status,
+        state.runtime.config().hotkey_debug,
+    )?;
     let list = create_child(
         state,
         w!("LISTBOX"),
@@ -1371,6 +1383,7 @@ struct Editor {
     buttons: [HWND; 3],
     status: HWND,
     test_status: HWND,
+    test_icon: HWND,
     test_result_state: TestResultState,
     test_result_height: i32,
     test_cancel: tokio_util::sync::CancellationToken,
@@ -1486,6 +1499,7 @@ fn edit_prompt(
         buttons: [HWND::default(); 3],
         status: HWND::default(),
         test_status: HWND::default(),
+        test_icon: HWND::default(),
         test_result_state: TestResultState::Idle,
         test_result_height: 0,
         test_cancel: tokio_util::sync::CancellationToken::new(),
@@ -2152,6 +2166,7 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
         );
     }
     dropdown_scrollbar::attach_edit(editor.test_status, editor.dpi)?;
+    editor.test_icon = test_status::create(editor.body)?;
     let mut context = vec![
         ("Start".into(), editor.config.start_key.clone()),
         ("Pause".into(), editor.config.pause_key.clone()),
@@ -2180,6 +2195,7 @@ fn create_editor(editor: &mut Editor) -> Result<(), String> {
         editor.prompt.hotkey.clone(),
         editor.language,
         editor.status,
+        editor.runtime.config().hotkey_debug,
     )?;
     hotkeys::set_context(editor.fields[3], context);
     let clear = editor_body_child(
@@ -2459,6 +2475,14 @@ fn layout_editor_body(editor: &Editor) {
         rect.bottom -= editor.offset;
         (item.hwnd, rect, visible)
     }));
+    if editor_test_result_visible(editor) {
+        let mut rect = editor_test_result_layout_in_body(editor).icon;
+        rect.top -= editor.offset;
+        rect.bottom -= editor.offset;
+        test_status::show(editor.test_icon, editor.test_result_state, rect);
+    } else {
+        test_status::hide(editor.test_icon);
+    }
     redraw_editor_controls(editor.body);
 }
 
@@ -2970,10 +2994,9 @@ unsafe extern "system" fn editor_body_proc(
                             rect.top -= editor.offset;
                             rect.bottom -= editor.offset;
                         }
-                        paint_test_result(
+                        paint_test_result_frame(
                             dc,
                             editor.dpi,
-                            editor.test_result_state,
                             layout,
                             GetFocus() == editor.test_status,
                         );
@@ -3393,9 +3416,9 @@ unsafe extern "system" fn editor_proc(
                 close_editor_provider(editor);
                 icon_picker::close(editor, false);
                 editor.icon_key_latch = None;
-                hotkeys::deactivate();
-            } else {
-                hotkeys::activate(unsafe { GetFocus() });
+                hotkeys::deactivate_window(hwnd);
+            } else if wparam.0 >> 16 == 0 && hotkeys::activate_window(hwnd) {
+                return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
@@ -3407,7 +3430,7 @@ unsafe extern "system" fn editor_proc(
             icon_picker::close(editor, false);
             editor.test_cancel.cancel();
             editor.test_receiver = None;
-            hotkeys::deactivate();
+            hotkeys::deactivate_window(hwnd);
             unsafe {
                 let _ = KillTimer(Some(hwnd), EDITOR_TEST_TIMER);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

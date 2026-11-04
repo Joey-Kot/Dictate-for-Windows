@@ -35,7 +35,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 |---|---|
 | 日常桌面使用、希望通过浮窗配置和操作 | `Dictate.exe` GUI |
 | 自动化、脚本调用、终端快捷键录音 | `dictate-cli.exe` CLI |
-| 转写已有音频并输出文本文件 | `dictate-cli.exe` CLI |
+| 转写已有音频并输出文本文件 | GUI 批量转写或 CLI 文件模式 |
 | 不想安装 FFmpeg | GUI 或 CLI |
 
 ## 功能范围与限制
@@ -96,12 +96,13 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 |---|---|
 | Display | 界面语言、配置文件位置、浮窗透明度和浮窗缩放 |
 | Audio API | 旧接口的地址、Token、模型、语言、提示词、文本路径和额外字段 |
-| 高级 Audio API | 启用开关、用户需求与厂商资料、工作流生成/校验、参数值、密钥、原始工作流 JSON、远程托管和测试工作流 |
+| Advanced Audio API | 启用开关、用户需求与厂商资料、工作流生成/校验、参数值、密钥、原始工作流 JSON、远程托管和测试工作流 |
 | Audio Record | 麦克风（第一项）、输出声道数、输出采样率、输出位深、比特率、编码器、容器、VAD 和边界填充 |
 | Rewrite API | Provider、Base URL、API Key、Model、有序提示词列表和图标、ADD PROMPT、Enable menu、Menu key 和连接测试 |
 | Network | 旧音频 API、高级 Audio API 与 Rewrite API 共用的超时、重试、HTTP/2、TLS 校验，以及可选的非实时分片上传 |
 | Audio Hotkeys | 三个快捷键、低级键盘钩子开关、两个剪贴板等待时间，以及可配置单批大小的 SendInput 输出 |
 | Cache | 缓存目录和缓存保留 |
+| Batch Transcription | 音频文件列表、输出目录、批量大小，以及转写、取消和重试 |
 | Debug | FFmpeg、录音、快捷键和上传调试开关，以及带复制全部、清空功能的实时只读输出框 |
 | About | 项目、作者、许可证和仓库信息 |
 
@@ -112,7 +113,15 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 3. 选择 Icon，填写 Title、Prompt Content、可选 Extra config 和可选 Hotkey。先保存提示词，再保存 Settings，整套草稿才会生效。
 4. 在输入框中选中文本并按提示词快捷键。也可以勾选 **Enable menu**、录入 **Menu key** 并保存设置，按下自定义菜单快捷键后，在鼠标处弹出的提示词列表中选择快捷操作。
 
-## 高级 Audio API
+### 批量转写
+
+1. 在 **Batch Transcription（批量转写）** 页面点击 **Files** 多选音频文件，或点击 **Folders** 多选文件夹并递归导入；也可以直接将音频文件拖入列表。
+2. 设置 **Output directory（输出目录）**，默认为文档目录下的 `Transcripts`。转写结果保存为 `.txt` 文件，同名文件自动编号避让。
+3. 设置 **Batch Size（批量大小）**，默认为 `1`，控制同时处理的文件数。所有文件及分段共用 **Network → Upload concurrency** 的并发上限。
+4. 点击 **Transcribe（转写）** 开始，按钮变为红色 **Cancel（取消）**。处理结束后如有失败文件，可点击 **Retry（重试）** 仅重试失败项。
+5. 选中文件后按 **Delete** 从列表移除；支持 **Ctrl** 多选和 **Shift** 区间选择，不删除源音频或已生成的结果。
+
+### Advanced Audio API
 
 高级 Audio API 是可选的、受限的声明式 ASR 工作流，配置成功后，将生成一个自定义的 ASR Provider。
 
@@ -264,6 +273,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
   "MAX_UPLOAD_SEGMENT_SECONDS": 300,
   "MIN_UPLOAD_PAUSE_MS": 700,
   "MAX_UPLOAD_CONCURRENCY": 1,
+  "BATCH_TRANSCRIPTION": {"output_dir": "", "batch_size": 1},
   "HOTKEY_HOOK": true,
   "START_KEY": "ctrl+alt+q",
   "PAUSE_KEY": "ctrl+alt+s",

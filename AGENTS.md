@@ -35,7 +35,7 @@ The current implementation uses Rust, Win32, Direct2D, and DirectWrite, with Dir
 |---|---|
 | Everyday desktop use with configuration and controls in a floating window | `Dictate.exe` GUI |
 | Automation, scripting, or hotkey recording from a terminal | `dictate-cli.exe` CLI |
-| Transcribing existing audio to a text file | `dictate-cli.exe` CLI |
+| Transcribing existing audio to text files | GUI Batch Transcription or CLI file mode |
 | Avoiding a separate FFmpeg installation | GUI or CLI |
 
 ## Architecture
@@ -349,6 +349,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 | Network | Timeout, retries, HTTP/2, and TLS verification shared by the Legacy Audio API, Advanced Audio API, and Rewrite API; optional pause-preserving segmented upload for Audio API transcription |
 | Audio Hotkeys | Three hotkeys, a low-level keyboard hook switch, two clipboard delays, and SendInput output with a configurable batch size |
 | Cache | Cache directory and cache retention |
+| Batch Transcription | File queue, output directory, concurrent files, Transcribe/Cancel, and failed-file Retry |
 | Debug | FFmpeg, recording, hotkey, and upload debug switches, plus a live read-only output box with Copy all and Clear controls |
 | About | Project, author, license, and repository information |
 
@@ -356,6 +357,26 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 - Audio Record starts with **Microphone**. Its list refreshes when Settings or the picker opens; **Follow system default** is available, and an offline saved device is retained and marked unavailable rather than silently replaced.
 - Display language, Microphone, audio output, and Rewrite Provider use the same scrollable dropdown behavior. Long lists—including the full Provider list—scroll and open upward when needed.
 - Audio output uses filtered presets for channels, sample rate, bit depth, bitrate, codec, and container. New configurations default to **mono, 16-bit preference, 16000 Hz, 128 kbps, Opus, and `opus`**. Selecting a codec reconciles incompatible choices; **Custom…** accepts an integer, and existing valid non-preset values remain until changed. The full supported codec/container matrix appears [below](#containers-and-codecs-supported-by-embedded-ffmpeg).
+
+### GUI batch transcription
+
+`settings/batch_transcription.rs` owns native file/folder multi-select, LISTBOX file drops, owner-drawn statuses, tooltip details, polling, and deferred window closure. `batch_queue.rs` is the cross-platform GUI queue model: stable IDs, path deduplication, run snapshots, failed-only Retry, and status transitions. Imports scan off the UI thread; insertion is bounded per timer tick. Directory links and Windows directory reparse points are skipped. New files imported while busy belong to the next run.
+
+`Runtime::transcribe_batch()` holds the existing action lock and `Uploading` state until every started operation and its cleanup finish. The existing cancel action cancels the entire batch. `batch_transcription::run_controlled()` limits active files using `BATCH_TRANSCRIPTION.batch_size` and uses one shared `UploadLimiter` from `MAX_UPLOAD_CONCURRENCY`. Ordinary files/realtime replays acquire one permit; segmented files acquire only at each leaf segment, with no enclosing file permit. All files and segments share this one budget, held through complete Advanced remote-upload/submit/poll/result/cleanup lifecycles and retries. Local preparation does not acquire it. Cancellation stops dispatch and drains started futures instead of aborting them.
+
+`file_transcription::FileTranscriber` owns the shared CLI/GUI processing path. Each call creates its own guarded scratch directory and never sweeps the scratch root. CLI performs its existing protected startup sweep once before entering this shared service. Caller-owned inputs are never removed. GUI output uses a sibling temporary file and `persist_noclobber`, retrying numbered names when occupied; CLI retains its explicit overwrite/default-path behavior. Valid empty ASR writes an empty transcript; local `NoSpeech` becomes Completed without an output path. Segment failures never write partial text.
+
+The GUI reads a validated draft snapshot while Debug flags remain applied-only. Output directory, file batch size, Network Upload concurrency, and Save are locked while the queue is running. Upload concurrency is independently editable when segmentation is off. Failed rows enable Retry only after the entire run has finished; Retry resets only failures. Settings close/Cancel/Esc requests cancellation and waits asynchronously for cleanup before destruction. Main-window shutdown uses a deferred timer while a batch drains. Page switches retain the run; closing Settings discards the queue. No worker holds UI pointers.
+
+The batch LISTBOX uses `LBS_EXTENDEDSEL` for native Ctrl/Shift selection. Its subclass handles Delete only while that list owns the key message and ignores autorepeat. Selected rows are removed in descending order from the native control; `Queue::remove()` rebuilds ID indices, clears path deduplication and rollback entries, and never touches source/output files. Re-import assigns a new ID, so late results from removed files cannot affect the new row. `BatchControl` skips removed undispatched jobs and cancels the actual child token of active/waiting files; cleanup drains under the existing shared workflow budget, while other files continue. Removing rows does not release Runtime's task lock early.
+
+Status rows use `dropdown::with_buffered_item()` to compose background, filename, badge, and icon into a compatible memory DC before one clipped BitBlt presentation. `batch_layout::StatusContent` centers the icon plus measured localized label as one group. Batch statuses render the supplied `Processing.svg`, transparent green `Success2.svg`, and transparent red `Failed2.svg` through the shared SVG cache. A separate 20-ms list timer invalidates only visible processing-icon rectangles, using the same layout as painting; it runs while the batch page is visible and a batch is active. Spinner phase follows elapsed time with the supplied 1.2-second clockwise rotation. Worker/import polling keeps its existing 50-ms interval. Language changes repaint complete rows once. Do not restore whole-row periodic invalidation or direct row painting, which caused visible flicker in Windows testing.
+
+The batch list reserves the 14-DIP scrollbar gutter only when its item count exceeds the visible full rows. Imports, deletion, DPI layout, and settings-page changes recompute that geometry and scrollbar visibility; shrinking back to one page restores the full inner width and top index zero. The batch scrollbar background matches the input frame, avoiding a darker vertical strip in the unused list area.
+
+Default output lookup uses `SHGetKnownFolderPath(KF_FLAG_DONT_VERIFY)`: opening Settings only resolves Documents/Transcripts and never requires or creates either directory. If lookup itself fails, the output field remains empty and editable so the remaining controls still initialize. Save accepts an empty default configuration; Transcribe reports an empty field before admission. The core batch entry recursively creates missing output ancestors and checks writability before conversion or recognition, reporting destination failures without terminating the application.
+
+`BATCH_TRANSCRIPTION` contains `output_dir` (default empty, GUI resolves Windows Documents/Transcripts) and positive `batch_size` (default 1). Existing configurations deserialize with defaults. Both settings are saved only by outer Save; queue/status/error/output metadata are not persisted. See [batch validation](docs/batch-transcription-validation.md) for automated and Windows-desktop acceptance boundaries.
 
 ### Rewriting selected text
 
@@ -368,6 +389,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 - Dictate backs up the clipboard, issues `Ctrl+C`, restores the backup, and only then sends the request. Read, backup, restore, cancellation, or empty-input failures stop the operation. The target application determines what `Ctrl+C` returns, so selection and password-field behavior cannot be inferred reliably.
 - Only valid, nonempty, complete Rewrite results are inserted. Failed, canceled, truncated, incomplete, or partial Rewrite results are never inserted. `USE_SENDINPUT=false` uses the clipboard and `Ctrl+V`; `true` uses SendInput.
 - **Test connectivity** uses the current main or prompt API draft and Network settings, makes one request, and does not read selection, insert text, or save changes. It shares the normal task lock and cancellation behavior.
+- Audio API and Rewrite API **Test connectivity**, Advanced Audio API **Test workflow**, and the prompt editor's **Test connectivity** share the supplied `assets/status-icons/Success1.svg`, `Failed1.svg`, and `Processing.svg`. `test_status_icons.rs` preserves the SVG canvas/colors/opacity and resolves the supplied 1.2-second clockwise group rotation into 60 cached vector phases. Its raster cache is bounded to 4 MiB / 256 entries. `settings/test_status.rs` owns fixed-size 20-DIP child icon windows, buffered GDI painting, and 20-ms timers while processing; success, failure, hiding, and destruction stop the timer. Rewrite reparenting and prompt-body scrolling move the icon with its result text. See the [test status icon validation record](docs/test-status-icons-validation.md) for automated coverage and pending Windows checks.
 
 ### Rewrite menu lifecycle and rendering
 
@@ -742,6 +764,7 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "MAX_UPLOAD_SEGMENT_SECONDS": 300,
   "MIN_UPLOAD_PAUSE_MS": 700,
   "MAX_UPLOAD_CONCURRENCY": 1,
+  "BATCH_TRANSCRIPTION": {"output_dir": "", "batch_size": 1},
   "HOTKEY_HOOK": true,
   "START_KEY": "ctrl+alt+q",
   "PAUSE_KEY": "ctrl+alt+s",
@@ -939,9 +962,9 @@ The embedded build supports WAV/PCM, MP3, FLAC, Ogg/Opus, Ogg/Vorbis, M4A/MP4/AA
 | `ENABLE_SEGMENTED_UPLOAD` | `false` | Enables post-recording or file-mode segmented upload for Legacy and Advanced non-realtime workflows; `realtime_session` is never segmented |
 | `MAX_UPLOAD_SEGMENT_SECONDS` | `300` | Strict positive maximum source-timeline span, in seconds, for each segment |
 | `MIN_UPLOAD_PAUSE_MS` | `700` | Strict positive minimum pause duration, in milliseconds, for libav silence analysis to consider as a segment boundary candidate |
-| `MAX_UPLOAD_CONCURRENCY` | `1` | Strict positive maximum number of concurrently active complete segment workflows, including their remote upload, request, polling, result, and cleanup work |
+| `MAX_UPLOAD_CONCURRENCY` | `1` | Positive shared limit for complete recognition workflows across all files/segments of a GUI batch, including remote upload, submit, polling, retries, result retrieval, and cleanup; ordinary segmented paths retain this bound. Independent of file Batch Size and editable without segmentation. |
 
-The three numeric segmented-upload fields are validated and retained even when `ENABLE_SEGMENTED_UPLOAD=false`. They have no CLI override flags: set them in the GUI's **Network** page or in the JSON configuration. Their maximum-length bound is measured on the original source-frame timeline; it is not a claim about encoded byte size or an individual provider's acceptance limit.
+The three numeric upload fields are validated and retained even when `ENABLE_SEGMENTED_UPLOAD=false`. They have no CLI override flags: set them in the GUI's **Network** page or in the JSON configuration. Their maximum-length bound is measured on the original source-frame timeline; it is not a claim about encoded byte size or an individual provider's acceptance limit.
 
 ### Hotkey, clipboard, cache, and debug fields
 
@@ -1125,6 +1148,10 @@ On the **Audio Hotkeys** page, select the start, pause, or cancel/retry hotkey f
 
 Prompt Hotkey and Menu key reuse this recorder and add explicit **Clear** buttons for their optional values. Disabling the menu disables its key field and Clear button while preserving the stored value. A blank Menu key is accepted by prompt-editor draft validation, but rejected by main settings Save if the menu is enabled.
 
+The foreground recorder processes key edges in hook order and posts generation-tagged preview/confirmation updates to the field. Focus-entry snapshots exclude aggregate modifier aliases and unmapped virtual-key states; the entry wait reconciles missed releases against asynchronous state while retaining keys swallowed by the hook. Waiting retains the capture prompt without restoring the committed value. Reconciliation never changes a chord already being recorded.
+
+Capture activation is idempotent for the current field: a following `WM_ACTIVATE` must not restart a session established by `WM_SETFOCUS`. Settings and the prompt editor consume active `WM_ACTIVATE` when a shortcut child already has focus; forwarding it to `DefWindowProc` moves focus to the top-level window, cancels capture, and restores the old shortcut. Field focus-loss and destruction cancel only that field's session; window activation/destruction cancels only captures belonging to that root window. The hook checks the foreground queue's focused HWND through `GetGUIThreadInfo`, and a deliberate click on an already focused field rearms its hook. Saved **Hotkey debug** enables bounded `[capture]` diagnostics in the GUI Debug page: at most 32 hook-edge traces and 64 field records per session, covering focus, injection flags, updates, and cancellation. Keys belonging to other foreground applications are omitted.
+
 - Only `Ctrl`, `Shift`, and `Alt` are modifiers; the left and right variants are equivalent. A hotkey consists of zero or more modifiers plus one other key; modifier-only combinations and multiple non-modifier keys are not accepted.
 - You can record `F1`–`F24`, letters, numbers, symbols, Space, `Esc`, and other keyboard keys that can report events and are not excluded. Number keys on the main keyboard and numeric keypad are distinguished.
 - Excluded keys: `Fn`, the menu key, the Windows logo key, `Tab`, `Backspace`, `Home`, `End`, `Num Lock`, `Insert`, `Delete`, `Print Screen`, `Scroll Lock`, `Pause`, `Enter`, `Caps Lock`, `Page Up`, `Page Down`, and the four arrow keys. These are also rejected when combined with modifiers. `Fn` itself has no standard Windows virtual-key code; keys translated by firmware can only be recognized from the events they actually report.
@@ -1200,7 +1227,7 @@ A segmented attempt instead creates a `RecordTemp_<16 hexadecimal characters>` d
 When `KEEP_CACHE=false` or `CACHE_DIR` is empty, runtime-owned temporary audio is deleted after the process finishes. With caching enabled, single-file audio is renamed to:
 
 ```text
-audio-YYYY-MM-DD-HH.MM.SS.<ext>
+audio-YYYY-MM-DD-HH.MM.SS-<unique-id>.<ext>
 ```
 
 Successful single-file recognition, including empty transcripts and the accepted HTTP 400 no-words response, follows the normal audio archive rules and can retain a nonempty raw response in the corresponding `.json` file. The extension does not guarantee JSON content. `handle_cache()` uses the caller's success flag and available response bytes, not a hard-coded HTTP status. Interactive failures converted to output placeholders do not retain a raw response file; CLI file mode can retain the raw response for transcript-extraction failures even though no transcript file is written. Manual retries do not create another persistent archive.
