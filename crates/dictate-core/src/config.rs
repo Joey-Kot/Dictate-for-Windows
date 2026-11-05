@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,6 +18,79 @@ pub const DEFAULT_MAX_UPLOAD_CONCURRENCY: u32 = 1;
 pub const DEFAULT_SENDINPUT_BATCH_SIZE: u32 = 128;
 /// Keep one injected batch bounded even when a configuration file is edited by hand.
 pub const MAX_SENDINPUT_BATCH_SIZE: u32 = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WindowColor(pub [u8; 3]);
+
+impl WindowColor {
+    pub const DEFAULT: Self = Self([18, 22, 25]);
+}
+
+impl FromStr for WindowColor {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        let hex = text.strip_prefix('#').unwrap_or(text);
+        if hex.len() != 6 || !hex.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return Err("expected a six-digit RGB hex color such as #121619");
+        }
+        let value = u32::from_str_radix(hex, 16).map_err(|_| "invalid RGB hex color")?;
+        let [_, red, green, blue] = value.to_be_bytes();
+        Ok(Self([red, green, blue]))
+    }
+}
+
+impl fmt::Display for WindowColor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [red, green, blue] = self.0;
+        write!(formatter, "#{red:02X}{green:02X}{blue:02X}")
+    }
+}
+
+impl TryFrom<String> for WindowColor {
+    type Error = <Self as FromStr>::Err;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl From<WindowColor> for String {
+    fn from(color: WindowColor) -> Self {
+        color.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowColors {
+    #[serde(rename = "WINDOW_BACKGROUND_COLOR")]
+    pub background: WindowColor,
+    #[serde(rename = "WINDOW_BUTTON_COLOR")]
+    pub button: WindowColor,
+    /// An unset color follows the background contrast automatically.
+    #[serde(rename = "WINDOW_FONT_COLOR")]
+    pub font: Option<WindowColor>,
+    #[serde(rename = "WINDOW_BORDER_COLOR")]
+    pub border: WindowColor,
+}
+
+impl WindowColors {
+    pub const DEFAULT: Self = Self {
+        background: WindowColor::DEFAULT,
+        button: WindowColor([39, 45, 48]),
+        font: None,
+        border: WindowColor([42, 45, 48]),
+    };
+}
+
+impl Default for WindowColors {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,6 +150,8 @@ pub struct Config {
     pub opacity: f64,
     #[serde(rename = "WINDOW_SCALE")]
     pub window_scale: f64,
+    #[serde(flatten)]
+    pub window_colors: WindowColors,
     /// Empty means follow the system default input endpoint at recording start.
     #[serde(rename = "INPUT_DEVICE")]
     pub input_device: String,
@@ -121,6 +198,9 @@ pub struct Config {
     pub hotkey_hook: bool,
     #[serde(rename = "USE_SENDINPUT")]
     pub use_sendinput: bool,
+    /// Allow clipboard output to replace contents that cannot be backed up.
+    #[serde(rename = "FORCE_CLIPBOARD_WRITE")]
+    pub force_clipboard_write: bool,
     /// Maximum UTF-16 code units per SendInput call. A scalar value is never split.
     #[serde(rename = "SENDINPUT_BATCH_SIZE")]
     pub sendinput_batch_size: u32,
@@ -163,6 +243,7 @@ impl Default for Config {
             extra_config: String::new(),
             opacity: 1.0,
             window_scale: 1.0,
+            window_colors: WindowColors::default(),
             input_device: String::new(),
             input_device_name: String::new(),
             channels: 1,
@@ -185,6 +266,7 @@ impl Default for Config {
             max_upload_concurrency: DEFAULT_MAX_UPLOAD_CONCURRENCY,
             hotkey_hook: true,
             use_sendinput: false,
+            force_clipboard_write: false,
             sendinput_batch_size: DEFAULT_SENDINPUT_BATCH_SIZE,
             start_key: "ctrl+alt+q".into(),
             pause_key: "ctrl+alt+s".into(),
@@ -315,7 +397,7 @@ impl Config {
         }
         if !self.opacity.is_finite()
             || !(0.1..=1.0).contains(&self.opacity)
-            || !is_opacity_step_aligned(self.opacity)
+            || !is_hundredth_step_aligned(self.opacity)
         {
             return Err(ConfigError::Invalid(format!(
                 "invalid OPACITY: {} (allowed 0.10..1.00 in steps of 0.01)",
@@ -324,10 +406,10 @@ impl Config {
         }
         if !self.window_scale.is_finite()
             || !(0.3..=2.0).contains(&self.window_scale)
-            || !is_tenth_step_aligned(self.window_scale)
+            || !is_hundredth_step_aligned(self.window_scale)
         {
             return Err(ConfigError::Invalid(format!(
-                "invalid WINDOW_SCALE: {} (allowed 0.3..2.0 in steps of 0.1)",
+                "invalid WINDOW_SCALE: {} (allowed 0.30..2.00 in steps of 0.01)",
                 self.window_scale
             )));
         }
@@ -429,14 +511,9 @@ impl Config {
     }
 }
 
-fn is_opacity_step_aligned(opacity: f64) -> bool {
-    let hundredths = opacity * 100.0;
+fn is_hundredth_step_aligned(value: f64) -> bool {
+    let hundredths = value * 100.0;
     (hundredths - hundredths.round()).abs() < 1e-9
-}
-
-fn is_tenth_step_aligned(value: f64) -> bool {
-    let tenths = value * 10.0;
-    (tenths - tenths.round()).abs() < 1e-9
 }
 
 pub fn container_extension(container: &str) -> String {
@@ -640,15 +717,18 @@ mod tests {
         assert_eq!(cfg.clipboard_write_delay, 80);
         assert_eq!(cfg.clipboard_restore_delay, 120);
         assert!(!cfg.use_sendinput);
+        assert!(!cfg.force_clipboard_write);
         assert_eq!(cfg.sendinput_batch_size, DEFAULT_SENDINPUT_BATCH_SIZE);
-        let enabled: Config = serde_json::from_str(r#"{"USE_SENDINPUT":true}"#).unwrap();
+        let enabled: Config =
+            serde_json::from_str(r#"{"USE_SENDINPUT":true,"FORCE_CLIPBOARD_WRITE":true}"#).unwrap();
         assert!(enabled.use_sendinput);
-        assert_eq!(
-            serde_json::to_value(enabled).unwrap()["USE_SENDINPUT"],
-            true
-        );
+        assert!(enabled.force_clipboard_write);
+        let serialized = serde_json::to_value(enabled).unwrap();
+        assert_eq!(serialized["USE_SENDINPUT"], true);
+        assert_eq!(serialized["FORCE_CLIPBOARD_WRITE"], true);
         assert_eq!(cfg.opacity, 1.0);
         assert_eq!(cfg.window_scale, 1.0);
+        assert_eq!(cfg.window_colors, WindowColors::DEFAULT);
         assert!(!cfg.advanced_audio_api.enabled);
         assert!(cfg.advanced_audio_api.workflow.is_none());
     }
@@ -729,21 +809,23 @@ mod tests {
         cfg.validate().unwrap();
         cfg.window_scale = 2.0;
         cfg.validate().unwrap();
-        cfg.window_scale = 0.2;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("WINDOW_SCALE")
-        );
-        cfg.window_scale = 2.1;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("WINDOW_SCALE")
-        );
         cfg.window_scale = 1.05;
+        cfg.validate().unwrap();
+        cfg.window_scale = 0.29;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("WINDOW_SCALE")
+        );
+        cfg.window_scale = 2.01;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("WINDOW_SCALE")
+        );
+        cfg.window_scale = 1.005;
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -765,11 +847,50 @@ mod tests {
         assert!(raw.contains_key("CANCEL_OR_RETRY_KEY"));
         assert_eq!(raw.get("OPACITY"), Some(&serde_json::json!(1.0)));
         assert_eq!(raw.get("WINDOW_SCALE"), Some(&serde_json::json!(1.0)));
+        assert!(!raw.contains_key("WINDOW_COLOR"));
+        assert_eq!(
+            raw.get("WINDOW_BACKGROUND_COLOR"),
+            Some(&serde_json::json!("#121619"))
+        );
+        assert_eq!(
+            raw.get("WINDOW_BUTTON_COLOR"),
+            Some(&serde_json::json!("#272D30"))
+        );
+        assert_eq!(raw.get("WINDOW_FONT_COLOR"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            raw.get("WINDOW_BORDER_COLOR"),
+            Some(&serde_json::json!("#2A2D30"))
+        );
         assert_eq!(
             raw.get("ADVANCED_AUDIO_API")
                 .and_then(|value| value.get("enabled")),
             Some(&serde_json::json!(false))
         );
+    }
+
+    #[test]
+    fn window_color_accepts_only_full_rgb_and_serializes_canonically() {
+        let config: Config =
+            serde_json::from_str(r#"{"WINDOW_BACKGROUND_COLOR":"30a0fF"}"#).unwrap();
+        assert_eq!(config.window_colors.background, WindowColor([48, 160, 255]));
+        assert_eq!(config.window_colors.button, WindowColors::DEFAULT.button);
+        assert_eq!(config.window_colors.font, None);
+        assert_eq!(config.window_colors.border, WindowColors::DEFAULT.border);
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["WINDOW_BACKGROUND_COLOR"],
+            "#30A0FF"
+        );
+        let old: Config = serde_json::from_str(r#"{"WINDOW_COLOR":"30a0fF"}"#).unwrap();
+        assert_eq!(old.window_colors.background, WindowColor::DEFAULT);
+        for invalid in ["#123", "#11223344", "11223G", "+12345", "＃112233"] {
+            assert!(invalid.parse::<WindowColor>().is_err(), "{invalid}");
+        }
+        let config: Config = serde_json::from_str(
+            r##"{"WINDOW_BUTTON_COLOR":"#ABCDEF","WINDOW_FONT_COLOR":"#000000","WINDOW_BORDER_COLOR":"#101010"}"##,
+        ).unwrap();
+        assert_eq!(config.window_colors.button, WindowColor([171, 205, 239]));
+        assert_eq!(config.window_colors.font, Some(WindowColor([0; 3])));
+        assert_eq!(config.window_colors.border, WindowColor([16; 3]));
     }
 
     #[test]

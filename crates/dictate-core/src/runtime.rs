@@ -448,10 +448,7 @@ impl Runtime {
         match result {
             Ok(text) if !text.trim().is_empty() => match output(text).await {
                 Ok(()) => self.set_state(State::Idle, "Rewrite completed", None::<&RuntimeError>),
-                Err(error) if error.canceled_before_output() => {
-                    self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
-                }
-                Err(error) => self.set_state(State::Idle, error.status(), Some(&error)),
+                Err(error) => self.report_output_error(&error, false),
             },
             Ok(_) => self.set_state(
                 State::Idle,
@@ -1387,6 +1384,16 @@ impl Runtime {
         self.set_state(state, message, Some(error));
     }
 
+    fn report_output_error(&self, error: &text_input::TextInputError, retry_audio: bool) {
+        if let Some(message) = error.cancellation_status() {
+            self.set_state(State::Idle, message, None::<&RuntimeError>);
+        } else if retry_audio {
+            self.set_retryable_error(error.status(), error);
+        } else {
+            self.set_state(State::Idle, error.status(), Some(error));
+        }
+    }
+
     async fn transcribe_recording(
         &self,
         result: RecordingResult,
@@ -1565,12 +1572,8 @@ impl Runtime {
                         },
                         None::<&RuntimeError>,
                     ),
-                    Err(error) if error.canceled_before_output() && !self.is_stopped() => {
-                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
-                    }
                     Err(error) if !self.is_stopped() => {
-                        let message = error.status();
-                        self.set_retryable_error(message, &error);
+                        self.report_output_error(&error, true);
                     }
                     _ => {}
                 }
@@ -1621,12 +1624,7 @@ impl Runtime {
                                 "ASR failed; placeholder inserted",
                                 None::<&RuntimeError>,
                             ),
-                            Err(error) if error.canceled_before_output() => self.set_state(
-                                State::Idle,
-                                "Request canceled",
-                                None::<&RuntimeError>,
-                            ),
-                            Err(error) => self.set_retryable_error(error.status(), &error),
+                            Err(error) => self.report_output_error(&error, true),
                         }
                     }
                     return;
@@ -1805,12 +1803,8 @@ impl Runtime {
                         },
                         None::<&RuntimeError>,
                     ),
-                    Err(error) if error.canceled_before_output() && !self.is_stopped() => {
-                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
-                    }
                     Err(error) if !self.is_stopped() => {
-                        let message = error.status();
-                        self.set_retryable_error(message, &error);
+                        self.report_output_error(&error, true);
                     }
                     _ => {}
                 }
@@ -1998,11 +1992,8 @@ impl Runtime {
                         },
                         None::<&RuntimeError>,
                     ),
-                    Err(error) if error.canceled_before_output() && !self.is_stopped() => {
-                        self.set_state(State::Idle, "Request canceled", None::<&RuntimeError>)
-                    }
                     Err(error) if !self.is_stopped() => {
-                        self.set_retryable_error(error.status(), &error);
+                        self.report_output_error(&error, true);
                     }
                     _ => {}
                 }
@@ -2039,12 +2030,7 @@ impl Runtime {
                                 "ASR failed; placeholder inserted",
                                 None::<&RuntimeError>,
                             ),
-                            Err(error) if error.canceled_before_output() => self.set_state(
-                                State::Idle,
-                                "Request canceled",
-                                None::<&RuntimeError>,
-                            ),
-                            Err(error) => self.set_retryable_error(error.status(), &error),
+                            Err(error) => self.report_output_error(&error, true),
                         }
                     }
                     return;
@@ -3749,6 +3735,25 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.snapshot().message, "Rewrite completed");
         assert!(runtime.snapshot().retry_available);
+    }
+
+    #[tokio::test]
+    async fn rewrite_canceled_after_forced_write_reports_paste_status() {
+        let runtime = Runtime::new(Config::default(), Arc::new(NoopConverter)).unwrap();
+        for (paste_sent, message) in [(false, "Request canceled"), (true, "Ctrl+V sent")] {
+            let cancellation = CancellationToken::new();
+            runtime
+                .finish_rewrite_with(Ok("rewritten text".into()), &cancellation, |_| async {
+                    cancellation.cancel();
+                    Err(ClipboardError::CanceledAfterOverwrite { paste_sent }.into())
+                })
+                .await;
+
+            let event = runtime.snapshot();
+            assert_eq!(event.state, State::Idle);
+            assert_eq!(event.message, message);
+            assert!(event.error.is_empty());
+        }
     }
 
     #[tokio::test]

@@ -94,7 +94,7 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 
 | Page | Contents |
 |---|---|
-| Display | UI language, configuration-file location, floating-window opacity, and floating-window scale |
+| Display | UI language, configuration-file location, and floating-window opacity, scale, and color |
 | Audio API | Legacy API endpoint, token, model, language, prompt, text path, and extra fields |
 | Advanced Audio API | Enable switch, user requirements and vendor documentation, workflow generation/validation, parameter values, secrets, raw workflow JSON, remote hosting, and workflow testing |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
@@ -253,6 +253,10 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "ExtraConfig": "{\"response_format\":\"json\",\"stream\":false,\"temperature\":0,\"language\":null,\"include[]\":\"logprobs\"}",
   "OPACITY": 1.0,
   "WINDOW_SCALE": 1.0,
+  "WINDOW_BACKGROUND_COLOR": "#121619",
+  "WINDOW_BUTTON_COLOR": "#272D30",
+  "WINDOW_FONT_COLOR": null,
+  "WINDOW_BORDER_COLOR": "#2A2D30",
   "INPUT_DEVICE": "",
   "INPUT_DEVICE_NAME": "",
   "CHANNELS": 1,
@@ -328,7 +332,11 @@ This is a Legacy Audio API example. See ExtraConfig below for the expanded form 
 | Field | Default | Behavior |
 |---|---:|---|
 | `OPACITY` | `1.0` | GUI floating-window opacity. Allows `0.10`–`1.00` in `0.01` steps; `1.0` is fully opaque. Full and minimal modes share this setting. |
-| `WINDOW_SCALE` | `1.0` | GUI floating-window scale. Allows `0.3`–`2.0` in `0.1` steps; immediately applies after saving to full and minimal window sizes, drawing, and mouse hit areas. |
+| `WINDOW_SCALE` | `1.0` | GUI floating-window scale. Allows `0.30`–`2.00` in `0.01` steps and applies on save to full and minimal window sizes, drawing, and mouse hit areas. |
+| `WINDOW_BACKGROUND_COLOR` | `"#121619"` | Floating-window background in full and minimal modes. |
+| `WINDOW_BUTTON_COLOR` | `"#272D30"` | Floating-window button fill. |
+| `WINDOW_FONT_COLOR` | `null` | Floating-window status text. `null` chooses a contrasting color automatically. |
+| `WINDOW_BORDER_COLOR` | `"#2A2D30"` | Floating-window outer border and button outlines. |
 
 ### Legacy Audio API and response fields
 
@@ -594,7 +602,9 @@ An appended selector operates on every already matched JSON value; it does not i
 
 By default, text is inserted through the clipboard because clipboard writing is fast for large text and preserves prior clipboard content. With Use SendInput enabled, text is injected through SendInput. This option suits inputs that cannot use the clipboard, but SendInput is slower than the clipboard for large one-shot text because it must wait for every character event.
 
-Clipboard output and Rewrite reading back up supported clipboard formats, including text and images. The temporary output and restored contents are excluded from Windows clipboard history; the target application's Copy during Rewrite may still appear there. If the clipboard changes during output, the newer content is kept. Backups are limited to 256 MiB and 256 formats, and unsupported formats stop the operation before the clipboard is changed.
+Clipboard output and Rewrite reading back up supported clipboard formats, including text and images. The temporary output and restored contents are excluded from Windows clipboard history; the target application's Copy during Rewrite may still appear there. If the clipboard changes during output, the newer content is kept. Backups are limited to 256 MiB and 256 formats. By default, unsupported formats stop the operation before the clipboard is changed.
+
+**Force clipboard write** (`FORCE_CLIPBOARD_WRITE`) defaults to off. When enabled, clipboard output can proceed if backup fails. In that case, the pasted text replaces the original clipboard contents. The setting applies only to clipboard output.
 
 ## Cache and temporary files
 

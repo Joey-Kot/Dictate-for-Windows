@@ -35,8 +35,22 @@ impl TextInputError {
         )
     }
 
+    pub(crate) fn cancellation_status(&self) -> Option<&'static str> {
+        match self {
+            Self::Clipboard(ClipboardError::CanceledAfterOverwrite { .. }) => Some(self.status()),
+            _ if self.canceled_before_output() => Some("Request canceled"),
+            _ => None,
+        }
+    }
+
     pub fn status(&self) -> &'static str {
         match self {
+            Self::Clipboard(ClipboardError::CanceledAfterOverwrite { paste_sent: false }) => {
+                "Request canceled"
+            }
+            Self::Clipboard(ClipboardError::CanceledAfterOverwrite { paste_sent: true }) => {
+                "Ctrl+V sent"
+            }
             Self::Clipboard(error) if error.paste_was_sent_before_restore_failure() => {
                 "Paste sent; clipboard restore failed"
             }
@@ -56,11 +70,12 @@ pub async fn send_text(
     if config.use_sendinput {
         send_unicode(text, cancellation, config.sendinput_batch_size as usize).await
     } else {
-        clipboard::paste_text(
+        clipboard::paste_text_with_policy(
             text,
             cancellation,
             Duration::from_millis(config.clipboard_write_delay),
             Duration::from_millis(config.clipboard_restore_delay),
+            config.force_clipboard_write,
         )
         .await
         .map_err(Into::into)

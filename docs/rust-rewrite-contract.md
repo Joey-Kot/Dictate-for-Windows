@@ -35,7 +35,7 @@ defaults. Missing fields receive defaults and unknown fields are ignored.
 | `ExtraConfig` | `""` | Blank or a JSON object; recursive merge before multipart serialization |
 | `REWRITE` | Empty API fields and prompt list, `custom_openai_compatible` provider, menu disabled | Shared by GUI and CLI hotkey mode; independent text API, optional per-prompt hotkeys, and GUI-only menu |
 | `OPACITY` | `1.0` | GUI floating-window opacity; `0.10`–`1.00` in `0.01` steps, where `1.0` is fully opaque |
-| `WINDOW_SCALE` | `1.0` | GUI floating-window scale; `0.3`–`2.0` in `0.1` steps, shared by full and minimal modes |
+| `WINDOW_SCALE` | `1.0` | GUI floating-window scale from `0.30` to `2.00` in `0.01` steps, shared by full and minimal modes |
 | `INPUT_DEVICE` | `""` | Stable Windows capture endpoint ID; empty follows the system default |
 | `INPUT_DEVICE_NAME` | `""` | Display-only cached name, not used for device resolution |
 | `CHANNELS` | `1` | Inclusive range 1–8; output channels only |

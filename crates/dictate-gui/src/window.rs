@@ -19,23 +19,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
+    WM_DPICHANGED, WM_DWMSENDICONICLIVEPREVIEWBITMAP, WM_DWMSENDICONICTHUMBNAIL, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
+    WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::i18n::Language;
 use crate::platform::{self, GuiLibAvConverter};
 use crate::render::{
-    FULL_HEIGHT, FULL_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH, Renderer, button_is_disabled,
-    hit_test_button,
+    FULL_HEIGHT, FULL_WIDTH, OverlayFrame, Renderer, button_is_disabled, hit_test_button,
+    panel_size,
 };
 use crate::resources;
 use crate::rewrite_menu::{RewriteMenu, WM_REWRITE_MENU_PICK};
-use crate::settings::{
-    SettingsWindow, WM_LANGUAGE_CHANGED, WM_OPACITY_CHANGED, WM_WINDOW_SCALE_CHANGED,
-};
+use crate::settings::{SettingsWindow, WM_LANGUAGE_CHANGED, WM_SETTINGS_APPLIED};
 use crate::taskbar;
 use crate::tray::{COMMAND_MINIMAL, COMMAND_QUIT, COMMAND_SETTINGS, TrayIcon, WM_TRAY};
 
@@ -44,6 +43,8 @@ const WM_ESCAPE_COMMAND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP +
 const WM_TOGGLE_REWRITE_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
 const ANIMATION_TIMER_ID: usize = 0x7101;
 const BATCH_QUIT_TIMER: usize = 0x7102;
+const TOPMOST_TIMER_ID: usize = 0x7103;
+const TOPMOST_CHECK_INTERVAL_MS: u32 = 400;
 const ANIMATION_INTERVAL_MS: u32 = 16;
 const ANIMATION_STEP_SECONDS: f32 = ANIMATION_INTERVAL_MS as f32 / 1_000.0;
 const HOVER_DURATION_SECONDS: f32 = 0.140;
@@ -54,6 +55,7 @@ struct WindowState {
     runtime: Arc<Runtime>,
     async_runtime: Option<tokio::runtime::Runtime>,
     renderer: Renderer,
+    custom_taskbar_previews: bool,
     tray: Option<TrayIcon>,
     settings: Option<SettingsWindow>,
     quit_pending: bool,
@@ -110,6 +112,8 @@ fn run_inner() -> Result<(), String> {
         config
     };
     let window_scale = config.window_scale;
+    let window_colors = config.window_colors;
+    let opacity_alpha = platform::window_opacity_alpha(config.opacity);
     let runtime =
         Runtime::new(config, Arc::new(GuiLibAvConverter)).map_err(|error| error.to_string())?;
     runtime.enable_retry_buffer();
@@ -136,7 +140,7 @@ fn run_inner() -> Result<(), String> {
     // frame is disabled after creation so the system does not add another border or corner.
     let rounded = true;
     let dpi = platform::system_dpi();
-    let mut renderer = Renderer::new().map_err(|error| error.to_string())?;
+    let mut renderer = Renderer::new(window_colors).map_err(|error| error.to_string())?;
     renderer.set_dpi(dpi);
     renderer.set_window_scale(window_scale as f32);
     let state = Box::new(WindowState {
@@ -144,6 +148,7 @@ fn run_inner() -> Result<(), String> {
         runtime: runtime.clone(),
         async_runtime: Some(async_runtime),
         renderer,
+        custom_taskbar_previews: false,
         tray: None,
         settings: None,
         quit_pending: false,
@@ -152,7 +157,7 @@ fn run_inner() -> Result<(), String> {
         rounded,
         dpi,
         window_scale,
-        opacity_alpha: platform::window_opacity_alpha(runtime.config().opacity),
+        opacity_alpha,
         event: runtime.snapshot(),
         language: Language::load(),
         pressed_button: None,
@@ -193,10 +198,18 @@ fn run_inner() -> Result<(), String> {
     })?;
     unsafe {
         platform::disable_native_window_frame(hwnd);
+        (*raw_state).custom_taskbar_previews = taskbar::enable_custom_previews(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = redraw_overlay(&mut *raw_state);
         let _ = taskbar::set_visible(hwnd, true);
+        SetTimer(
+            Some(hwnd),
+            TOPMOST_TIMER_ID,
+            TOPMOST_CHECK_INTERVAL_MS,
+            None,
+        );
     }
+    platform::maintain_overlay_z_order(hwnd);
     let weak = Arc::downgrade(&runtime);
     let hwnd_value = hwnd.0 as usize;
     runtime.set_event_handler(Some(Arc::new(move |event| {
@@ -239,11 +252,14 @@ fn run_inner() -> Result<(), String> {
     unsafe {
         while GetMessageW(&mut message, None, 0, 0).0 > 0 {
             if message.message == WM_KEYDOWN
-                && !crate::settings::microphone_handles_escape(message.hwnd)
                 && message.wParam.0
                     == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize
+                && !crate::settings::control_handles_escape(message.hwnd)
             {
-                let _ = PostMessageW(Some(hwnd), WM_ESCAPE_COMMAND, WPARAM(0), LPARAM(0));
+                // A held Esc can outlive the popup that handled its first press.
+                if message.lParam.0 as usize & (1 << 30) == 0 {
+                    let _ = PostMessageW(Some(hwnd), WM_ESCAPE_COMMAND, WPARAM(0), LPARAM(0));
+                }
                 continue;
             }
             let _ = TranslateMessage(&message);
@@ -271,6 +287,10 @@ unsafe extern "system" fn window_proc(
     if pointer.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
+    if message == WM_TIMER && wparam.0 == TOPMOST_TIMER_ID {
+        platform::maintain_overlay_z_order(hwnd);
+        return LRESULT(0);
+    }
     let state = unsafe { &mut *pointer };
     match message {
         WM_CREATE => {
@@ -293,11 +313,26 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_DWMSENDICONICTHUMBNAIL | WM_DWMSENDICONICLIVEPREVIEWBITMAP
+            if state.custom_taskbar_previews =>
+        {
+            let preview = if message == WM_DWMSENDICONICTHUMBNAIL {
+                taskbar::Preview::Thumbnail(lparam)
+            } else {
+                taskbar::Preview::Peek
+            };
+            if publish_taskbar_preview(state, preview).is_err() {
+                state.custom_taskbar_previews = false;
+                taskbar::use_default_previews(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as u32;
             let height = ((lparam.0 >> 16) & 0xffff) as u32;
             state.renderer.resize(width, height);
             let _ = redraw_overlay(state);
+            refresh_taskbar_previews(state);
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -451,6 +486,7 @@ unsafe extern "system" fn window_proc(
         WM_RUNTIME_EVENT => {
             let event = unsafe { Box::from_raw(lparam.0 as *mut Event) };
             let previous_state = state.event.state;
+            let preview_changed = state.event != *event;
             state.event = *event;
             if matches!(
                 state.event.state,
@@ -473,28 +509,33 @@ unsafe extern "system" fn window_proc(
                 stop_animation_timer(state);
             }
             let _ = redraw_overlay(state);
-            LRESULT(0)
-        }
-        WM_LANGUAGE_CHANGED => {
-            if let Some(language) = Language::ALL.get(wparam.0).copied() {
-                state.language = language;
-                let _ = redraw_overlay(state);
+            if preview_changed {
+                refresh_taskbar_previews(state);
             }
             LRESULT(0)
         }
-        WM_OPACITY_CHANGED => {
-            state.opacity_alpha = wparam.0.min(u8::MAX as usize) as u8;
-            let _ = redraw_overlay(state);
+        WM_LANGUAGE_CHANGED => {
+            if let Some(language) = Language::ALL.get(wparam.0).copied()
+                && state.language != language
+            {
+                state.language = language;
+                let _ = redraw_overlay(state);
+                refresh_taskbar_previews(state);
+            }
             LRESULT(0)
         }
-        WM_WINDOW_SCALE_CHANGED => {
+        WM_SETTINGS_APPLIED => {
             // Main settings posts this after applying any configuration, including
             // prompt edits. Discard an open snapshot before it can be clicked.
             close_rewrite_menu(state);
-            state.window_scale = state.runtime.config().window_scale;
+            let config = state.runtime.config();
+            state.window_scale = config.window_scale;
+            state.opacity_alpha = platform::window_opacity_alpha(config.opacity);
             state.renderer.set_window_scale(state.window_scale as f32);
+            state.renderer.set_window_colors(config.window_colors);
             resize_overlay(state);
             let _ = redraw_overlay(state);
+            refresh_taskbar_previews(state);
             LRESULT(0)
         }
         WM_ESCAPE_COMMAND => {
@@ -530,6 +571,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = unsafe { KillTimer(Some(hwnd), TOPMOST_TIMER_ID) };
             stop_animation_timer(state);
             state.runtime.set_rewrite_menu_handler(None);
             close_rewrite_menu(state);
@@ -555,15 +597,46 @@ unsafe extern "system" fn window_proc(
 fn redraw_overlay(state: &mut WindowState) -> windows::core::Result<()> {
     state.renderer.paint(
         state.hwnd,
-        &state.event,
-        state.minimal,
-        state.rounded,
-        state.language,
-        state.pressed_button,
-        &state.hover_lifts,
-        state.animation_time,
+        OverlayFrame {
+            event: &state.event,
+            minimal: state.minimal,
+            rounded: state.rounded,
+            language: state.language,
+            hover_lifts: &state.hover_lifts,
+            animation_time: state.animation_time,
+        },
         state.opacity_alpha,
     )
+}
+
+fn publish_taskbar_preview(
+    state: &WindowState,
+    preview: taskbar::Preview,
+) -> windows::core::Result<()> {
+    let size = preview.size(state.hwnd, panel_size(state.minimal))?;
+    if size.0 == 0 || size.1 == 0 {
+        return Ok(());
+    }
+    let surface = state.renderer.render_preview(
+        OverlayFrame {
+            event: &state.event,
+            minimal: state.minimal,
+            rounded: state.rounded,
+            language: state.language,
+            hover_lifts: &[0.0; 5],
+            animation_time: state.animation_time,
+        },
+        size,
+        state.opacity_alpha,
+    )?;
+    preview.publish(state.hwnd, surface.bitmap())
+}
+
+fn refresh_taskbar_previews(state: &WindowState) {
+    // DWM caches the stills. Keep animation ticks on the visible overlay.
+    if state.custom_taskbar_previews {
+        taskbar::invalidate_previews(state.hwnd);
+    }
 }
 
 fn show_tray_menu(state: &mut WindowState) {
@@ -627,11 +700,7 @@ fn set_minimal(state: &mut WindowState, minimal: bool) {
 }
 
 fn resize_overlay(state: &WindowState) {
-    let (width, height) = if state.minimal {
-        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
-    } else {
-        (FULL_WIDTH, FULL_HEIGHT)
-    };
+    let (width, height) = panel_size(state.minimal);
     unsafe {
         let _ = SetWindowPos(
             state.hwnd,
@@ -666,6 +735,7 @@ fn toggle_rewrite_menu(state: &mut WindowState, point: POINT) {
         state.event.error.clear();
         state.event.message = state.language.text("no_rewrite_prompts").into();
         let _ = redraw_overlay(state);
+        refresh_taskbar_previews(state);
         return;
     }
     if matches!(
@@ -690,6 +760,7 @@ fn toggle_rewrite_menu(state: &mut WindowState, point: POINT) {
         state.event.error.clear();
         state.event.message = format!("{}: {error}", state.language.text("rewrite_menu_failed"));
         let _ = redraw_overlay(state);
+        refresh_taskbar_previews(state);
     }
 }
 

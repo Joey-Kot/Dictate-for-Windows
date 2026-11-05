@@ -264,7 +264,12 @@ fn exercise_native_output() -> Result<(), String> {
     if custom_format == 0 {
         return Err("Cannot register native clipboard test format".into());
     }
-    for (include_text, original_marker) in [(false, false), (true, false), (true, true)] {
+    let cancellation = CancellationToken::new();
+    for (include_text, original_marker, force_write) in [
+        (false, false, false),
+        (true, false, true),
+        (true, true, false),
+    ] {
         seed_image_and_text(custom_format, include_text, original_marker)?;
         let original_dib = read_bytes(8)?;
         let original_custom = read_bytes(custom_format)?;
@@ -273,8 +278,8 @@ fn exercise_native_output() -> Result<(), String> {
         } else {
             None
         };
-        let snapshot =
-            backup_and_write("Temporary transcription").map_err(|error| error.to_string())?;
+        let snapshot = backup_and_write("Temporary transcription", &cancellation, force_write)
+            .map_err(|error| error.to_string())?;
         assert_history_excluded()?;
         if read_changed(0)?.as_deref() != Some("Temporary transcription") {
             return Err("Temporary paste text differs from expected".into());
@@ -305,8 +310,8 @@ fn exercise_native_output() -> Result<(), String> {
     seed_image_and_text(custom_format, true, false)?;
     // A new Copy can contain exactly the same text as the temporary output.
     // Its identity, rather than a text comparison, must control restoration.
-    let snapshot =
-        backup_and_write("Copied selection — 选中的文本").map_err(|error| error.to_string())?;
+    let snapshot = backup_and_write("Copied selection — 选中的文本", &cancellation, false)
+        .map_err(|error| error.to_string())?;
     if !snapshot.temporary_is_current()? {
         return Err("The temporary clipboard was not recognized".into());
     }
@@ -325,8 +330,8 @@ fn exercise_native_output() -> Result<(), String> {
         let _clipboard = open(Some(owner.0), Duration::from_secs(1))?;
         unsafe { EmptyClipboard() }.map_err(|error| error.to_string())?;
     }
-    let snapshot =
-        backup_and_write("Temporary transcription").map_err(|error| error.to_string())?;
+    let snapshot = backup_and_write("Temporary transcription", &cancellation, false)
+        .map_err(|error| error.to_string())?;
     drop(snapshot); // Also exercise the best-effort Drop cleanup.
     assert_history_excluded()?;
     let _clipboard = open(None, Duration::from_secs(1))?;
@@ -345,6 +350,7 @@ fn native_output_restores_image_text_and_history_markers() -> Result<(), String>
 }
 
 fn exercise_selection_markers() -> Result<(), String> {
+    let cancellation = CancellationToken::new();
     let markers = unsafe {
         [
             RegisterClipboardFormatW(w!("MSDEVColumnSelect")),
@@ -374,7 +380,8 @@ fn exercise_selection_markers() -> Result<(), String> {
                     .map_err(|_| "Selection marker was not advertised".to_owned())?;
             }
             let snapshot = if write_output {
-                backup_and_write("Temporary output").map_err(|error| error.to_string())?
+                backup_and_write("Temporary output", &cancellation, false)
+                    .map_err(|error| error.to_string())?
             } else {
                 backup_and_clear().map_err(|error| error.to_string())?.0
             };
@@ -403,15 +410,24 @@ fn exercise_selection_markers() -> Result<(), String> {
         set_bytes(markers[0], b"selection-marker-data")?;
     }
     let original_marker = read_bytes(markers[0])?;
-    let snapshot = backup_and_write("Temporary output").map_err(|error| error.to_string())?;
+    let snapshot = backup_and_write("Temporary output", &cancellation, false)
+        .map_err(|error| error.to_string())?;
     drop(owner);
     snapshot.restore()?;
     if read_bytes(markers[0])? != original_marker {
         return Err("Selection marker data was not preserved".into());
     }
 
-    // A failed delayed render of an unrelated format must still abort backup,
-    // rather than silently replacing potentially meaningful clipboard data.
+    Ok(())
+}
+
+#[test]
+#[ignore = "uses the real Windows desktop clipboard; run manually with --ignored --test-threads=1"]
+fn native_selection_markers_survive_copy_and_paste_transactions() -> Result<(), String> {
+    with_saved_clipboard(exercise_selection_markers)
+}
+
+fn exercise_unrendered_format() -> Result<(), String> {
     let unknown =
         unsafe { RegisterClipboardFormatW(w!("Dictate.NativeRegression.UnrenderedFormat")) };
     if unknown == 0 {
@@ -426,21 +442,35 @@ fn exercise_selection_markers() -> Result<(), String> {
         unsafe { IsClipboardFormatAvailable(unknown) }
             .map_err(|_| "Unrendered test format was not advertised".to_owned())?;
     }
-    if !matches!(
-        backup_and_write("Temporary output"),
+    let cancellation = CancellationToken::new();
+    assert!(matches!(
+        backup_and_write("Temporary output", &cancellation, false),
         Err(BeginError::Backup(_))
-    ) {
-        return Err("An unrelated unrendered format should prevent backup".into());
-    }
-    if read_changed(0)?.as_deref() != Some("Original selection") {
-        return Err("Failed backup changed the original clipboard".into());
-    }
+    ));
+    assert!(matches!(backup_and_clear(), Err(BeginError::Backup(_))));
+    let canceled = CancellationToken::new();
+    canceled.cancel();
+    assert!(matches!(
+        backup_and_write("Temporary output", &canceled, true),
+        Err(BeginError::Canceled)
+    ));
+    assert_eq!(read_changed(0)?.as_deref(), Some("Original selection"));
+
+    let snapshot = backup_and_write("Temporary output", &cancellation, true)
+        .map_err(|error| error.to_string())?;
     drop(owner);
+    assert!(snapshot.temporary_is_current()?);
+    snapshot.restore()?;
+    drop(snapshot);
+    assert_history_excluded()?;
+    assert_eq!(read_changed(0)?.as_deref(), Some("Temporary output"));
+    let _clipboard = open(None, Duration::from_secs(1))?;
+    assert!(unsafe { IsClipboardFormatAvailable(unknown) }.is_err());
     Ok(())
 }
 
 #[test]
 #[ignore = "uses the real Windows desktop clipboard; run manually with --ignored --test-threads=1"]
-fn native_selection_markers_survive_copy_and_paste_transactions() -> Result<(), String> {
-    with_saved_clipboard(exercise_selection_markers)
+fn native_unrendered_format_can_be_overwritten_when_forced() -> Result<(), String> {
+    with_saved_clipboard(exercise_unrendered_format)
 }

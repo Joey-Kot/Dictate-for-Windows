@@ -279,28 +279,35 @@ pub(super) unsafe fn with_buffered_item(
 ) -> LRESULT {
     unsafe {
         let rect = item.rcItem;
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 0 || height <= 0 {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
             return LRESULT(1);
         }
-        let dc = CreateCompatibleDC(Some(item.hDC));
-        let bitmap = CreateCompatibleBitmap(item.hDC, width, height);
+        with_buffered_dc(item.hDC, rect, |dc| {
+            // Empty owner-draw list notifications may have no row content.
+            fill_color(dc, rect, background());
+            let mut buffered = *item;
+            buffered.hDC = dc;
+            paint(&buffered)
+        })
+    }
+}
+
+pub(super) unsafe fn with_buffered_dc<T>(dest: HDC, rect: RECT, paint: impl FnOnce(HDC) -> T) -> T {
+    unsafe {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let dc = CreateCompatibleDC(Some(dest));
+        let bitmap = CreateCompatibleBitmap(dest, width, height);
         if dc.0.is_null() || bitmap.0.is_null() {
             let _ = DeleteDC(dc);
             let _ = DeleteObject(HGDIOBJ(bitmap.0));
-            return paint(item);
+            return paint(dest);
         }
         let old = SelectObject(dc, HGDIOBJ(bitmap.0));
         let _ = SetViewportOrgEx(dc, -rect.left, -rect.top, None);
-        // Empty owner-draw list notifications may have no row content.
-        SetDCBrushColor(dc, background());
-        FillRect(dc, &rect, HBRUSH(GetStockObject(DC_BRUSH).0));
-        let mut buffered = *item;
-        buffered.hDC = dc;
-        let result = paint(&buffered);
+        let result = paint(dc);
         let _ = BitBlt(
-            item.hDC,
+            dest,
             rect.left,
             rect.top,
             width,
@@ -406,6 +413,20 @@ pub(super) fn position(panel: HWND, button: HWND, height: i32, dpi: u32) -> i32 
 }
 
 pub(super) fn position_pixels(panel: HWND, button: HWND, height: i32, dpi: u32) -> i32 {
+    position_at_anchor(panel, button, None, height, dpi)
+}
+
+pub(super) fn position_with_width(panel: HWND, button: HWND, width: i32, height: i32, dpi: u32) {
+    position_at_anchor(
+        panel,
+        button,
+        Some(platform::scale(width, dpi)),
+        platform::scale(height, dpi),
+        dpi,
+    );
+}
+
+fn position_at_anchor(panel: HWND, button: HWND, width: Option<i32>, height: i32, dpi: u32) -> i32 {
     unsafe {
         let mut data = 0;
         if GetWindowSubclass(panel, Some(panel_proc), 1, Some(&mut data)).as_bool() {
@@ -426,7 +447,7 @@ pub(super) fn position_pixels(panel: HWND, button: HWND, height: i32, dpi: u32) 
         if !ScreenToClient(parent, &mut origin).as_bool() {
             return 0;
         }
-        let width = bounds.right - bounds.left;
+        let width = width.unwrap_or(bounds.right - bounds.left);
         let height = height + platform::scale(PADDING * 2, dpi);
         let gap = platform::scale(6, dpi);
         let mut client = RECT::default();

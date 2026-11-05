@@ -25,16 +25,18 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
-    HGDIOBJ, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush,
+    HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::w;
 use windows_numerics::{Matrix3x2, Vector2};
 
+use dictate_core::config::{WindowColor, WindowColors};
 use dictate_core::runtime::{Event, State};
 
 use crate::i18n::Language;
+use crate::window_color::{contrasting_foreground, status_text_color};
 
 pub const BUTTON_SIZE: i32 = 32;
 pub const BUTTON_GAP: i32 = 6;
@@ -44,6 +46,15 @@ pub const FULL_WIDTH: i32 = 222;
 pub const FULL_HEIGHT: i32 = 94;
 pub const MINIMAL_WIDTH: i32 = 170;
 pub const MINIMAL_HEIGHT: i32 = 46;
+
+pub struct OverlayFrame<'a> {
+    pub event: &'a Event,
+    pub minimal: bool,
+    pub rounded: bool,
+    pub language: Language,
+    pub hover_lifts: &'a [f32; 5],
+    pub animation_time: f32,
+}
 
 pub struct Renderer {
     factory: ID2D1Factory,
@@ -59,10 +70,12 @@ pub struct Renderer {
     minimal_panel_border_geometry: ID2D1PathGeometry,
     dpi: u32,
     window_scale: f32,
+    colors: WindowColors,
+    status_color: D2D1_COLOR_F,
 }
 
 impl Renderer {
-    pub fn new() -> windows::core::Result<Self> {
+    pub fn new(colors: WindowColors) -> windows::core::Result<Self> {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let write_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -137,12 +150,14 @@ impl Renderer {
                 minimal_panel_border_geometry,
                 dpi: 96,
                 window_scale: 1.0,
+                colors,
+                status_color: d2d_window_color(
+                    colors
+                        .font
+                        .unwrap_or_else(|| status_text_color(colors.background)),
+                ),
             })
         }
-    }
-
-    pub fn discard_device_resources(&mut self) {
-        self.target = None;
     }
 
     pub fn set_dpi(&mut self, dpi: u32) {
@@ -157,6 +172,15 @@ impl Renderer {
         if let Some(target) = &self.target {
             self.apply_dpi(target);
         }
+    }
+
+    pub fn set_window_colors(&mut self, colors: WindowColors) {
+        self.colors = colors;
+        self.status_color = d2d_window_color(
+            colors
+                .font
+                .unwrap_or_else(|| status_text_color(colors.background)),
+        );
     }
 
     fn apply_dpi(&self, target: &ID2D1RenderTarget) {
@@ -174,23 +198,48 @@ impl Renderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
         hwnd: HWND,
-        event: &Event,
-        minimal: bool,
-        rounded: bool,
-        language: Language,
-        _pressed_button: Option<i32>,
-        hover_lifts: &[f32; 5],
-        animation_time: f32,
+        frame: OverlayFrame<'_>,
         opacity: u8,
     ) -> windows::core::Result<()> {
         self.ensure_target()?;
         self.ensure_surface(hwnd)?;
         let target = self.target.as_ref().unwrap();
         let surface = self.surface.as_ref().unwrap();
+        if let Err(error) = self.draw_to_surface(target, surface, frame) {
+            self.target = None;
+            return Err(error);
+        }
+        unsafe { surface.present(hwnd, opacity) }
+    }
+
+    pub fn render_preview(
+        &self,
+        frame: OverlayFrame<'_>,
+        size: (u32, u32),
+        opacity: u8,
+    ) -> windows::core::Result<LayeredSurface> {
+        let (pixel_width, pixel_height) = size;
+        let (width, height) = panel_size(frame.minimal);
+        let mut surface = LayeredSurface::new(pixel_width, pixel_height)?;
+        {
+            let dpi_x = 96.0 * pixel_width as f32 / width as f32;
+            let dpi_y = 96.0 * pixel_height as f32 / height as f32;
+            let target = self.create_target(dpi_x, dpi_y)?;
+            self.draw_to_surface(&target, &surface, frame)?;
+        }
+        surface.finish_preview(opacity)?;
+        Ok(surface)
+    }
+
+    fn draw_to_surface(
+        &self,
+        target: &ID2D1DCRenderTarget,
+        surface: &LayeredSurface,
+        frame: OverlayFrame<'_>,
+    ) -> windows::core::Result<()> {
         unsafe {
             target.BindDC(
                 surface.dc,
@@ -202,26 +251,48 @@ impl Renderer {
                 },
             )?;
             target.BeginDraw();
+            let drawing = self.draw_panel(target, frame);
+            let finished = target.EndDraw(None, None);
+            drawing.and(finished)
+        }
+    }
+
+    fn draw_panel(
+        &self,
+        target: &ID2D1RenderTarget,
+        frame: OverlayFrame<'_>,
+    ) -> windows::core::Result<()> {
+        let OverlayFrame {
+            event,
+            minimal,
+            rounded,
+            language,
+            hover_lifts,
+            animation_time,
+        } = frame;
+        unsafe {
             target.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
 
-            let panel_color = rgb8(18, 22, 25);
-            let button_color = rgb8(39, 45, 48);
-            let hover_color = rgb8(49, 57, 61);
-            let disabled_color = rgb8(27, 32, 35);
+            let custom_buttons = self.colors.button != WindowColors::DEFAULT.button;
+            let [r, g, b] = self.colors.button.0;
+            let button_color = d2d_window_color(self.colors.button);
+            let hover_color = rgb8(
+                r.saturating_add(10),
+                g.saturating_add(12),
+                b.saturating_add(13),
+            );
+            let disabled_color = rgb8(
+                r.saturating_sub(12),
+                g.saturating_sub(13),
+                b.saturating_sub(13),
+            );
             let active_color = rgb8(197, 50, 50);
-            let panel = target.CreateSolidColorBrush(&panel_color, None)?;
-            let panel_border = target.CreateSolidColorBrush(&rgb8(42, 45, 48), None)?;
-            let border = target.CreateSolidColorBrush(&rgb8(65, 70, 73), None)?;
-            let disabled_border = target.CreateSolidColorBrush(&rgb8(37, 42, 45), None)?;
-            let active_border = target.CreateSolidColorBrush(&rgb8(239, 108, 108), None)?;
-            let normal = target.CreateSolidColorBrush(&rgb8(217, 227, 229), None)?;
-            let muted = target.CreateSolidColorBrush(&rgb8(102, 108, 110), None)?;
-            let warning = target.CreateSolidColorBrush(&rgb8(240, 208, 115), None)?;
-            let danger = target.CreateSolidColorBrush(&rgb8(255, 156, 141), None)?;
-            let accent = target.CreateSolidColorBrush(&rgb8(168, 215, 208), None)?;
-            let white = target.CreateSolidColorBrush(&rgb8(255, 255, 255), None)?;
+            let panel =
+                target.CreateSolidColorBrush(&d2d_window_color(self.colors.background), None)?;
+            let border =
+                target.CreateSolidColorBrush(&d2d_window_color(self.colors.border), None)?;
             let handle = target.CreateSolidColorBrush(&rgb8(65, 69, 71), None)?;
-            let status_brush = target.CreateSolidColorBrush(&rgb8(174, 189, 192), None)?;
+            let status_brush = target.CreateSolidColorBrush(&self.status_color, None)?;
             let wave_factor = if event.state == State::Paused {
                 0.72
             } else {
@@ -232,11 +303,6 @@ impl Renderer {
             let wave_secondary =
                 target.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.60 * wave_factor), None)?;
 
-            let size = if minimal {
-                (MINIMAL_WIDTH, MINIMAL_HEIGHT)
-            } else {
-                (FULL_WIDTH, FULL_HEIGHT)
-            };
             if rounded {
                 let (panel_geometry, panel_border_geometry) = if minimal {
                     (
@@ -247,17 +313,18 @@ impl Renderer {
                     (&self.full_panel_geometry, &self.full_panel_border_geometry)
                 };
                 target.FillGeometry(panel_geometry, &panel, None::<&ID2D1Brush>);
-                target.DrawGeometry(panel_border_geometry, &panel_border, 1.0, None);
+                target.DrawGeometry(panel_border_geometry, &border, 1.0, None);
             } else {
+                let (width, height) = panel_size(minimal);
                 fill_rounded_f(
                     target,
                     &panel,
-                    &panel_border,
+                    &border,
                     D2D_RECT_F {
                         left: 0.0,
                         top: 0.0,
-                        right: size.0 as f32,
-                        bottom: size.1 as f32,
+                        right: width as f32,
+                        bottom: height as f32,
                     },
                     0.0,
                 );
@@ -292,42 +359,47 @@ impl Renderer {
                 } else {
                     button_color
                 };
-                let fill_color = if is_disabled {
+                let fill_color = if is_disabled || (active_record && custom_buttons) {
                     base_color
                 } else {
                     mix(base_color, hover_color, hover_progress)
                 };
                 let fill = target.CreateSolidColorBrush(&fill_color, None)?;
-                let outline = if active_record && !is_disabled {
-                    &active_border
-                } else if is_disabled {
-                    &disabled_border
-                } else {
-                    &border
-                };
                 let rect = button_rect_f(index, minimal, hover_lifts[index as usize]);
                 fill_rounded_f(
                     target,
                     &fill,
-                    outline,
+                    &border,
                     rect,
                     if rounded { 8.0 } else { 0.0 },
                 );
-                let brush = if is_disabled {
-                    &muted
+                let icon_color = if is_disabled {
+                    [102, 108, 110]
                 } else if active_record {
-                    &white
+                    [255, 255, 255]
                 } else if index == 1 {
-                    &warning
-                } else if index == 2 && retry_button {
-                    &accent
-                } else if index == 2 {
-                    &danger
-                } else if index >= 3 {
-                    &accent
+                    [240, 208, 115]
+                } else if index == 2 && !retry_button {
+                    [255, 156, 141]
+                } else if index >= 2 {
+                    [168, 215, 208]
                 } else {
-                    &normal
+                    [217, 227, 229]
                 };
+                let preferred = WindowColor(icon_color);
+                let mut icon_color = d2d_window_color(preferred);
+                if custom_buttons && !active_record {
+                    let fill = [fill_color.r, fill_color.g, fill_color.b]
+                        .map(|channel| (channel * 255.0).round() as u8);
+                    let foreground =
+                        d2d_window_color(contrasting_foreground(WindowColor(fill), preferred));
+                    icon_color = if is_disabled {
+                        mix(fill_color, foreground, 0.5)
+                    } else {
+                        foreground
+                    };
+                }
+                let brush = target.CreateSolidColorBrush(&icon_color, None)?;
                 draw_icon(
                     target,
                     &self.stroke_style,
@@ -335,7 +407,7 @@ impl Renderer {
                     &self.retry_geometry,
                     index,
                     rect,
-                    brush,
+                    &brush,
                     &wave_primary,
                     &wave_secondary,
                     event.state,
@@ -368,20 +440,19 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-
-            if let Err(error) = target.EndDraw(None, None) {
-                self.discard_device_resources();
-                return Err(error);
-            }
-            surface.present(hwnd, opacity)?;
         }
         Ok(())
     }
 
     fn ensure_target(&mut self) -> windows::core::Result<()> {
-        if self.target.is_some() {
-            return Ok(());
+        if self.target.is_none() {
+            let dpi = self.dpi as f32 * self.window_scale;
+            self.target = Some(self.create_target(dpi, dpi)?);
         }
+        Ok(())
+    }
+
+    fn create_target(&self, dpi_x: f32, dpi_y: f32) -> windows::core::Result<ID2D1DCRenderTarget> {
         unsafe {
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -389,15 +460,13 @@ impl Renderer {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                dpiX: self.dpi as f32,
-                dpiY: self.dpi as f32,
+                dpiX: dpi_x,
+                dpiY: dpi_y,
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
-            self.target = Some(self.factory.CreateDCRenderTarget(&properties)?);
-            self.apply_dpi(self.target.as_ref().unwrap());
+            self.factory.CreateDCRenderTarget(&properties)
         }
-        Ok(())
     }
 
     fn ensure_surface(&mut self, hwnd: HWND) -> windows::core::Result<()> {
@@ -416,9 +485,18 @@ impl Renderer {
     }
 }
 
-struct LayeredSurface {
+pub fn panel_size(minimal: bool) -> (i32, i32) {
+    if minimal {
+        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+    } else {
+        (FULL_WIDTH, FULL_HEIGHT)
+    }
+}
+
+pub struct LayeredSurface {
     dc: HDC,
     bitmap: HBITMAP,
+    bits: *mut u8,
     previous: HGDIOBJ,
     width: u32,
     height: u32,
@@ -461,11 +539,34 @@ impl LayeredSurface {
             Ok(Self {
                 dc,
                 bitmap,
+                bits: bits.cast(),
                 previous,
                 width,
                 height,
             })
         }
+    }
+
+    pub fn bitmap(&self) -> HBITMAP {
+        self.bitmap
+    }
+
+    fn finish_preview(&mut self, opacity: u8) -> windows::core::Result<()> {
+        // Hand DWM a bitmap that is no longer selected into a device context.
+        if unsafe { SelectObject(self.dc, self.previous) }.is_invalid() {
+            return Err(windows::core::Error::from_win32());
+        }
+        // Flush drawing to the DIB before DWM copies it or we touch its pixels.
+        unsafe { GdiFlush().ok()? };
+        if opacity != u8::MAX {
+            // Match UpdateLayeredWindow's constant alpha on premultiplied BGRA.
+            let byte_count = self.width as usize * self.height as usize * 4;
+            let pixels = unsafe { std::slice::from_raw_parts_mut(self.bits, byte_count) };
+            for channel in pixels {
+                *channel = ((u16::from(*channel) * u16::from(opacity) + 127) / 255) as u8;
+            }
+        }
+        Ok(())
     }
 
     unsafe fn present(&self, hwnd: HWND, opacity: u8) -> windows::core::Result<()> {
@@ -1474,6 +1575,11 @@ fn rgb8(r: u8, g: u8, b: u8) -> D2D1_COLOR_F {
     color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
 }
 
+fn d2d_window_color(color: WindowColor) -> D2D1_COLOR_F {
+    let [red, green, blue] = color.0;
+    rgb8(red, green, blue)
+}
+
 fn mix(from: D2D1_COLOR_F, to: D2D1_COLOR_F, amount: f32) -> D2D1_COLOR_F {
     let amount = amount.clamp(0.0, 1.0);
     color(
@@ -1487,6 +1593,8 @@ fn mix(from: D2D1_COLOR_F, to: D2D1_COLOR_F, amount: f32) -> D2D1_COLOR_F {
 #[cfg(test)]
 mod rounded_shape_tests {
     use super::*;
+    use crate::taskbar::Preview;
+    use windows::Win32::Foundation::LPARAM;
     use windows::Win32::Graphics::Gdi::{
         DC_BRUSH, DIBSECTION, FillRect, GdiFlush, GetObjectW, GetStockObject, GetViewportOrgEx,
         HBRUSH, IntersectClipRect, SetDCBrushColor, SetViewportOrgEx,
@@ -1509,6 +1617,41 @@ mod rounded_shape_tests {
                 (surface.width * surface.height * 4) as usize,
             );
             bytes.as_chunks::<4>().0.to_vec()
+        }
+    }
+
+    #[test]
+    fn preview_fits_both_size_limits_and_keeps_premultiplied_opacity() {
+        let renderer = Renderer::new(WindowColors {
+            background: WindowColor([40, 80, 120]),
+            ..WindowColors::DEFAULT
+        })
+        .unwrap();
+        let event = Event::default();
+        for ((max_width, max_height), (width, height)) in
+            [((400, 300), (400, 169)), ((400, 40), (94, 40))]
+        {
+            let preview = Preview::Thumbnail(LPARAM(max_width << 16 | max_height));
+            let size = preview.size(HWND::default(), panel_size(false)).unwrap();
+            let surface = renderer
+                .render_preview(
+                    OverlayFrame {
+                        event: &event,
+                        minimal: false,
+                        rounded: true,
+                        language: Language::ALL[0],
+                        hover_lifts: &[0.0; 5],
+                        animation_time: 0.0,
+                    },
+                    size,
+                    128,
+                )
+                .unwrap();
+            assert_eq!((surface.width, surface.height), (width, height));
+            let pixels = pixels(&surface);
+            assert_eq!(pixels[0], [0, 0, 0, 0]);
+            let inside_panel = ((height - 5) * width + width / 2) as usize;
+            assert_eq!(pixels[inside_panel], [60, 40, 20, 128]);
         }
     }
 

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio_util::sync::CancellationToken;
 use windows::{
     Win32::{
         Foundation::{
@@ -301,7 +302,7 @@ impl Drop for GlobalLockGuard {
 pub(crate) struct ClipboardSnapshot {
     data: Vec<ClipboardData>,
     history_marker: ClipboardData,
-    restored: Cell<bool>,
+    needs_restore: Cell<bool>,
     temporary_id: Option<[u8; 16]>,
 }
 
@@ -312,6 +313,8 @@ unsafe impl Send for ClipboardSnapshot {}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BeginError {
+    #[error("clipboard operation canceled")]
+    Canceled,
     #[error("{0}")]
     Backup(String),
     #[error("{0}")]
@@ -334,7 +337,7 @@ fn is_presence_only_marker(format: u32) -> bool {
     }
 }
 
-fn snapshot(history_marker: ClipboardData) -> Result<ClipboardSnapshot, String> {
+fn snapshot() -> Result<Vec<ClipboardData>, String> {
     let mut formats = Vec::new();
     let mut previous = 0;
     loop {
@@ -377,16 +380,14 @@ fn snapshot(history_marker: ClipboardData) -> Result<ClipboardSnapshot, String> 
         }
         data.push(ClipboardData::duplicate(format, kind, handle)?);
     }
-    Ok(ClipboardSnapshot {
-        data,
-        history_marker,
-        // Until EmptyClipboard succeeds there is nothing to restore.
-        restored: Cell::new(true),
-        temporary_id: None,
-    })
+    Ok(data)
 }
 
-fn begin(temporary_text: Option<&str>) -> Result<(ClipboardSnapshot, u32), BeginError> {
+fn begin(
+    temporary_text: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+    force_write: bool,
+) -> Result<(ClipboardSnapshot, u32), BeginError> {
     // Windows checks this registered format when processing clipboard changes.
     // Allocate both markers and the text before touching the existing clipboard,
     // including a spare marker for restoration if the temporary write fails.
@@ -423,15 +424,30 @@ fn begin(temporary_text: Option<&str>) -> Result<(ClipboardSnapshot, u32), Begin
     // live owner on a worker without a message loop can block that process.
     let owner = OwnerWindow::new().map_err(BeginError::Replace)?;
     let clipboard = open(Some(owner.0), Duration::from_millis(1000)).map_err(BeginError::Backup)?;
-    let mut snapshot = snapshot(restore_marker).map_err(BeginError::Backup)?;
+    let (data, needs_restore) = match snapshot() {
+        Ok(data) => (data, true),
+        Err(_) if force_write => (Vec::new(), false),
+        Err(error) => return Err(BeginError::Backup(error)),
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(BeginError::Canceled);
+    }
     unsafe { EmptyClipboard() }
         .map_err(|error| BeginError::Replace(format!("Cannot clear clipboard: {error}")))?;
-    snapshot.restored.set(false);
+    let mut snapshot = ClipboardSnapshot {
+        data,
+        history_marker: restore_marker,
+        needs_restore: Cell::new(needs_restore),
+        temporary_id: None,
+    };
 
     let write = temporary_marker
         .set()
         .and_then(|()| text.as_ref().map_or(Ok(()), ClipboardData::set));
     if let Err(operation) = write {
+        if !needs_restore {
+            return Err(BeginError::Replace(operation));
+        }
         let restore = snapshot.restore_open();
         // If restoration failed before clearing, release the open clipboard
         // before the snapshot's Drop makes a final best-effort attempt.
@@ -450,11 +466,15 @@ fn begin(temporary_text: Option<&str>) -> Result<(ClipboardSnapshot, u32), Begin
 }
 
 pub(crate) fn backup_and_clear() -> Result<(ClipboardSnapshot, u32), BeginError> {
-    begin(None)
+    begin(None, None, false)
 }
 
-pub(crate) fn backup_and_write(text: &str) -> Result<ClipboardSnapshot, BeginError> {
-    begin(Some(text)).map(|(snapshot, _)| snapshot)
+pub(crate) fn backup_and_write(
+    text: &str,
+    cancellation: &CancellationToken,
+    force_write: bool,
+) -> Result<ClipboardSnapshot, BeginError> {
+    begin(Some(text), Some(cancellation), force_write).map(|(snapshot, _)| snapshot)
 }
 
 pub(crate) fn read_changed(sequence: u32) -> Result<Option<String>, String> {
@@ -517,8 +537,12 @@ impl ClipboardSnapshot {
         self.temporary_is_current_open()
     }
 
+    pub(crate) fn needs_restore(&self) -> bool {
+        self.needs_restore.get()
+    }
+
     pub(crate) fn restore(&self) -> Result<(), String> {
-        if self.restored.get() {
+        if !self.needs_restore() {
             return Ok(());
         }
         // SetClipboardData needs an owner, but only during this write. All data
@@ -529,7 +553,7 @@ impl ClipboardSnapshot {
         if !self.temporary_is_current_open()? {
             // Another application has replaced our temporary output. Keep the
             // newer clipboard rather than putting the older snapshot over it.
-            self.restored.set(true);
+            self.needs_restore.set(false);
             return Ok(());
         }
         self.restore_open()
@@ -557,7 +581,7 @@ impl ClipboardSnapshot {
             }
         }
         // Never clear a partially restored clipboard on a subsequent call.
-        self.restored.set(true);
+        self.needs_restore.set(false);
         if failures.is_empty() {
             Ok(())
         } else {
@@ -572,7 +596,7 @@ impl ClipboardSnapshot {
 impl Drop for ClipboardSnapshot {
     fn drop(&mut self) {
         // A dropped async output task must still make a best effort to restore.
-        if !self.restored.get() {
+        if self.needs_restore() {
             let _ = self.restore();
         }
     }

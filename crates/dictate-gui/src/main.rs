@@ -44,6 +44,8 @@ mod test_status_icons;
 mod tray;
 #[cfg(windows)]
 mod window;
+#[cfg(any(windows, test))]
+mod window_color;
 
 #[cfg(windows)]
 fn main() {

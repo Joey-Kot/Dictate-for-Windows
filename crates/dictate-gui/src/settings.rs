@@ -53,6 +53,7 @@ use crate::resources;
 mod advanced_audio;
 mod audio;
 mod batch_transcription;
+mod color_picker;
 mod debug;
 mod dropdown;
 #[path = "dropdown_scrollbar.rs"]
@@ -68,8 +69,8 @@ use microphone::{
     ID_MICROPHONE, ID_MICROPHONE_LIST, MICROPHONE_TIMER, MicrophonePicker, WM_MICROPHONE_ACTION,
 };
 
-pub fn microphone_handles_escape(hwnd: HWND) -> bool {
-    if hotkeys::value(hwnd).is_some() {
+pub fn control_handles_escape(hwnd: HWND) -> bool {
+    if color_picker::handles_escape(hwnd) || hotkeys::value(hwnd).is_some() {
         return true;
     }
     unsafe {
@@ -93,8 +94,7 @@ const ID_FIELD_BASE: usize = 0x6200;
 const SAVE_TIMER: usize = 0x6701;
 pub const WM_LANGUAGE_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 22;
 const CONNECTIVITY_TIMER: usize = 0x6700;
-pub const WM_OPACITY_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
-pub const WM_WINDOW_SCALE_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
+pub const WM_SETTINGS_APPLIED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
 
 const WINDOW_WIDTH: i32 = 760;
 const WINDOW_HEIGHT: i32 = 724;
@@ -113,9 +113,10 @@ pub(super) const TEST_RESULT_MAX_HEIGHT: i32 = TEST_RESULT_MIN_HEIGHT + TEST_RES
 const API_TEST_RESULT_TOP: i32 = 506;
 const REWRITE_TEST_RESULT_TOP: i32 = 626;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
-const HOTKEY_INPUT_KEYS: [&str; 3] = [
+const HOTKEY_INPUT_KEYS: [&str; 4] = [
     "CLIPBOARD_WRITE_DELAY",
     "CLIPBOARD_RESTORE_DELAY",
+    "FORCE_CLIPBOARD_WRITE",
     "SENDINPUT_BATCH_SIZE",
 ];
 const SEGMENTED_UPLOAD_KEYS: [&str; 2] = ["MAX_UPLOAD_SEGMENT_SECONDS", "MIN_UPLOAD_PAUSE_MS"];
@@ -359,6 +360,12 @@ const FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Boolean,
     },
     FieldSpec {
+        key: "FORCE_CLIPBOARD_WRITE",
+        label: "Force clipboard write",
+        group: "Hotkeys",
+        kind: FieldKind::Boolean,
+    },
+    FieldSpec {
         key: "SENDINPUT_BATCH_SIZE",
         label: "Batch size (UTF-16)",
         group: "Hotkeys",
@@ -426,6 +433,7 @@ struct SettingsState {
     language_items: Vec<HWND>,
     language_panel: HWND,
     language_open: bool,
+    color_picker: Option<std::rc::Rc<color_picker::Picker>>,
     microphone: Option<MicrophonePicker>,
     audio_draft: crate::audio_options::AudioDraft,
     audio_pickers: Vec<audio::AudioPicker>,
@@ -611,6 +619,7 @@ impl SettingsWindow {
             language_items: Vec::new(),
             language_panel: HWND::default(),
             language_open: false,
+            color_picker: None,
             microphone: None,
             audio_draft: crate::audio_options::AudioDraft::new(&runtime.config()),
             audio_pickers: Vec::new(),
@@ -698,6 +707,11 @@ unsafe extern "system" fn settings_proc(
     if pointer.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
+    if message == WM_DRAWITEM
+        && color_picker::draw_swatch(unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) })
+    {
+        return LRESULT(1);
+    }
     let state = unsafe { &mut *pointer };
     if rewrite::handle_message(state, message, wparam, lparam) {
         return LRESULT(0);
@@ -732,6 +746,9 @@ unsafe extern "system" fn settings_proc(
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            if color_picker::command(state, id, notification) {
+                return LRESULT(0);
+            }
             if batch_transcription::command(state, id, notification) {
                 return LRESULT(0);
             }
@@ -760,6 +777,7 @@ unsafe extern "system" fn settings_proc(
                 rewrite::close_provider(state);
                 advanced_audio::close_dynamic_select(state);
                 set_language_dropdown(state, false);
+                close_color_picker(state);
                 audio::close_all(state);
                 if let Some(picker) = &mut state.microphone {
                     picker.set_open(false, state.language, state.dpi);
@@ -776,6 +794,7 @@ unsafe extern "system" fn settings_proc(
                     let _ = InvalidateRect(Some(hwnd), None, true);
                 }
             } else if id == ID_LANGUAGE && notification == BN_CLICKED {
+                close_color_picker(state);
                 set_language_dropdown(state, !state.language_open);
             } else if id == ID_MICROPHONE && notification == BN_CLICKED && !state.saving {
                 audio::close_all(state);
@@ -823,6 +842,7 @@ unsafe extern "system" fn settings_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            close_color_picker(state);
             rewrite::close_provider(state);
             advanced_audio::close_dynamic_select(state);
             audio::close_all(state);
@@ -1010,6 +1030,7 @@ unsafe extern "system" fn settings_proc(
         }
         WM_CTLCOLORDLG => LRESULT(state.background_brush.0 as isize),
         WM_DPICHANGED => {
+            close_color_picker(state);
             rewrite::close_provider(state);
             audio::close_all(state);
             state.dpi = ((wparam.0 >> 16) & 0xffff) as u32;
@@ -1072,6 +1093,7 @@ unsafe extern "system" fn settings_proc(
         }
         windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
             if wparam.0 & 0xffff == 0 {
+                close_color_picker(state);
                 hotkeys::deactivate_window(hwnd);
             } else if wparam.0 >> 16 == 0 && hotkeys::activate_window(hwnd) {
                 return LRESULT(0);
@@ -1393,6 +1415,13 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
             },
         );
     }
+
+    state.color_picker = Some(color_picker::Picker::create(
+        state,
+        group_y["Display"],
+        config.window_colors,
+        instance,
+    )?);
 
     advanced_audio::create(state, instance)?;
     rewrite::create(state, instance)?;
@@ -1952,6 +1981,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         if id == ID_TEST_CONNECTIVITY
             || rewrite::is_action_button(id)
             || debug::is_button(id)
+            || color_picker::is_reset(id)
             || advanced_audio::is_button(id)
         {
             draw_action_button(item, state.font, state.dpi);
@@ -2641,6 +2671,12 @@ fn set_language_dropdown(state: &mut SettingsState, open: bool) {
     }
 }
 
+fn close_color_picker(state: &SettingsState) {
+    if let Some(picker) = &state.color_picker {
+        picker.close(false);
+    }
+}
+
 fn select_language(state: &mut SettingsState, index: usize) {
     let Some(language) = Language::ALL.get(index).copied() else {
         return;
@@ -2871,24 +2907,9 @@ fn poll_save(state: &mut SettingsState) {
     }
     state.saving = false;
     enable_controls(state, true);
-    let config = state.runtime.config();
-    unsafe {
-        let alpha = platform::window_opacity_alpha(config.opacity);
-        let _ = PostMessageW(
-            Some(state.owner),
-            WM_OPACITY_CHANGED,
-            WPARAM(alpha as usize),
-            LPARAM(0),
-        );
-        let _ = PostMessageW(
-            Some(state.owner),
-            WM_WINDOW_SCALE_CHANGED,
-            WPARAM(0),
-            LPARAM(0),
-        );
-    }
     match result {
         Ok(_) => unsafe {
+            let _ = PostMessageW(Some(state.owner), WM_SETTINGS_APPLIED, WPARAM(0), LPARAM(0));
             let _ = DestroyWindow(state.hwnd);
         },
         Err(error) => show_error(state.hwnd, &error),
@@ -2937,6 +2958,7 @@ fn save(state: &mut SettingsState) {
         }
     };
     state.saving = true;
+    close_color_picker(state);
     rewrite::close_provider(state);
     audio::close_all(state);
     if let Some(picker) = &mut state.microphone {
@@ -3036,6 +3058,15 @@ fn read_config(state: &SettingsState) -> Result<Config, String> {
         object.insert(field.key.into(), value);
     }
     let mut config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if let Some(picker) = &state.color_picker {
+        config.window_colors = picker.values().map_err(|field| {
+            format!(
+                "{}\n{}",
+                state.language.text(field.label_key()),
+                state.language.text("window_color_invalid"),
+            )
+        })?;
+    }
     config.advanced_audio_api = advanced_audio::read(state)?;
     config.rewrite = rewrite::read(state);
     config.batch_transcription = batch_transcription::read(state)?;
@@ -3072,6 +3103,12 @@ fn enable_controls(state: &SettingsState, enabled: bool) {
     for control in state
         .controls
         .values()
+        .chain(
+            state
+                .color_picker
+                .iter()
+                .flat_map(|picker| picker.buttons()),
+        )
         .chain(state.rewrite.provider_items.iter())
         .chain(state.page_buttons.iter())
         .chain(std::iter::once(&state.language_control))
@@ -3136,10 +3173,20 @@ fn update_input_controls(state: &SettingsState) {
             let _ = InvalidateRect(Some(*control), None, true);
         }
     }
-    for key in ["CLIPBOARD_WRITE_DELAY", "CLIPBOARD_RESTORE_DELAY"] {
+    let sendinput_enabled = state
+        .boolean_values
+        .get("USE_SENDINPUT")
+        .copied()
+        .unwrap_or(false);
+    for (key, available) in [
+        ("CLIPBOARD_WRITE_DELAY", true),
+        ("CLIPBOARD_RESTORE_DELAY", true),
+        ("FORCE_CLIPBOARD_WRITE", !sendinput_enabled),
+        ("SENDINPUT_BATCH_SIZE", sendinput_enabled),
+    ] {
         if let Some(control) = state.controls.get(key) {
             unsafe {
-                let _ = EnableWindow(*control, !state.saving);
+                let _ = EnableWindow(*control, !state.saving && available);
                 let _ = InvalidateRect(Some(*control), None, true);
             }
         }
@@ -3148,25 +3195,6 @@ fn update_input_controls(state: &SettingsState) {
                 unsafe {
                     let _ = InvalidateRect(Some(*label), None, true);
                 }
-            }
-        }
-    }
-    let sendinput_batch_enabled = !state.saving
-        && state
-            .boolean_values
-            .get("USE_SENDINPUT")
-            .copied()
-            .unwrap_or(false);
-    if let Some(control) = state.controls.get("SENDINPUT_BATCH_SIZE") {
-        unsafe {
-            let _ = EnableWindow(*control, sendinput_batch_enabled);
-            let _ = InvalidateRect(Some(*control), None, true);
-        }
-    }
-    for (label, label_key) in &state.localized_controls {
-        if *label_key == "SENDINPUT_BATCH_SIZE" {
-            unsafe {
-                let _ = InvalidateRect(Some(*label), None, true);
             }
         }
     }

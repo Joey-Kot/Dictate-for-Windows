@@ -37,6 +37,8 @@ pub(crate) fn wait_for_cleanup() {
 pub enum ClipboardError {
     #[error("clipboard operation canceled")]
     Canceled,
+    #[error("clipboard operation canceled (sent Ctrl+V = {paste_sent})")]
+    CanceledAfterOverwrite { paste_sent: bool },
     #[error("read original clipboard: {0}")]
     Read(String),
     #[error("write paste text to clipboard: {0}")]
@@ -71,6 +73,10 @@ pub trait ClipboardOperations: Send + Sync {
     type Snapshot: Send;
 
     fn backup_and_write(&self, text: &str) -> Result<Self::Snapshot, ClipboardError>;
+    /// Called just after a successful write, before attempting restoration.
+    fn wrote_without_backup(&self, _snapshot: &Self::Snapshot) -> bool {
+        false
+    }
     fn temporary_is_current(&self, snapshot: &Self::Snapshot) -> Result<bool, String>;
     fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
     fn send_paste(&self) -> Result<(), String>;
@@ -97,6 +103,16 @@ pub async fn paste_text(
     write_delay: Duration,
     restore_delay: Duration,
 ) -> Result<(), ClipboardError> {
+    paste_text_with_policy(text, cancellation, write_delay, restore_delay, false).await
+}
+
+pub(crate) async fn paste_text_with_policy(
+    text: &str,
+    cancellation: &CancellationToken,
+    write_delay: Duration,
+    restore_delay: Duration,
+    force_write: bool,
+) -> Result<(), ClipboardError> {
     #[cfg(windows)]
     {
         paste_text_with(
@@ -104,13 +120,16 @@ pub async fn paste_text(
             cancellation,
             write_delay,
             restore_delay,
-            &WindowsClipboard,
+            &WindowsClipboard {
+                force_write,
+                cancellation,
+            },
         )
         .await
     }
     #[cfg(not(windows))]
     {
-        let _ = (text, cancellation, write_delay, restore_delay);
+        let _ = (text, cancellation, write_delay, restore_delay, force_write);
         Err(ClipboardError::UnsupportedPlatform)
     }
 }
@@ -129,9 +148,10 @@ pub async fn paste_text_with<O: ClipboardOperations + ?Sized>(
     if cancellation.is_cancelled() {
         return Err(ClipboardError::Canceled);
     }
-    // Back up all formats and install the temporary text while the clipboard
-    // is held open, so another copy cannot be lost between the two steps.
-    let original = operations.backup_and_write(text)?;
+    // Keep the clipboard open from the backup attempt through the write, so
+    // another copy cannot be lost between the two steps.
+    let snapshot = operations.backup_and_write(text)?;
+    let wrote_without_backup = operations.wrote_without_backup(&snapshot);
 
     let mut paste_sent = false;
     let mut operation = operations.wait(cancellation, write_delay).await;
@@ -139,7 +159,7 @@ pub async fn paste_text_with<O: ClipboardOperations + ?Sized>(
         operation = Err(ClipboardError::Canceled);
     }
     if operation.is_ok() {
-        operation = match operations.temporary_is_current(&original) {
+        operation = match operations.temporary_is_current(&snapshot) {
             Ok(true) => Ok(()),
             Ok(false) => Err(ClipboardError::Write(
                 "Clipboard changed before the paste shortcut".into(),
@@ -167,15 +187,17 @@ pub async fn paste_text_with<O: ClipboardOperations + ?Sized>(
         }
     }
 
-    // Restoration is required after every successful temporary write,
-    // including failure and cancellation paths.
-    let restore = operations.restore(&original);
+    // Restore any backup even after failure or cancellation.
+    let restore = operations.restore(&snapshot);
     match (operation, restore) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(message)) => Err(ClipboardError::Restore {
             paste_sent,
             message,
         }),
+        (Err(ClipboardError::Canceled), Ok(())) if wrote_without_backup => {
+            Err(ClipboardError::CanceledAfterOverwrite { paste_sent })
+        }
         (Err(error), Ok(())) => Err(error),
         (Err(operation), Err(restore)) => Err(ClipboardError::OperationAndRestore {
             operation: Box::new(operation),
@@ -186,26 +208,35 @@ pub async fn paste_text_with<O: ClipboardOperations + ?Sized>(
 }
 
 #[cfg(windows)]
-struct WindowsClipboard;
+struct WindowsClipboard<'a> {
+    force_write: bool,
+    cancellation: &'a CancellationToken,
+}
 
 #[cfg(windows)]
 #[async_trait]
-impl ClipboardOperations for WindowsClipboard {
+impl ClipboardOperations for WindowsClipboard<'_> {
     type Snapshot = crate::windows_clipboard::ClipboardSnapshot;
 
     fn backup_and_write(&self, text: &str) -> Result<Self::Snapshot, ClipboardError> {
         use crate::windows_clipboard::BeginError;
-        crate::windows_clipboard::backup_and_write(text).map_err(|error| match error {
-            BeginError::Backup(message) => ClipboardError::Read(message),
-            BeginError::Replace(message) => ClipboardError::Write(message),
-            BeginError::ReplaceAndRestore { operation, restore } => {
-                ClipboardError::OperationAndRestore {
-                    operation: Box::new(ClipboardError::Write(operation)),
-                    paste_sent: false,
-                    restore,
+        crate::windows_clipboard::backup_and_write(text, self.cancellation, self.force_write)
+            .map_err(|error| match error {
+                BeginError::Canceled => ClipboardError::Canceled,
+                BeginError::Backup(message) => ClipboardError::Read(message),
+                BeginError::Replace(message) => ClipboardError::Write(message),
+                BeginError::ReplaceAndRestore { operation, restore } => {
+                    ClipboardError::OperationAndRestore {
+                        operation: Box::new(ClipboardError::Write(operation)),
+                        paste_sent: false,
+                        restore,
+                    }
                 }
-            }
-        })
+            })
+    }
+
+    fn wrote_without_backup(&self, snapshot: &Self::Snapshot) -> bool {
+        !snapshot.needs_restore()
     }
 
     fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
@@ -235,7 +266,7 @@ mod tests {
     }
 
     struct Snapshot {
-        original: Content,
+        original: Option<Content>,
         temporary: Content,
     }
 
@@ -255,6 +286,7 @@ mod tests {
             )>,
         >,
         backup_error: Mutex<bool>,
+        force_write: bool,
         restore_error: Mutex<bool>,
         send_error: Mutex<bool>,
     }
@@ -298,11 +330,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("backup/write:{text}"));
-            if *self.backup_error.lock().unwrap() {
+            let backup_failed = *self.backup_error.lock().unwrap();
+            if backup_failed && !self.force_write {
                 return Err(ClipboardError::Read("backup failed".into()));
             }
             let mut clipboard = self.clipboard.lock().unwrap();
-            let original = clipboard.clone();
+            let original = (!backup_failed).then(|| clipboard.clone());
             let temporary = Content {
                 text: Some(text.into()),
                 ..Content::default()
@@ -312,6 +345,10 @@ mod tests {
                 original,
                 temporary,
             })
+        }
+
+        fn wrote_without_backup(&self, snapshot: &Snapshot) -> bool {
+            snapshot.original.is_none()
         }
 
         fn temporary_is_current(&self, snapshot: &Snapshot) -> Result<bool, String> {
@@ -324,12 +361,15 @@ mod tests {
 
         fn restore(&self, snapshot: &Snapshot) -> Result<(), String> {
             self.calls.lock().unwrap().push("restore".into());
+            let Some(original) = &snapshot.original else {
+                return Ok(());
+            };
             if *self.restore_error.lock().unwrap() {
                 return Err("restore failed".into());
             }
             let mut clipboard = self.clipboard.lock().unwrap();
             if *clipboard == snapshot.temporary {
-                *clipboard = snapshot.original.clone();
+                *clipboard = original.clone();
             }
             Ok(())
         }
@@ -438,6 +478,43 @@ mod tests {
                     Some(&Duration::from_millis(120))
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_forced_overwrite_reports_whether_paste_was_sent() {
+        for (cancel_on_wait, paste_sent) in [(1, false), (2, true)] {
+            let fake = Fake {
+                clipboard: Mutex::new(Content {
+                    text: Some("original".into()),
+                    ..Content::default()
+                }),
+                cancel_on_wait: Mutex::new(Some(cancel_on_wait)),
+                backup_error: Mutex::new(true),
+                force_write: true,
+                ..Fake::default()
+            };
+            let error = paste_text_with(
+                "transcription",
+                &CancellationToken::new(),
+                Duration::ZERO,
+                Duration::ZERO,
+                &fake,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ClipboardError::CanceledAfterOverwrite { paste_sent: sent } if sent == paste_sent
+            ));
+            assert_eq!(
+                fake.clipboard.lock().unwrap().text.as_deref(),
+                Some("transcription")
+            );
+            assert_eq!(
+                fake.calls.lock().unwrap().iter().any(|call| call == "send"),
+                paste_sent
+            );
         }
     }
 

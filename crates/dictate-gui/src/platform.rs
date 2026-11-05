@@ -1,14 +1,21 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::IntersectRect;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
     SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GW_HWNDPREV, GWL_EXSTYLE, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HWND_TOP, HWND_TOPMOST, IsIconic, IsWindowVisible, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SetWindowPos, WS_EX_TOPMOST,
 };
 
 pub fn enable_high_dpi() {
@@ -43,6 +50,78 @@ pub fn unscale_with_factor(value: i32, dpi: u32, factor: f64) -> i32 {
 
 pub fn window_opacity_alpha(opacity: f64) -> u8 {
     (opacity.clamp(0.1, 1.0) * 255.0).round() as u8
+}
+
+pub fn maintain_overlay_z_order(hwnd: HWND) {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
+        let topmost = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+        if (topmost && !covered_by_other_app(hwnd)) || is_cloaked(hwnd) {
+            return;
+        }
+        let insert_after = if topmost { HWND_TOP } else { HWND_TOPMOST };
+        let _ = SetWindowPos(
+            hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+fn covered_by_other_app(hwnd: HWND) -> bool {
+    unsafe {
+        let mut overlay_bounds = RECT::default();
+        if GetWindowRect(hwnd, &mut overlay_bounds).is_err() {
+            return false;
+        }
+        let own_process = std::process::id();
+        let mut below = hwnd;
+        // The Z order can change while walking it. Bound the work of each check.
+        for _ in 0..256 {
+            let Ok(above) = GetWindow(below, GW_HWNDPREV) else {
+                break;
+            };
+            if above == hwnd {
+                break;
+            }
+            below = above;
+            let mut bounds = RECT::default();
+            if !IsWindowVisible(above).as_bool()
+                || IsIconic(above).as_bool()
+                || GetWindowRect(above, &mut bounds).is_err()
+                || !IntersectRect(&mut RECT::default(), &overlay_bounds, &bounds).as_bool()
+            {
+                continue;
+            }
+            let mut process = 0;
+            if GetWindowThreadProcessId(above, Some(&mut process)) != 0
+                && process != own_process
+                && !is_cloaked(above)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0_u32;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            std::ptr::from_mut(&mut cloaked).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    result.is_ok() && cloaked != 0
 }
 
 pub fn disable_native_window_frame(hwnd: HWND) {

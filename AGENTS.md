@@ -823,7 +823,7 @@ This is a Legacy Audio API example with explicit menu/icon defaults and selectio
 | Field | Default | Behavior |
 |---|---:|---|
 | `OPACITY` | `1.0` | GUI floating window opacity. Accepts `0.10`–`1.00` in steps of `0.01`; `1.0` is fully opaque. Full and minimal modes share this setting. |
-| `WINDOW_SCALE` | `1.0` | GUI floating window scale. Accepts `0.3`–`2.0` in steps of `0.1`; saving immediately updates the window, rendered content, and mouse hit areas in both full and minimal modes. |
+| `WINDOW_SCALE` | `1.0` | GUI floating window scale. Accepts `0.30`–`2.00` in steps of `0.01`. Saving immediately updates the window, rendered content, and mouse hit areas in both full and minimal modes. |
 
 ### Legacy Audio API and response fields
 
