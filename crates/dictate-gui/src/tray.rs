@@ -26,6 +26,8 @@ pub struct TrayIcon {
 impl TrayIcon {
     pub fn create(hwnd: HWND) -> windows::core::Result<Self> {
         let icon = resources::load_app_icon()?;
+        let mut tip = [0_u16; 128];
+        write_wide(&mut tip, "Dictate");
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
@@ -33,9 +35,9 @@ impl TrayIcon {
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
             hIcon: icon,
+            szTip: tip,
             ..Default::default()
         };
-        write_wide(&mut data.szTip, "Dictate");
         unsafe {
             if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
                 return Err(windows::core::Error::from_win32());
@@ -90,7 +92,8 @@ impl TrayIcon {
             )
             .0 as usize;
             let _ = DestroyMenu(menu);
-            if !previous_foreground.is_invalid() && previous_foreground != self.data.hWnd {
+            let owner = self.data.hWnd;
+            if !previous_foreground.is_invalid() && previous_foreground != owner {
                 let _ = SetForegroundWindow(previous_foreground);
             }
             (command != 0).then_some(command)

@@ -2,7 +2,7 @@
 
 # Dictate for Windows
 
-Dictate for Windows is a local speech-to-text client for Windows x86_64. It records microphone audio through global hotkeys or a native floating window, obtains a complete transcription through the Legacy Audio API or an enabled Advanced Audio API workflow, and inserts it at the current input position. Prompt hotkeys can also rewrite selected text. Successful rewrite and transcription results use the same clipboard or SendInput insertion method.
+Dictate for Windows is a local speech-to-text client for Windows. It records microphone audio through global hotkeys or a native floating window, obtains a complete transcription through the Legacy Audio API or an enabled Advanced Audio API workflow, and inserts it at the current input position. Prompt hotkeys can also rewrite selected text. Successful rewrite and transcription results use the same clipboard or SendInput insertion method.
 
 The project contains two Rust applications:
 
@@ -26,8 +26,10 @@ It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
 
 | Component | Download | SHA-256 |
 |---|---|---|
-| GUI | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
-| CLI | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI, 64-bit | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
+| CLI, 64-bit | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI, 32-bit | [dictate-gui-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip.sha256) |
+| CLI, 32-bit | [dictate-cli-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip.sha256) |
 
 ### Which version should I use?
 
@@ -46,13 +48,13 @@ It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
 
 ## Requirements
 
-- Windows 10 or Windows 11 x86_64.
+- Windows 10 x86/x86_64 or Windows 11 x86_64.
 - A usable microphone input device for recording.
 
 ### Developing from source
 
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
-- The `x86_64-pc-windows-gnu` Rust target.
+- The `x86_64-pc-windows-gnu` and/or `i686-pc-windows-gnu` Rust target.
 - MinGW-w64, C/C++ build tools, `pkg-config`, Autoconf, Automake, Libtool, NASM, YASM, and XZ utilities.
 - Network access to obtain FFmpeg and codec sources when building static audio dependencies.
 
@@ -60,7 +62,7 @@ It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
 
 ### First launch
 
-1. Download and extract `dictate-gui-windows-amd64.zip`.
+1. Download and extract the GUI archive for your Windows architecture.
 2. Run `Dictate.exe`.
 3. The application creates its default configuration at:
 
@@ -619,7 +621,7 @@ On startup, the application deletes files and directories beginning with `Record
 
 ## Building from source
 
-Official releases are cross-compiled with Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` target.
+Official releases are cross-compiled with Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` and `i686-pc-windows-gnu` targets.
 
 ### Installing the Rust toolchain
 
@@ -627,7 +629,8 @@ Local builds and CI use Rust 1.99.1, with `rustfmt`, `clippy`, and the Windows G
 
 ```bash
 rustup toolchain install 1.99.1 --profile minimal \
-  --component rustfmt --component clippy --target x86_64-pc-windows-gnu
+  --component rustfmt --component clippy \
+  --target x86_64-pc-windows-gnu,i686-pc-windows-gnu
 ```
 
 ### Tests and static checks
@@ -638,6 +641,9 @@ cargo test --workspace --features dictate-gui/native-gui
 cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
 cargo check --workspace \
   --target x86_64-pc-windows-gnu \
+  --features dictate-gui/native-gui
+cargo check --workspace \
+  --target i686-pc-windows-gnu \
   --features dictate-gui/native-gui
 ```
 
@@ -661,9 +667,12 @@ For log receiving, buffering, request redaction, and native FFmpeg forwarding te
 The FFmpeg dependency build requires `aria2c` to download source archives.
 
 ```bash
-scripts/build-ffmpeg-windows-amd64.sh
-scripts/build-rust-windows-amd64.sh
-scripts/package-windows-release.sh
+for arch in amd64 x86; do
+  scripts/build-ffmpeg-windows.sh "$arch"
+  scripts/build-rust-windows.sh "$arch"
+  scripts/verify-windows-binaries.sh "$arch"
+  scripts/package-windows-release.sh "$arch"
+done
 ```
 
 Build outputs:
@@ -671,11 +680,15 @@ Build outputs:
 ```text
 dist/cli/dictate-cli.exe
 dist/gui/Dictate.exe
+dist/x86/cli/dictate-cli.exe
+dist/x86/gui/Dictate.exe
 dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
+dist/dictate-cli-windows-x86.zip
+dist/dictate-gui-windows-x86.zip
 ```
 
-Capture uses Windows WASAPI directly, with no PortAudio build or link requirement. `scripts/build-ffmpeg-windows-amd64.sh` downloads the official FFmpeg 9.0.2 source archive; Linux embedded-audio tests use the same archive.
+Capture uses Windows WASAPI directly. `scripts/build-ffmpeg-windows.sh` downloads the official FFmpeg 9.0.2 source archive; Linux embedded-audio tests use the same archive. Each architecture has its own static FFmpeg/codec build and library directory.
 
 The trimmed build enables file I/O and the codecs, parsers, and muxers required by PCM (including A-law/μ-law), WAV, MP3, Opus, Speex, AAC, AMR-NB/WB, AVI, FLAC, FLV, M4A, MKV, MOV, MP4, MPEG, Ogg, WebM, ASF (WMA), AIFF, and WavPack. Speex uses `libspeex`; AMR-WB uses `libvo_amrwbenc`. FLV retains AAC/MP3 audio support while removing FLV1 and H.264 codecs. WMA v1/v2 codecs are enabled while Theora and WMV video codecs are removed; this build does not include WMA Pro, WMA Lossless, WMV3, or VC-1.
 

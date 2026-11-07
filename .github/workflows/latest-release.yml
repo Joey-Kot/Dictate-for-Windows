@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: latest-release
@@ -16,8 +17,16 @@ concurrency:
 
 jobs:
   build:
-    name: Build Windows Release
+    name: Build Windows ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-pc-windows-gnu
+          - arch: x86
+            target: i686-pc-windows-gnu
 
     steps:
       - name: Checkout
@@ -29,7 +38,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
-          targets: x86_64-pc-windows-gnu
+          targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
       - name: Install native build dependencies
@@ -54,11 +63,14 @@ jobs:
             xz-utils
 
       - name: Test and lint
+        if: matrix.arch == 'amd64'
         run: |
           cargo fmt --all --check
           cargo test --workspace --features dictate-gui/native-gui
           cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
-          cargo check --workspace --target x86_64-pc-windows-gnu --features dictate-gui/native-gui
+
+      - name: Check Windows target
+        run: cargo check --workspace --target "${{ matrix.target }}" --features dictate-gui/native-gui
 
       - name: Check third-party notices
         run: |
@@ -71,26 +83,23 @@ jobs:
 
       - name: Check FFmpeg nonfree is disabled
         run: |
-          if grep -n -- '--enable-nonfree' scripts/build-ffmpeg-windows-amd64.sh; then
+          if grep -n -- '--enable-nonfree' scripts/build-ffmpeg-windows.sh; then
             echo "FFmpeg nonfree components must not be enabled." >&2
             exit 1
           fi
 
-      - name: Build static FFmpeg/libav for MinGW
-        run: scripts/build-ffmpeg-windows-amd64.sh
+      - name: Build static FFmpeg and codecs
+        run: scripts/build-ffmpeg-windows.sh "${{ matrix.arch }}"
 
       - name: Validate embedded decoding and VAD on Linux
+        if: matrix.arch == 'amd64'
         run: bash scripts/test-embedded-audio.sh
 
       - name: Build Rust CLI and native GUI
-        run: scripts/build-rust-windows-amd64.sh
+        run: scripts/build-rust-windows.sh "${{ matrix.arch }}"
 
       - name: Verify binary contracts
         run: |
-          # Subclass helpers must resolve against Common Controls v6 at startup.
-          x86_64-w64-mingw32-objdump -p dist/gui/Dictate.exe | grep 'Entry: ID: 0x000018,'
-          strings dist/gui/Dictate.exe | grep -F 'name="Microsoft.Windows.Common-Controls"'
-          strings dist/gui/Dictate.exe | grep -F 'version="6.0.0.0"'
           if grep -R -n -E '\bbeeep\b|Toast' crates native; then
             echo "A forbidden input or notification implementation is present." >&2
             exit 1
@@ -99,34 +108,78 @@ jobs:
             echo "The removed NOTIFICATION field is serialized." >&2
             exit 1
           fi
-          x86_64-w64-mingw32-objdump -x dist/gui/Dictate.exe | grep 'keybd_event'
-          x86_64-w64-mingw32-objdump -x dist/gui/Dictate.exe | grep 'SendInput'
-          x86_64-w64-mingw32-objdump -x dist/cli/dictate-cli.exe | grep 'SendInput'
-          x86_64-w64-mingw32-objdump -x dist/cli/dictate-cli.exe | grep 'keybd_event'
-          if strings dist/gui/Dictate.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
-            echo "GUI contains the external FFmpeg backend." >&2
-            exit 1
-          fi
-          strings dist/gui/Dictate.exe | grep '\[ffmpeg\] crop/transcode'
-          strings dist/cli/dictate-cli.exe | grep '\[ffmpeg\] crop/transcode'
-          if strings dist/cli/dictate-cli.exe | grep '\[ffmpeg\] executing: ffmpeg'; then
-            echo "CLI contains the external FFmpeg backend." >&2
-            exit 1
-          fi
-          cli_imports="$(x86_64-w64-mingw32-objdump -p dist/cli/dictate-cli.exe | grep 'DLL Name')"
-          if echo "$cli_imports" | grep -E -i 'avcodec|avformat|avutil|swresample|portaudio'; then
-            echo "CLI has a dynamic PortAudio or libav dependency." >&2
-            exit 1
-          fi
-          imports="$(x86_64-w64-mingw32-objdump -p dist/gui/Dictate.exe | grep 'DLL Name')"
-          echo "$imports"
-          if echo "$imports" | grep -E -i 'avcodec|avformat|avutil|swresample|portaudio'; then
-            echo "GUI has a dynamic PortAudio or libav dependency." >&2
-            exit 1
-          fi
+          scripts/verify-windows-binaries.sh "${{ matrix.arch }}"
 
       - name: Package releases
-        run: scripts/package-windows-release.sh
+        run: scripts/package-windows-release.sh "${{ matrix.arch }}"
+
+      - name: Upload architecture artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/dictate-cli-windows-${{ matrix.arch }}.zip
+            dist/dictate-cli-windows-${{ matrix.arch }}.zip.sha256
+            dist/dictate-gui-windows-${{ matrix.arch }}.zip
+            dist/dictate-gui-windows-${{ matrix.arch }}.zip.sha256
+
+  smoke-windows:
+    name: Smoke test packaged Windows binaries
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download both architectures
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: windows-release-*
+          merge-multiple: true
+
+      - name: Exercise embedded audio conversion
+        shell: pwsh
+        run: |
+          foreach ($arch in @('amd64', 'x86')) {
+            $destination = Join-Path $env:RUNNER_TEMP "dictate-cli-$arch"
+            Expand-Archive -LiteralPath "dist/dictate-cli-windows-$arch.zip" -DestinationPath $destination
+            $guiDestination = Join-Path $env:RUNNER_TEMP "dictate-gui-$arch"
+            Expand-Archive -LiteralPath "dist/dictate-gui-windows-$arch.zip" -DestinationPath $guiDestination
+            if (-not (Test-Path (Join-Path $guiDestination 'Dictate.exe'))) {
+              throw "GUI executable is missing from the $arch archive"
+            }
+            python -B scripts/smoke-windows-release.py (Join-Path $destination 'dictate-cli.exe')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  publish:
+    name: Publish Windows releases
+    needs: [build, smoke-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download both architectures
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: windows-release-*
+          merge-multiple: true
+
+      - name: Verify all release checksums
+        run: |
+          cd dist
+          for arch in amd64 x86; do
+            for component in cli gui; do
+              sha256sum --check "dictate-$component-windows-$arch.zip.sha256"
+            done
+          done
 
       - name: Move Latest tag
         run: |
@@ -150,6 +203,10 @@ jobs:
             dist/dictate-cli-windows-amd64.zip.sha256 \
             dist/dictate-gui-windows-amd64.zip \
             dist/dictate-gui-windows-amd64.zip.sha256 \
+            dist/dictate-cli-windows-x86.zip \
+            dist/dictate-cli-windows-x86.zip.sha256 \
+            dist/dictate-gui-windows-x86.zip \
+            dist/dictate-gui-windows-x86.zip.sha256 \
             --clobber
           # Remove only the four assets published under the former project name.
           published_assets="$(gh release view Latest --json assets --jq '.assets[].name')"

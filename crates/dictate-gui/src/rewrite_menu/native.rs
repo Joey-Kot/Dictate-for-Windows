@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use super::layout::{Bounds, Layout, SCROLLBAR_INSET, SCROLLBAR_SCALE};
+use super::pointer_queue::{PointerEvent, PointerQueue};
 use super::surface::Surface;
 use super::theme::Theme;
 use crate::prompt_icons::IconRenderer;
@@ -49,6 +50,7 @@ struct MenuState {
     owner: HWND,
     open: bool,
     generation: u32,
+    pending_pointer: PointerQueue,
     prompts: Vec<RewritePrompt>,
     config_path: PathBuf,
     layout: Layout,
@@ -96,6 +98,7 @@ impl RewriteMenu {
             owner,
             open: false,
             generation: 0,
+            pending_pointer: PointerQueue::default(),
             prompts: Vec::new(),
             config_path: PathBuf::new(),
             layout: Layout::new(0, 1920, 1080, 96),
@@ -418,28 +421,20 @@ unsafe fn close(ptr: *mut MenuState, force: bool) {
     }
 }
 
-unsafe fn cursor_dip(ptr: *mut MenuState, packed: LPARAM) -> (f32, f32) {
+unsafe fn cursor_dip(ptr: *mut MenuState, mut point: POINT) -> (f32, f32) {
     unsafe {
-        let mut point = POINT {
-            x: packed.0 as i32,
-            y: (packed.0 as u64 >> 32) as i32,
-        };
         let _ = ScreenToClient((*ptr).hwnd, &mut point);
         let scale = 96.0 / (*ptr).dpi.max(1) as f32;
         (point.x as f32 * scale, point.y as f32 * scale)
     }
 }
 
-fn packed_point(point: POINT) -> LPARAM {
-    LPARAM(((point.x as u32 as u64) | ((point.y as u32 as u64) << 32)) as isize)
-}
-
-unsafe fn pointer_event(ptr: *mut MenuState, message: u32, packed: LPARAM) {
+unsafe fn pointer_event(ptr: *mut MenuState, message: u32, point: POINT) {
     unsafe {
         if !(*ptr).open {
             return;
         }
-        let (x, y) = cursor_dip(ptr, packed);
+        let (x, y) = cursor_dip(ptr, point);
         let state = &mut *ptr;
         match message {
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -515,7 +510,7 @@ unsafe extern "system" fn window_proc(
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             let ptr = create.lpCreateParams as *mut MenuState;
             (*ptr).hwnd = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as _);
             return LRESULT(1);
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MenuState;
@@ -553,7 +548,7 @@ unsafe extern "system" fn window_proc(
                 }
                 let mut point = POINT::default();
                 if GetCursorPos(&mut point).is_ok() {
-                    pointer_event(ptr, WM_MOUSEMOVE, packed_point(point));
+                    pointer_event(ptr, WM_MOUSEMOVE, point);
                 }
                 LRESULT(0)
             }
@@ -564,8 +559,15 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             POINTER => {
-                if (wparam.0 >> 32) as u32 == (*ptr).generation {
-                    pointer_event(ptr, wparam.0 as u32, lparam);
+                if let Some(event) = (*ptr).pending_pointer.take((*ptr).generation) {
+                    pointer_event(
+                        ptr,
+                        event.message,
+                        POINT {
+                            x: event.x,
+                            y: event.y,
+                        },
+                    );
                 }
                 LRESULT(0)
             }
@@ -626,6 +628,21 @@ unsafe extern "system" fn window_proc(
             }
             _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
+    }
+}
+
+unsafe fn post_pointer(ptr: *mut MenuState, message: u32, point: POINT) {
+    unsafe {
+        let hwnd = (*ptr).hwnd;
+        let event = PointerEvent {
+            generation: (*ptr).generation,
+            message,
+            x: point.x,
+            y: point.y,
+        };
+        (*ptr).pending_pointer.post(event, || {
+            PostMessageW(Some(hwnd), POINTER, WPARAM(0), LPARAM(0)).is_ok()
+        });
     }
 }
 
@@ -720,31 +737,16 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                             // work: a fast outside release must never escape
                             // while the matching down is still queued.
                             LEFT_OWNED.set(true);
-                            let _ = PostMessageW(
-                                Some(hwnd),
-                                POINTER,
-                                WPARAM(((*ptr).generation as usize) << 32 | message as usize),
-                                packed_point(event.pt),
-                            );
+                            post_pointer(ptr, message, event.pt);
                             return LRESULT(1);
                         }
                         WM_LBUTTONUP if captured => {
                             LEFT_OWNED.set(false);
-                            let _ = PostMessageW(
-                                Some(hwnd),
-                                POINTER,
-                                WPARAM(((*ptr).generation as usize) << 32 | message as usize),
-                                packed_point(event.pt),
-                            );
+                            post_pointer(ptr, message, event.pt);
                             return LRESULT(1);
                         }
                         WM_MOUSEMOVE if captured => {
-                            let _ = PostMessageW(
-                                Some(hwnd),
-                                POINTER,
-                                WPARAM(((*ptr).generation as usize) << 32 | message as usize),
-                                packed_point(event.pt),
-                            );
+                            post_pointer(ptr, message, event.pt);
                         }
                         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
                             if !inside =>

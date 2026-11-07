@@ -1,6 +1,7 @@
 //! Nonactivating Rewrite flyout. Layout is pure DIP geometry; Windows draws at
 //! the pointer monitor's physical DPI, independently of floating-window scale.
 mod layout;
+mod pointer_queue;
 
 #[cfg(windows)]
 mod backdrop;

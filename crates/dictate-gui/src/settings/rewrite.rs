@@ -314,7 +314,7 @@ unsafe extern "system" fn page_proc(
             SetWindowLongPtrW(
                 hwnd,
                 GWLP_USERDATA,
-                (*(lparam.0 as *const CREATESTRUCTW)).lpCreateParams as isize,
+                (*(lparam.0 as *const CREATESTRUCTW)).lpCreateParams as _,
             );
         }
     }
@@ -2953,7 +2953,7 @@ unsafe extern "system" fn editor_body_proc(
     if message == WM_NCCREATE {
         unsafe {
             let create = &*(lparam.0 as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
         }
     }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Editor;
@@ -3194,7 +3194,7 @@ unsafe extern "system" fn editor_proc(
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             let editor = create.lpCreateParams.cast::<Editor>();
             (*editor).hwnd = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, editor as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, editor as _);
         }
     }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Editor;

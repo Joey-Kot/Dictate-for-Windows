@@ -700,7 +700,7 @@ unsafe extern "system" fn settings_proc(
         let state = create.lpCreateParams as *mut SettingsState;
         unsafe {
             (*state).hwnd = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as _);
         }
     }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;

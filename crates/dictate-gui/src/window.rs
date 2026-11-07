@@ -280,7 +280,7 @@ unsafe extern "system" fn window_proc(
         let state = create.lpCreateParams as *mut WindowState;
         unsafe {
             (*state).hwnd = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as _);
         }
     }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;

@@ -2,7 +2,7 @@
 
 This is the implementation reference for maintainers and coding agents. `README.md` and `README_ZH.md` are user-facing documentation; this file records module boundaries, state transitions, resource ownership, and validation details. Diagrams describe the current implementation, including platform fallbacks, rather than the initial design proposals.
 
-Dictate for Windows is a local speech-to-text client for Windows x86_64. It records microphone audio through global hotkeys or a native floating window, uses either the existing Legacy Audio API or an enabled Advanced Audio API workflow to obtain a final transcript, and automatically inserts it at the current input position. Prompt hotkeys and the GUI's nonactivating Rewrite menu can rewrite selected text; successful results use the same clipboard or SendInput output method as transcription.
+Dictate for Windows is a local speech-to-text client for 32-bit x86 and 64-bit x86_64 Windows. It records microphone audio through global hotkeys or a native floating window, uses either the existing Legacy Audio API or an enabled Advanced Audio API workflow to obtain a final transcript, and automatically inserts it at the current input position. Prompt hotkeys and the GUI's nonactivating Rewrite menu can rewrite selected text; successful results use the same clipboard or SendInput output method as transcription.
 
 The project includes two Rust programs:
 
@@ -26,8 +26,10 @@ The current implementation uses Rust, Win32, Direct2D, and DirectWrite, with Dir
 
 | Component | Download | SHA-256 |
 |---|---|---|
-| GUI | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
-| CLI | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI, 64-bit | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
+| CLI, 64-bit | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI, 32-bit | [dictate-gui-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip.sha256) |
+| CLI, 32-bit | [dictate-cli-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip.sha256) |
 
 ### Which version to choose
 
@@ -268,7 +270,7 @@ stateDiagram-v2
 
 ## Scope and limitations
 
-- Releases target Windows x86_64. The GUI, microphone capture, device enumeration, and global hotkeys are Windows-only; CLI source can still compile elsewhere.
+- Releases target Windows x86 and x86_64. The GUI, microphone capture, device enumeration, and global hotkeys are Windows-only; CLI source can still compile elsewhere.
 - Choose a named microphone or follow the system default. The device is resolved again whenever recording starts.
 - Legacy Audio API sends `multipart/form-data` and expects HTTP 200 JSON; the exact HTTP 400 `ASR_RESPONSE_HAVE_NO_WORDS` recognition response also completes normally with no text. It runs after recording, not as realtime recognition. Segmented upload sends independently decodable files through separate requests.
 - Advanced Audio API supports bounded HTTP request, stream, and poll workflows plus WebSocket realtime sessions. It does not support gRPC, custom HTTP/2 event streams, callback/webhook-only completion, arbitrary code or workflow branches/loops, custom signer code, provider-specific realtime resume, or foreground partial text.
@@ -280,14 +282,14 @@ stateDiagram-v2
 
 ### GUI
 
-- Windows 10 or Windows 11 x86_64.
+- Windows 10 x86/x86_64 or Windows 11 x86_64. The x86 build requires SSE2.
 - An available microphone input device for recording.
 - A compatible Legacy ASR HTTP endpoint or a validated, enabled Advanced Audio API workflow for transcription; a supported text service for Rewrite.
 - No installation of FFmpeg, PortAudio, WebView2, or the Visual C++ Redistributable is required.
 
 ### CLI
 
-- Windows x86_64.
+- Windows 10 x86/x86_64 or Windows 11 x86_64. The x86 build requires SSE2.
 - A microphone for hotkey recording mode.
 - No system FFmpeg installation is required.
 - A compatible Legacy ASR HTTP endpoint or a validated, enabled Advanced Audio API workflow for transcription; a supported text service for Rewrite.
@@ -295,7 +297,7 @@ stateDiagram-v2
 ### Developing from source
 
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
-- The `x86_64-pc-windows-gnu` Rust target.
+- The `x86_64-pc-windows-gnu` and/or `i686-pc-windows-gnu` Rust target.
 - MinGW-w64, C/C++ build tools, `pkg-config`, Autoconf, Automake, Libtool, NASM, YASM, and XZ tools.
 - Access to FFmpeg and codec source code when building the static audio dependencies.
 
@@ -303,7 +305,7 @@ stateDiagram-v2
 
 ### First launch
 
-1. Download and extract `dictate-gui-windows-amd64.zip`.
+1. Download and extract the GUI archive for your Windows architecture.
 2. Run `Dictate.exe`.
 3. The program creates a default configuration at:
 
@@ -417,7 +419,7 @@ stateDiagram-v2
     end note
 ```
 
-- **Focus and input:** `WS_EX_NOACTIVATE`, `MA_NOACTIVATE`, and explicit `SWP_NOACTIVATE | SWP_NOOWNERZORDER` positioning keep both showing and hiding nonactivating. Temporary low-level keyboard/mouse hooks are installed while open regardless of `HOTKEY_HOOK`. Esc is consumed through its release; outside clicks close the menu and continue to the target app; wheel input inside the popup is consumed so the background does not scroll. Left-button ownership is recorded in the hook before queued GUI messages, allowing scrollbar drag/release outside the menu. Input generations reject messages left over from a previous opening. These hooks are separate from the ordinary application hotkey backend.
+- **Focus and input:** `WS_EX_NOACTIVATE`, `MA_NOACTIVATE`, and explicit `SWP_NOACTIVATE | SWP_NOOWNERZORDER` positioning keep both showing and hiding nonactivating. Temporary low-level keyboard/mouse hooks are installed while open regardless of `HOTKEY_HOOK`. Esc is consumed through its release; outside clicks close the menu and continue to the target app; wheel input inside the popup is consumed so the background does not scroll. Left-button ownership is recorded in the hook before queued GUI messages, allowing scrollbar drag/release outside the menu. `pointer_queue.rs` owns full 32-bit coordinates and the generation for every successfully posted pointer message on both architectures; queued generations reject events from a previous opening. These hooks are separate from the ordinary application hotkey backend.
 - **Layout:** 248 DIP width, 40 DIP row height, 22 DIP icons, 14 DIP text, 8 DIP corner radius, and 4 DIP top/bottom padding. The normal maximum is seven complete visible rows (248×288 DIP); fewer items shrink the height, and a short work area reduces the visible row count. Titles are single-line ellipsized. The scrollbar has its own gutter and uses the shared scrollbar metrics; separators are inset and omitted after the last visible row. Layout and hit testing use the same geometry.
 - **DPI and positioning:** use the trigger-time pointer's monitor DPI and work area, including taskbar limits and negative screen coordinates. Flip the opening direction near an edge, clamp to the work area, and recompute on display/DPI changes. Menu scale is independent of `WINDOW_SCALE` and `OPACITY`, which control the recording overlay.
 - **Composition:** `surface.rs` owns a DirectComposition visual and premultiplied-alpha DXGI swap chain. Direct2D/DirectWrite draw crisp text, icons, subtle interaction overlays, separators, and scrollbar above the background; do not blur or stretch a screenshot of the whole menu. The recording overlay's existing layered-window renderer is a different path.
@@ -1251,7 +1253,7 @@ Rewrite does not create an audio cache or a persistent request/response cache, a
 
 ## Building from source
 
-Official releases are cross-compiled using Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` target.
+Official releases are cross-compiled using Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` and `i686-pc-windows-gnu` targets.
 
 ### Installing the Rust toolchain
 
@@ -1259,7 +1261,8 @@ Local builds and CI use Rust 1.99.1, with `rustfmt`, `clippy`, and the Windows G
 
 ```bash
 rustup toolchain install 1.99.1 --profile minimal \
-  --component rustfmt --component clippy --target x86_64-pc-windows-gnu
+  --component rustfmt --component clippy \
+  --target x86_64-pc-windows-gnu,i686-pc-windows-gnu
 ```
 
 ### Tests and static checks
@@ -1270,6 +1273,9 @@ cargo test --workspace --features dictate-gui/native-gui
 cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
 cargo clippy --workspace --all-targets \
   --target x86_64-pc-windows-gnu \
+  --features dictate-gui/native-gui -- -D warnings
+cargo clippy --workspace --all-targets \
+  --target i686-pc-windows-gnu \
   --features dictate-gui/native-gui -- -D warnings
 git diff --check
 ```
@@ -1312,9 +1318,12 @@ The option defaults to six items and accepts 0–1000. `F8` toggles at the point
 The FFmpeg dependency build requires `aria2c` to download source archives.
 
 ```bash
-scripts/build-ffmpeg-windows-amd64.sh
-scripts/build-rust-windows-amd64.sh
-scripts/package-windows-release.sh
+for arch in amd64 x86; do
+  scripts/build-ffmpeg-windows.sh "$arch"
+  scripts/build-rust-windows.sh "$arch"
+  scripts/verify-windows-binaries.sh "$arch"
+  scripts/package-windows-release.sh "$arch"
+done
 ```
 
 Build outputs:
@@ -1322,13 +1331,19 @@ Build outputs:
 ```text
 dist/cli/dictate-cli.exe
 dist/gui/Dictate.exe
+dist/x86/cli/dictate-cli.exe
+dist/x86/gui/Dictate.exe
 dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
+dist/dictate-cli-windows-x86.zip
+dist/dictate-gui-windows-x86.zip
 ```
 
-Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows-amd64.sh` downloads `https://www.ffmpeg.org/releases/ffmpeg-9.0.2.tar.gz` and verifies its SHA-256, `84960df915059e8754fef2cd7c9afeb614062b1b5458ec471eecee619ee04e98`, before extraction. The source is placed in a versioned directory to avoid reusing old Git sources; Linux embedded audio tests verify and use the same unmodified source archive. The MOV demuxer remains enabled for existing M4A/MP4 audio-file input support; this configuration does not isolate parsing to PCM as the Android build does.
+Audio capture uses the Windows system WASAPI interface directly, with no need to build or link PortAudio. `scripts/build-ffmpeg-windows.sh` downloads `https://www.ffmpeg.org/releases/ffmpeg-9.0.2.tar.gz` and verifies its SHA-256, `84960df915059e8754fef2cd7c9afeb614062b1b5458ec471eecee619ee04e98`, before extraction. The x86 and amd64 builds use separate source/build and library directories; the original `*-amd64.sh` entry points remain available. Linux embedded audio tests verify and use the same unmodified source archive. The MOV demuxer remains enabled for existing M4A/MP4 audio-file input support; this configuration does not isolate parsing to PCM as the Android build does.
 
 The Opus 1.5.2 and LAME 3.100 source archives are also checked against fixed SHA-256 hashes before extraction, including downloads already in the cache. The hashes are recorded in the build scripts and third-party component notices.
+
+The x86 and amd64 build directories and FFmpeg install prefixes must remain separate. The build scripts check compiler pointer width and existing archives before reuse, and mark each directory with its architecture. See [Windows x86 validation](docs/windows-x86-validation.md) for local checks and the remaining desktop acceptance boundary.
 
 The trimmed build enables file input/output and the codecs, parsers, and muxers required for PCM (including A-law/μ-law), WAV, MP3, Opus, Speex, AAC, AMR-NB/WB, AVI, FLAC, FLV, M4A, MKV, MOV, MP4, MPEG, Ogg, WebM, ASF (WMA), AIFF, and WavPack. Speex uses `libspeex`, and AMR-WB uses `libvo_amrwbenc`. FLV retains AAC/MP3 audio support, with FLV1 and H.264 codecs removed. WMA v1/v2 encoding and decoding are enabled, while Theora and WMV video codecs are removed; this build does not include WMA Pro, WMA Lossless, WMV3, or VC-1.
 
@@ -1337,15 +1352,15 @@ Build component names differ from file extensions: raw PCM muxers use `pcm_*`; S
 GitHub Actions also checks that:
 
 - Formatting, tests, and `clippy -D warnings` pass.
-- Windows API and MinGW target compilation succeeds.
+- Both Windows GNU target builds succeed and their PE architecture matches the archive name.
 - The GUI embeds the Common Controls v6 manifest required by the drop-down control subclassing interfaces.
 - The FFmpeg build does not enable `nonfree`.
 - Both the CLI and GUI include `keybd_event` and `SendInput`, supporting the two selectable input paths.
-- The GUI does not include an external FFmpeg backend.
-- The GUI does not dynamically depend on PortAudio or libav DLLs.
+- Neither executable contains an external FFmpeg backend or imports audio/codec or compiler-runtime DLLs.
+- A Windows runner extracts both architectures and exercises each packaged CLI's embedded Opus conversion and transcription against a local stub. The x86 executable runs there under WOW64; it does not replace 32-bit Windows desktop acceptance.
 - `NOTICE` and `THIRD_PARTY_LICENSES/` are complete.
 
-After a successful build, the workflow updates the `Latest` tag and Release, and uploads the GUI, CLI, and their SHA-256 files.
+After both architecture builds and Windows smoke tests succeed, one publishing job updates the `Latest` tag and Release and uploads all four archives and their SHA-256 files.
 
 ### Containers and codecs supported by embedded FFmpeg
 

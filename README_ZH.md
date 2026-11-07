@@ -2,7 +2,7 @@
 
 # Dictate for Windows
 
-Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客户端。它通过全局快捷键或原生浮窗录制麦克风音频，使用现有的 Legacy Audio API（旧音频 API）或已启用的高级 Audio API 工作流取得完整转写，再自动写入当前输入位置。还可以通过提示词快捷键改写选中的文本；成功结果与转录共用剪贴板或 SendInput 写入方式。
+Dictate for Windows 是一个 Windows 本地语音转文字客户端。它通过全局快捷键或原生浮窗录制麦克风音频，使用现有的 Legacy Audio API（旧音频 API）或已启用的高级 Audio API 工作流取得完整转写，再自动写入当前输入位置。还可以通过提示词快捷键改写选中的文本；成功结果与转录共用剪贴板或 SendInput 写入方式。
 
 项目包含两个 Rust 程序：
 
@@ -26,8 +26,10 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 | 组件 | 下载 | SHA-256 |
 |---|---|---|
-| GUI | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
-| CLI | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI，64 位 | [dictate-gui-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-amd64.zip.sha256) |
+| CLI，64 位 | [dictate-cli-windows-amd64.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-amd64.zip.sha256) |
+| GUI，32 位 | [dictate-gui-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-gui-windows-x86.zip.sha256) |
+| CLI，32 位 | [dictate-cli-windows-x86.zip](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip) | [sha256](https://github.com/Joey-Kot/Dictate-for-Windows/releases/download/Latest/dictate-cli-windows-x86.zip.sha256) |
 
 ### 应该选择哪个版本
 
@@ -46,13 +48,13 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 ## 运行要求
 
-- Windows 10 或 Windows 11 x86_64。
+- Windows 10 x86/x86_64，或 Windows 11 x86_64。
 - 录音功能需要可用的麦克风输入设备。
 
 ### 从源码开发
 
 - Rust 1.99.1（由 `rust-toolchain.toml` 固定版本）。
-- `x86_64-pc-windows-gnu` Rust 目标。
+- `x86_64-pc-windows-gnu` 和／或 `i686-pc-windows-gnu` Rust 目标。
 - MinGW-w64、C/C++ 构建工具、`pkg-config`、Autoconf、Automake、Libtool、NASM、YASM 和 XZ 工具。
 - 构建静态音频依赖时需要能够获取 FFmpeg 和编解码器源码。
 
@@ -60,7 +62,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 ### 首次启动
 
-1. 下载并解压 `dictate-gui-windows-amd64.zip`。
+1. 下载并解压与 Windows 架构对应的 GUI 压缩包。
 2. 运行 `Dictate.exe`。
 3. 程序会在以下位置创建默认配置：
 
@@ -615,7 +617,7 @@ multipart 内容：
 
 ## 从源码构建
 
-正式发布使用 Ubuntu、MinGW-w64 和 Rust `x86_64-pc-windows-gnu` 目标交叉构建。
+正式发布使用 Ubuntu、MinGW-w64 和 Rust `x86_64-pc-windows-gnu`、`i686-pc-windows-gnu` 目标交叉构建。
 
 ### 安装 Rust 工具链
 
@@ -623,7 +625,8 @@ multipart 内容：
 
 ```bash
 rustup toolchain install 1.99.1 --profile minimal \
-  --component rustfmt --component clippy --target x86_64-pc-windows-gnu
+  --component rustfmt --component clippy \
+  --target x86_64-pc-windows-gnu,i686-pc-windows-gnu
 ```
 
 ### 测试与静态检查
@@ -634,6 +637,9 @@ cargo test --workspace --features dictate-gui/native-gui
 cargo clippy --workspace --all-targets --features dictate-gui/native-gui -- -D warnings
 cargo check --workspace \
   --target x86_64-pc-windows-gnu \
+  --features dictate-gui/native-gui
+cargo check --workspace \
+  --target i686-pc-windows-gnu \
   --features dictate-gui/native-gui
 ```
 
@@ -657,9 +663,12 @@ Rewrite 的自动化结果及待执行的选区读取、真实写入、Provider 
 构建 FFmpeg 依赖时，需要使用 `aria2c` 下载源码包。
 
 ```bash
-scripts/build-ffmpeg-windows-amd64.sh
-scripts/build-rust-windows-amd64.sh
-scripts/package-windows-release.sh
+for arch in amd64 x86; do
+  scripts/build-ffmpeg-windows.sh "$arch"
+  scripts/build-rust-windows.sh "$arch"
+  scripts/verify-windows-binaries.sh "$arch"
+  scripts/package-windows-release.sh "$arch"
+done
 ```
 
 构建结果：
@@ -667,11 +676,15 @@ scripts/package-windows-release.sh
 ```text
 dist/cli/dictate-cli.exe
 dist/gui/Dictate.exe
+dist/x86/cli/dictate-cli.exe
+dist/x86/gui/Dictate.exe
 dist/dictate-cli-windows-amd64.zip
 dist/dictate-gui-windows-amd64.zip
+dist/dictate-cli-windows-x86.zip
+dist/dictate-gui-windows-x86.zip
 ```
 
-采集直接使用 Windows 系统 WASAPI 接口，无需构建或链接 PortAudio。`scripts/build-ffmpeg-windows-amd64.sh` 下载 FFmpeg 9.0.2 官方源码包；Linux 内嵌音频测试也使用此源码包。
+采集直接使用 Windows 系统 WASAPI 接口。`scripts/build-ffmpeg-windows.sh` 下载 FFmpeg 9.0.2 官方源码包；Linux 内嵌音频测试也使用此源码包。两种架构分别构建并保存静态 FFmpeg 及编解码库。
 
 裁剪构建启用文件读写，以及 PCM（含 A-law/μ-law）、WAV、MP3、Opus、Speex、AAC、AMR-NB/WB、AVI、FLAC、FLV、M4A、MKV、MOV、MP4、MPEG、Ogg、WebM、ASF（WMA）、AIFF 和 WavPack 所需的编解码器、解析器与封装器。Speex 使用 `libspeex`，AMR-WB 使用 `libvo_amrwbenc`。FLV 保留 AAC/MP3 音频支持，移除 FLV1、H.264 编解码器。启用 WMA v1/v2 编解码，移除 Theora 和 WMV 视频编解码器；本构建不包含 WMA Pro、WMA Lossless、WMV3、VC-1。
 
