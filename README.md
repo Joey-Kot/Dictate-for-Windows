@@ -2,25 +2,47 @@
 
 # Dictate for Windows
 
-Dictate for Windows is a local speech-to-text client for Windows. It records microphone audio through global hotkeys or a native floating window, obtains a complete transcription through the Legacy Audio API or an enabled Advanced Audio API workflow, and inserts it at the current input position. Prompt hotkeys can also rewrite selected text. Successful rewrite and transcription results use the same clipboard or SendInput insertion method.
+![Dictate for Windows](docs/Display.png)
 
-The project contains two Rust applications:
+**Speak and type instantly; select text and summon AI at your fingertips.**
 
-- `Dictate.exe`: a native Win32 GUI application that captures audio with Windows WASAPI and statically links a trimmed FFmpeg/libav build. Extract and run it directly.
-- `dictate-cli.exe`: a command-line application for hotkey recording and transcribing existing audio files. It shares the embedded libav converter with the GUI and does not require a system FFmpeg installation.
+Dictate for Windows is a voice typing and text rewriting tool that works alongside your existing keyboard. Start voice typing with a shortcut, or select text and choose a prompt from a floating menu to have AI process it according to your instructions. You can also drag local audio files or folders into the interface to batch-transcribe existing recordings.
 
-It is currently implemented with Rust, Win32, Direct2D, and DirectWrite.
+It supports multiple ways to connect to speech and text APIs and can **generate custom speech Providers that connect directly to vendors, based on their API documentation and your requirements**. Everything from audio encoding and speech segmentation to prompts, API parameters, and network requests can be configured to suit your needs.
 
-## Features
+## Voice typing: From microphone to text, configured your way
 
-- **Recording and transcription**: Record through the floating window or global hotkeys, with pause, cancel, and retry of the most recent recording.
-- **Text rewriting**: Use prompt hotkeys or an optional native Rewrite menu to rewrite selected text with different providers.
-- **Custom APIs**: Configure a regular OpenAI-compatible-style audio API plus provider-specific Rewrite APIs, models, prompts, and extra request parameters.
-- **Advanced custom Audio API providers**: Generate and validate declarative ASR-provider workflows from separate user requirements and vendor documentation. Workflows provide typed, conditionally visible, single-select, and multi-select controls, and support single requests, streamed responses, asynchronous polling, and real-time WebSocket transcription.
-- **Automatic insertion**: Insert transcription and rewrite results into the active application through the clipboard or SendInput.
-- **Audio processing**: Select microphones and output formats, optionally trim with Earshot VAD, and use embedded FFmpeg without a separate installation.
-- **Local concurrent segmented uploads**: Analyze silence from audio amplitude with embedded FFmpeg/libav, prefer pauses as boundaries while preserving the complete audio timeline, export independent media segments, and submit them to the ASR API with bounded concurrency.
-- **GUI and CLI**: Native multilingual floating UI and a command-line application for everyday recording, scripting, and transcribing existing audio files.
+Record using the default microphone or one you specify, capturing audio using the microphone’s own sample rate and other parameters before converting it to the required format. Audio formats and codecs are configurable, covering most codecs supported by FFmpeg.
+
+Transcription supports two connection methods:
+
+- **Audio API-compatible**: Use an OpenAI-style transcription endpoint, specify the full API URL, customize the text field in the returned JSON, and add nested JSON parameters.
+- **AI-powered speech Provider generator**: Paste a vendor’s API documentation and enter the parameters and features you need. AI then generates a custom Provider that connects directly to the vendor’s endpoint. Generation uses the API configured for text rewriting.
+
+Audio processing supports silence-based splitting using PCM analysis, VAD with adjustable parameters, length-based splitting, and concurrent transcription. These features are available with both types of speech API.
+
+## Text rewriting: Unlimited prompts, connected to different models
+
+After selecting text, you can run a prompt directly using its assigned shortcut, or use a global shortcut to open a floating desktop menu and choose the action you need.
+
+You can configure any number of prompts. Each prompt can have an icon, title, content, optional shortcut, and additional JSON parameters. It can use the primary Provider or specify its own, allowing different tasks to use different vendors or models.
+
+The text API supports **15 vendors and 25 API endpoints**, including Chat Completions, Responses, and Anthropic and Gemini endpoints. Prompt icons can be selected from 25 built-in icons or imported as PNG, JPG, or SVG files.
+
+## Batch transcription of local audio: Process existing recordings too
+
+Drag audio files or folders directly into the batch transcription interface to process them using a configured speech Provider.
+
+Batch transcription supports both Audio API-compatible Providers and AI-generated custom speech Providers, using the same settings for audio conversion, silence-based splitting, VAD, and concurrency. Long recordings and multiple audio files can all be processed with the same configuration.
+
+## Use it your way
+
+- **Text input**: Text is entered quickly through the clipboard by default. You can also use SendInput to simulate keyboard input and adjust the batch size.
+- **Shortcut capture**: Use system-registered shortcuts or switch to a low-level keyboard hook.
+- **API parameters**: Both speech and text APIs support additional nested JSON parameters for accessing advanced vendor features.
+- **Caching and debugging**: Choose whether to save original audio, converted audio, and API response JSON. Debugging options for recording, FFmpeg conversion, shortcuts, and network uploads can be enabled individually.
+- **Network controls**: Configure options such as request timeout, retry count, HTTP/2, and SSL verification.
+- **Ways to use it**: Includes a floating GUI and a CLI.
 
 ## Downloads
 
