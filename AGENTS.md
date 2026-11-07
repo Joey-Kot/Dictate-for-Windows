@@ -341,7 +341,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 
 | Page | Contents |
 |---|---|
-| Display | Interface language, configuration file location, floating window opacity, and floating window scale |
+| Display | Interface language, configuration file location, floating window opacity, scale, theme, and four editable colors |
 | Audio API | Legacy endpoint, Token, model, language, prompt, text path, and extra fields |
 | Advanced Audio API | Enable switch, requirements and vendor material, workflow generation/validation, Values, Secrets, raw Workflow JSON, Remote hosting, and Test workflow |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
@@ -354,6 +354,7 @@ Full mode appears in the taskbar; minimal mode hides the taskbar entry while kee
 | About | Project, author, license, and repository information |
 
 - Settings can be saved only in `Idle` or `Error`. Save validates the draft, prepares affected resources, and atomically applies the configuration; failure preserves the previous configuration and hotkeys. Cancel discards the draft.
+- Display's floating-window Theme is stored independently from the four colors. Selecting Dark or Light loads that preset into the draft; selecting Custom keeps the current draft. Editing colors never changes the selected theme. Each color's Reset uses the selected preset, or Light for Custom. Dark preserves automatic background-contrast text; Light uses `#E9FFF6` background, `#D3E8FF` button, `#000000` font, and `#E9FFF6` border. Old configurations default to Dark without changing existing colors.
 - Audio Record starts with **Microphone**. Its list refreshes when Settings or the picker opens; **Follow system default** is available, and an offline saved device is retained and marked unavailable rather than silently replaced.
 - Display language, Microphone, audio output, and Rewrite Provider use the same scrollable dropdown behavior. Long lists—including the full Provider list—scroll and open upward when needed.
 - Audio output uses filtered presets for channels, sample rate, bit depth, bitrate, codec, and container. New configurations default to **mono, 16-bit preference, 16000 Hz, 128 kbps, Opus, and `opus`**. Selecting a codec reconciles incompatible choices; **Custom…** accepts an integer, and existing valid non-preset values remain until changed. The full supported codec/container matrix appears [below](#containers-and-codecs-supported-by-embedded-ffmpeg).
@@ -744,6 +745,11 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "ExtraConfig": "{\"response_format\":\"json\",\"stream\":false,\"temperature\":0,\"language\":null,\"include[]\":\"logprobs\"}",
   "OPACITY": 1.0,
   "WINDOW_SCALE": 1.0,
+  "WINDOW_THEME": "dark",
+  "WINDOW_BACKGROUND_COLOR": "#121619",
+  "WINDOW_BUTTON_COLOR": "#272D30",
+  "WINDOW_FONT_COLOR": null,
+  "WINDOW_BORDER_COLOR": "#2A2D30",
   "INPUT_DEVICE": "",
   "INPUT_DEVICE_NAME": "",
   "CHANNELS": 1,
@@ -824,6 +830,11 @@ This is a Legacy Audio API example with explicit menu/icon defaults and selectio
 |---|---:|---|
 | `OPACITY` | `1.0` | GUI floating window opacity. Accepts `0.10`–`1.00` in steps of `0.01`; `1.0` is fully opaque. Full and minimal modes share this setting. |
 | `WINDOW_SCALE` | `1.0` | GUI floating window scale. Accepts `0.30`–`2.00` in steps of `0.01`. Saving immediately updates the window, rendered content, and mouse hit areas in both full and minimal modes. |
+| `WINDOW_THEME` | `"dark"` | Selected GUI floating-window theme: `dark`, `light`, or `custom`. Its value never overrides separately saved colors on load. |
+| `WINDOW_BACKGROUND_COLOR` | `"#121619"` | Background color in full and minimal modes. |
+| `WINDOW_BUTTON_COLOR` | `"#272D30"` | Button fill color. |
+| `WINDOW_FONT_COLOR` | `null` | Status text color; `null` automatically contrasts with the background. |
+| `WINDOW_BORDER_COLOR` | `"#2A2D30"` | Outer border and button outline color. |
 
 ### Legacy Audio API and response fields
 

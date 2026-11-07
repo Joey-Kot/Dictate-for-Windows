@@ -1,6 +1,6 @@
 use std::f32::consts::TAU;
 
-use dictate_core::config::{WindowColor, WindowColors};
+use dictate_core::config::{WindowColor, WindowColors, WindowTheme};
 
 pub(crate) fn status_text_color(background: WindowColor) -> WindowColor {
     contrasting_foreground(background, WindowColor([174, 189, 192]))
@@ -55,14 +55,16 @@ impl ColorField {
 }
 
 pub(crate) struct ColorDrafts {
+    theme: WindowTheme,
     selection: [Hsv; ColorField::ALL.len()],
     invalid_hex: [Option<String>; ColorField::ALL.len()],
     auto_font: bool,
 }
 
 impl ColorDrafts {
-    pub fn new(colors: WindowColors) -> Self {
+    pub fn new(colors: WindowColors, theme: WindowTheme) -> Self {
         Self {
+            theme,
             selection: [
                 colors.background.into(),
                 colors.button.into(),
@@ -74,6 +76,18 @@ impl ColorDrafts {
             ],
             invalid_hex: Default::default(),
             auto_font: colors.font.is_none(),
+        }
+    }
+
+    pub fn theme(&self) -> WindowTheme {
+        self.theme
+    }
+
+    pub fn select_theme(&mut self, theme: WindowTheme) {
+        match theme {
+            WindowTheme::Dark => *self = Self::new(WindowColors::DEFAULT, theme),
+            WindowTheme::Light => *self = Self::new(WindowColors::LIGHT, theme),
+            WindowTheme::Custom => self.theme = theme,
         }
     }
 
@@ -112,10 +126,14 @@ impl ColorDrafts {
     }
 
     pub fn reset(&mut self, field: ColorField) {
-        let defaults = Self::new(WindowColors::DEFAULT);
+        let colors = match self.theme {
+            WindowTheme::Dark => WindowColors::DEFAULT,
+            WindowTheme::Light | WindowTheme::Custom => WindowColors::LIGHT,
+        };
+        let defaults = Self::new(colors, self.theme);
         self.set_selection(field, defaults.selection(field));
         if field == ColorField::Font {
-            self.auto_font = true;
+            self.auto_font = defaults.auto_font;
         }
     }
 
@@ -268,7 +286,7 @@ mod tests {
 
     #[test]
     fn resets_and_invalid_hex_are_independent_across_color_fields() {
-        let mut draft = ColorDrafts::new(WindowColors::DEFAULT);
+        let mut draft = ColorDrafts::new(WindowColors::DEFAULT, WindowTheme::Dark);
         draft.edit_hex(ColorField::Background, "FFFFFF".into());
         draft.edit_hex(ColorField::Button, "FF6600".into());
         draft.edit_hex(ColorField::Border, "123".into());
@@ -294,5 +312,53 @@ mod tests {
         draft.reset(ColorField::Background);
         assert_eq!(draft.hex(ColorField::Font), "#AEBDC0");
         assert_eq!(draft.hex(ColorField::Button), "#FF6600");
+    }
+
+    #[test]
+    fn choosing_presets_replaces_colors_but_edits_keep_the_selected_theme() {
+        let mut draft = ColorDrafts::new(WindowColors::DEFAULT, WindowTheme::Dark);
+        draft.edit_hex(ColorField::Background, "#123456".into());
+        draft.edit_hex(ColorField::Button, "bad".into());
+        assert_eq!(draft.theme(), WindowTheme::Dark);
+
+        draft.select_theme(WindowTheme::Light);
+        assert_eq!(draft.theme(), WindowTheme::Light);
+        assert_eq!(draft.values(), Ok(WindowColors::LIGHT));
+        assert_eq!(draft.hex(ColorField::Background), "#E9FFF6");
+        assert_eq!(draft.hex(ColorField::Button), "#D3E8FF");
+        assert_eq!(draft.hex(ColorField::Font), "#000000");
+        assert_eq!(draft.hex(ColorField::Border), "#E9FFF6");
+
+        draft.edit_hex(ColorField::Font, "#123456".into());
+        assert_eq!(draft.theme(), WindowTheme::Light);
+        draft.reset(ColorField::Font);
+        assert_eq!(draft.values(), Ok(WindowColors::LIGHT));
+
+        draft.select_theme(WindowTheme::Dark);
+        assert_eq!(draft.theme(), WindowTheme::Dark);
+        assert_eq!(draft.values(), Ok(WindowColors::DEFAULT));
+        draft.edit_hex(ColorField::Border, "#123456".into());
+        draft.select_theme(WindowTheme::Dark);
+        assert_eq!(draft.values(), Ok(WindowColors::DEFAULT));
+    }
+
+    #[test]
+    fn custom_keeps_current_edits_and_each_reset_uses_light() {
+        let mut draft = ColorDrafts::new(WindowColors::DEFAULT, WindowTheme::Dark);
+        draft.edit_hex(ColorField::Background, "#ABCDEF".into());
+        draft.edit_hex(ColorField::Button, "invalid".into());
+        draft.select_theme(WindowTheme::Custom);
+        assert_eq!(draft.theme(), WindowTheme::Custom);
+        assert_eq!(draft.hex(ColorField::Background), "#ABCDEF");
+        assert_eq!(draft.hex(ColorField::Button), "invalid");
+
+        draft.reset(ColorField::Button);
+        assert_eq!(draft.hex(ColorField::Button), "#D3E8FF");
+        assert_eq!(draft.hex(ColorField::Background), "#ABCDEF");
+        for field in [ColorField::Background, ColorField::Font, ColorField::Border] {
+            draft.reset(field);
+        }
+        assert_eq!(draft.theme(), WindowTheme::Custom);
+        assert_eq!(draft.values(), Ok(WindowColors::LIGHT));
     }
 }

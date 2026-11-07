@@ -691,6 +691,7 @@ pub(super) fn create(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.control_groups.insert(button.0 as usize, GROUP);
         state.localized_controls.push((button, label));
@@ -755,6 +756,7 @@ pub(super) fn create(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.control_groups.insert(button.0 as usize, GROUP);
         state.localized_controls.push((button, label));
@@ -1014,6 +1016,7 @@ fn create_dynamic_form_controls(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.localized_controls.push((button, label));
         register_dynamic_control(state, button);
@@ -1057,6 +1060,7 @@ fn create_summary_controls(
         ID_RESET,
         instance,
     )?;
+    dropdown::track_hover(reset, false)?;
     state.controls.insert(RESET_KEY, reset);
     state
         .localized_controls
@@ -1432,6 +1436,7 @@ fn create_dynamic_select(
         ID_DYNAMIC_SELECT,
         instance,
     )?;
+    dropdown::track_hover(select, false)?;
     let panel = dropdown::create_panel(state, instance)?;
     let list = create_child(
         state,
@@ -1496,6 +1501,7 @@ fn create_dynamic_multi_select(
         ID_DYNAMIC_MULTI_SELECT,
         instance,
     )?;
+    dropdown::track_hover(button, false)?;
     let panel = dropdown::create_panel(state, instance)?;
     let list = create_child(
         state,
@@ -2706,6 +2712,7 @@ fn create_remote_editor_controls(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.control_groups.insert(button.0 as usize, GROUP);
         state.localized_controls.push((button, label));
@@ -2807,6 +2814,7 @@ fn create_remote_editor_controls(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.control_groups.insert(button.0 as usize, GROUP);
         state.localized_controls.push((button, label));

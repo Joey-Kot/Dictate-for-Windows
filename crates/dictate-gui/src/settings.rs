@@ -1420,6 +1420,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
         state,
         group_y["Display"],
         config.window_colors,
+        config.window_theme,
         instance,
     )?);
 
@@ -1453,6 +1454,7 @@ fn create_controls(state: &mut SettingsState) -> Result<(), String> {
         ID_TEST_CONNECTIVITY,
         instance,
     )?;
+    dropdown::track_hover(test_connectivity, false)?;
     state
         .controls
         .insert("__test_connectivity", test_connectivity);
@@ -1879,6 +1881,7 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         }
 
         if id == ID_LANGUAGE
+            || color_picker::is_theme_button(id)
             || id == rewrite::ID_PROVIDER
             || id == ID_MICROPHONE
             || advanced_audio::is_dynamic_select_button(id)
@@ -1889,6 +1892,11 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         {
             let open = if id == ID_LANGUAGE {
                 state.language_open
+            } else if color_picker::is_theme_button(id) {
+                state
+                    .color_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.theme_is_open())
             } else if id == rewrite::ID_PROVIDER {
                 state.rewrite.provider_open
             } else if id == ID_MICROPHONE {
@@ -1953,9 +1961,18 @@ fn draw_owner_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
             return;
         }
 
-        if id >= ID_LANGUAGE_ITEM_BASE && id < ID_LANGUAGE_ITEM_BASE + Language::ALL.len() {
-            let index = id - ID_LANGUAGE_ITEM_BASE;
-            let selected = Language::ALL.get(index).copied() == Some(state.language);
+        if (id >= ID_LANGUAGE_ITEM_BASE && id < ID_LANGUAGE_ITEM_BASE + Language::ALL.len())
+            || color_picker::theme_item(id).is_some()
+        {
+            let selected = if let Some(theme) = color_picker::theme_item(id) {
+                state
+                    .color_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.theme() == theme)
+            } else {
+                let index = id - ID_LANGUAGE_ITEM_BASE;
+                Language::ALL.get(index).copied() == Some(state.language)
+            };
             dropdown::draw_row(
                 item.hDC,
                 item.rcItem,
@@ -2570,6 +2587,9 @@ fn refresh_language(state: &SettingsState) {
         );
     }
     rewrite::refresh_labels(state);
+    if let Some(picker) = &state.color_picker {
+        picker.refresh_language(state.language);
+    }
     advanced_audio::sync_visibility(state);
     sync_connectivity_result(state);
     for (hwnd, key) in &state.localized_controls {
@@ -2673,6 +2693,7 @@ fn set_language_dropdown(state: &mut SettingsState, open: bool) {
 
 fn close_color_picker(state: &SettingsState) {
     if let Some(picker) = &state.color_picker {
+        picker.close_theme();
         picker.close(false);
     }
 }
@@ -3059,6 +3080,7 @@ fn read_config(state: &SettingsState) -> Result<Config, String> {
     }
     let mut config: Config = serde_json::from_value(value).map_err(|error| error.to_string())?;
     if let Some(picker) = &state.color_picker {
+        config.window_theme = picker.theme();
         config.window_colors = picker.values().map_err(|field| {
             format!(
                 "{}\n{}",

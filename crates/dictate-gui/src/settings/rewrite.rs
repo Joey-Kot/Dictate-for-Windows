@@ -636,6 +636,9 @@ pub fn create(
             });
             control
         };
+        if index == 0 {
+            dropdown::track_hover(control, false)?;
+        }
         state.control_groups.insert(control.0 as usize, "Rewrite");
         state.controls.insert(key, control);
     }
@@ -691,6 +694,7 @@ pub fn create(
             id,
             instance,
         )?;
+        dropdown::track_hover(button, false)?;
         state.controls.insert(key, button);
         state.control_groups.insert(button.0 as usize, "Rewrite");
         state.localized_controls.push((button, label));

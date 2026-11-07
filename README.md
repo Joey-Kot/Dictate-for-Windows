@@ -94,7 +94,7 @@ Full mode appears on the taskbar. Minimal mode hides the taskbar entry while ret
 
 | Page | Contents |
 |---|---|
-| Display | UI language, configuration-file location, and floating-window opacity, scale, and color |
+| Display | UI language, configuration-file location, and floating-window opacity, scale, theme, and colors |
 | Audio API | Legacy API endpoint, token, model, language, prompt, text path, and extra fields |
 | Advanced Audio API | Enable switch, user requirements and vendor documentation, workflow generation/validation, parameter values, secrets, raw workflow JSON, remote hosting, and workflow testing |
 | Audio Record | Microphone (first item), output channel count, output sample rate, output bit depth, bitrate, encoder, container, VAD, and boundary padding |
@@ -253,6 +253,7 @@ Copy the [complete example file](examples/example_provider_openai.json) and repl
   "ExtraConfig": "{\"response_format\":\"json\",\"stream\":false,\"temperature\":0,\"language\":null,\"include[]\":\"logprobs\"}",
   "OPACITY": 1.0,
   "WINDOW_SCALE": 1.0,
+  "WINDOW_THEME": "dark",
   "WINDOW_BACKGROUND_COLOR": "#121619",
   "WINDOW_BUTTON_COLOR": "#272D30",
   "WINDOW_FONT_COLOR": null,
@@ -333,6 +334,7 @@ This is a Legacy Audio API example. See ExtraConfig below for the expanded form 
 |---|---:|---|
 | `OPACITY` | `1.0` | GUI floating-window opacity. Allows `0.10`–`1.00` in `0.01` steps; `1.0` is fully opaque. Full and minimal modes share this setting. |
 | `WINDOW_SCALE` | `1.0` | GUI floating-window scale. Allows `0.30`–`2.00` in `0.01` steps and applies on save to full and minimal window sizes, drawing, and mouse hit areas. |
+| `WINDOW_THEME` | `"dark"` | Selected floating-window theme: `dark`, `light`, or `custom`. The four saved colors remain independent of this selection. |
 | `WINDOW_BACKGROUND_COLOR` | `"#121619"` | Floating-window background in full and minimal modes. |
 | `WINDOW_BUTTON_COLOR` | `"#272D30"` | Floating-window button fill. |
 | `WINDOW_FONT_COLOR` | `null` | Floating-window status text. `null` chooses a contrasting color automatically. |

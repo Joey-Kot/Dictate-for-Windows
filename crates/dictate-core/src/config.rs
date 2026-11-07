@@ -63,6 +63,15 @@ impl From<WindowColor> for String {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowTheme {
+    #[default]
+    Dark,
+    Light,
+    Custom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowColors {
@@ -83,6 +92,13 @@ impl WindowColors {
         button: WindowColor([39, 45, 48]),
         font: None,
         border: WindowColor([42, 45, 48]),
+    };
+
+    pub const LIGHT: Self = Self {
+        background: WindowColor([0xE9, 0xFF, 0xF6]),
+        button: WindowColor([0xD3, 0xE8, 0xFF]),
+        font: Some(WindowColor([0, 0, 0])),
+        border: WindowColor([0xE9, 0xFF, 0xF6]),
     };
 }
 
@@ -150,6 +166,8 @@ pub struct Config {
     pub opacity: f64,
     #[serde(rename = "WINDOW_SCALE")]
     pub window_scale: f64,
+    #[serde(rename = "WINDOW_THEME")]
+    pub window_theme: WindowTheme,
     #[serde(flatten)]
     pub window_colors: WindowColors,
     /// Empty means follow the system default input endpoint at recording start.
@@ -243,6 +261,7 @@ impl Default for Config {
             extra_config: String::new(),
             opacity: 1.0,
             window_scale: 1.0,
+            window_theme: WindowTheme::default(),
             window_colors: WindowColors::default(),
             input_device: String::new(),
             input_device_name: String::new(),
@@ -847,6 +866,7 @@ mod tests {
         assert!(raw.contains_key("CANCEL_OR_RETRY_KEY"));
         assert_eq!(raw.get("OPACITY"), Some(&serde_json::json!(1.0)));
         assert_eq!(raw.get("WINDOW_SCALE"), Some(&serde_json::json!(1.0)));
+        assert_eq!(raw.get("WINDOW_THEME"), Some(&serde_json::json!("dark")));
         assert!(!raw.contains_key("WINDOW_COLOR"));
         assert_eq!(
             raw.get("WINDOW_BACKGROUND_COLOR"),
@@ -891,6 +911,40 @@ mod tests {
         assert_eq!(config.window_colors.button, WindowColor([171, 205, 239]));
         assert_eq!(config.window_colors.font, Some(WindowColor([0; 3])));
         assert_eq!(config.window_colors.border, WindowColor([16; 3]));
+    }
+
+    #[test]
+    fn window_theme_round_trips_without_overwriting_edited_colors() {
+        let old: Config = serde_json::from_str(
+            r##"{"WINDOW_BACKGROUND_COLOR":"#123456","WINDOW_FONT_COLOR":"#ABCDEF"}"##,
+        )
+        .unwrap();
+        assert_eq!(old.window_theme, WindowTheme::Dark);
+        assert_eq!(
+            old.window_colors.background,
+            WindowColor([0x12, 0x34, 0x56])
+        );
+        assert_eq!(
+            old.window_colors.font,
+            Some(WindowColor([0xAB, 0xCD, 0xEF]))
+        );
+
+        for (theme, name) in [
+            (WindowTheme::Dark, "dark"),
+            (WindowTheme::Light, "light"),
+            (WindowTheme::Custom, "custom"),
+        ] {
+            let config = Config {
+                window_theme: theme,
+                window_colors: old.window_colors,
+                ..Config::default()
+            };
+            let value = serde_json::to_value(&config).unwrap();
+            assert_eq!(value["WINDOW_THEME"], name);
+            let reloaded: Config = serde_json::from_value(value).unwrap();
+            assert_eq!(reloaded.window_theme, theme);
+            assert_eq!(reloaded.window_colors, old.window_colors);
+        }
     }
 
     #[test]

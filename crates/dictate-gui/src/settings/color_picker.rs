@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use dictate_core::config::WindowColors;
+use dictate_core::config::{WindowColors, WindowTheme};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SetDIBitsToDevice,
@@ -11,14 +11,16 @@ use windows::Win32::UI::Controls::{
     TBM_GETCHANNELRECT, TBM_GETTHUMBRECT, TBM_SETPOS, TBM_SETRANGE, TBS_NOTICKS, TRACKBAR_CLASSW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN, VK_TAB,
+    GetCapture, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, SWP_NOZORDER, WM_APP, WM_CANCELMODE, WM_CHAR, WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETFOCUS, WM_USER,
+    BM_CLICK, GetNextDlgTabItem, GetParent, SWP_NOZORDER, WM_APP, WM_CANCELMODE, WM_CHAR,
+    WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETFOCUS,
+    WM_USER,
 };
 
 use super::*;
@@ -27,9 +29,13 @@ use crate::window_color::{ColorDrafts, ColorField, Hsv};
 const ID_SWATCH_BASE: usize = 0x6130;
 const ID_RESET_BASE: usize = 0x6134;
 const ID_HEX: usize = 0x6138;
+const ID_THEME: usize = 0x6139;
+const ID_THEME_ITEM_BASE: usize = 0x613A;
 const SUBCLASS: usize = ID_SWATCH_BASE;
 const FOCUS_SLIDER: u32 = WM_APP + 38;
 const CHECK_FOCUS: u32 = WM_APP + 39;
+const CHECK_THEME_FOCUS: u32 = WM_APP + 40;
+const THEMES: [WindowTheme; 3] = [WindowTheme::Dark, WindowTheme::Light, WindowTheme::Custom];
 // commctrl.h defines TBM_GETPOS as WM_USER. The bindings omit it.
 const TBM_GETPOS: u32 = WM_USER;
 const PANEL_WIDTH: i32 = 240;
@@ -48,6 +54,11 @@ struct Row {
 }
 
 pub(super) struct Picker {
+    theme_label: HWND,
+    theme_button: HWND,
+    theme_panel: HWND,
+    theme_items: Vec<HWND>,
+    theme_open: Cell<bool>,
     rows: Vec<Row>,
     brightness_label: HWND,
     panel: HWND,
@@ -67,6 +78,7 @@ impl Picker {
         state: &mut SettingsState,
         y: i32,
         colors: WindowColors,
+        theme: WindowTheme,
         instance: HMODULE,
     ) -> Result<Rc<Self>, String> {
         let classes = INITCOMMONCONTROLSEX {
@@ -79,10 +91,53 @@ impl Picker {
         let layout_start = state.layouts.borrow().len();
         let mut panel = HWND::default();
         let result = (|| {
+            let theme_label = create_label(
+                state,
+                state.language.text("window_theme"),
+                CONTENT_LEFT,
+                y,
+                LABEL_WIDTH,
+                FIELD_HEIGHT,
+                instance,
+            )?;
+            let theme_button = create_child(
+                state,
+                w!("BUTTON"),
+                state.language.text(theme_label_key(theme)),
+                WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                EDIT_LEFT,
+                y,
+                EDIT_WIDTH,
+                FIELD_HEIGHT,
+                ID_THEME,
+                instance,
+            )?;
+            let theme_panel = dropdown::create_panel(state, instance)?;
+            let mut theme_items = Vec::with_capacity(THEMES.len());
+            for (index, theme) in THEMES.into_iter().enumerate() {
+                let item = create_child(
+                    state,
+                    w!("BUTTON"),
+                    state.language.text(theme_label_key(theme)),
+                    WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    0,
+                    0,
+                    EDIT_WIDTH,
+                    dropdown::ROW_HEIGHT,
+                    ID_THEME_ITEM_BASE + index,
+                    instance,
+                )?;
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SetParent(item, Some(theme_panel))
+                        .map_err(|error| error.to_string())?;
+                }
+                dropdown::track_hover(item, false)?;
+                theme_items.push(item);
+            }
             let mut rows = Vec::with_capacity(ColorField::ALL.len());
             let style = WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32);
             for (index, field) in ColorField::ALL.into_iter().enumerate() {
-                let top = y + index as i32 * 42;
+                let top = y + (index as i32 + 1) * 42;
                 let text = state.language.text(field.label_key());
                 let label =
                     create_label(state, text, CONTENT_LEFT, top, 250, FIELD_HEIGHT, instance)?;
@@ -159,6 +214,11 @@ impl Picker {
                 ID_HEX,
             )?;
             let picker = Rc::new(Self {
+                theme_label,
+                theme_button,
+                theme_panel,
+                theme_items,
+                theme_open: Cell::new(false),
                 rows,
                 brightness_label,
                 panel,
@@ -168,12 +228,13 @@ impl Picker {
                 hex,
                 dpi: Cell::new(state.dpi),
                 active: Cell::new(None),
-                draft: RefCell::new(ColorDrafts::new(colors)),
+                draft: RefCell::new(ColorDrafts::new(colors, theme)),
                 updating_hex: Cell::new(false),
                 wheel_bitmap: RefCell::default(),
             });
-            for hwnd in [panel, wheel, slider, hex]
+            for hwnd in [panel, wheel, slider, hex, theme_button, theme_panel]
                 .into_iter()
+                .chain(picker.theme_items.iter().copied())
                 .chain(picker.rows.iter().map(|row| row.swatch))
             {
                 attach(&picker, hwnd)?;
@@ -192,6 +253,17 @@ impl Picker {
         })();
         match result {
             Ok(picker) => {
+                for hwnd in [picker.theme_label, picker.theme_button] {
+                    state.control_groups.insert(hwnd.0 as usize, "Display");
+                }
+                state
+                    .localized_controls
+                    .push((picker.theme_label, "window_theme"));
+                for (item, theme) in picker.theme_items.iter().zip(THEMES) {
+                    state
+                        .localized_controls
+                        .push((*item, theme_label_key(theme)));
+                }
                 for (field, row) in ColorField::ALL.into_iter().zip(&picker.rows) {
                     for hwnd in [row.label, row.swatch, row.reset] {
                         state.control_groups.insert(hwnd.0 as usize, "Display");
@@ -226,8 +298,79 @@ impl Picker {
         self.draft.borrow().values()
     }
 
+    pub fn theme(&self) -> WindowTheme {
+        self.draft.borrow().theme()
+    }
+
     pub fn buttons(&self) -> impl Iterator<Item = &HWND> {
-        self.rows.iter().flat_map(|row| [&row.swatch, &row.reset])
+        std::iter::once(&self.theme_button)
+            .chain(self.theme_items.iter())
+            .chain(self.rows.iter().flat_map(|row| [&row.swatch, &row.reset]))
+    }
+
+    pub fn theme_is_open(&self) -> bool {
+        self.theme_open.get()
+    }
+
+    pub fn refresh_language(&self, language: Language) {
+        let text = wide(language.text(theme_label_key(self.theme())));
+        unsafe {
+            let _ = SetWindowTextW(self.theme_button, PCWSTR(text.as_ptr()));
+            let _ = InvalidateRect(Some(self.theme_button), None, false);
+        }
+    }
+
+    pub fn close_theme(&self) {
+        if self.theme_open.replace(false) {
+            unsafe {
+                let _ = ShowWindow(self.theme_panel, SW_HIDE);
+                let _ = InvalidateRect(Some(self.theme_button), None, false);
+            }
+        }
+    }
+
+    fn toggle_theme(&self, dpi: u32) {
+        if self.theme_open.get() {
+            self.close_theme();
+            return;
+        }
+        self.close(false);
+        let width = dropdown::position(
+            self.theme_panel,
+            self.theme_button,
+            THEMES.len() as i32 * dropdown::ROW_HEIGHT,
+            dpi,
+        );
+        self.theme_open.set(true);
+        unsafe {
+            for (index, item) in self.theme_items.iter().enumerate() {
+                let _ = SetWindowPos(
+                    *item,
+                    Some(HWND_TOP),
+                    platform::scale(dropdown::PADDING, dpi),
+                    platform::scale(dropdown::PADDING + index as i32 * dropdown::ROW_HEIGHT, dpi),
+                    width,
+                    platform::scale(dropdown::ROW_HEIGHT, dpi),
+                    SWP_NOACTIVATE,
+                );
+                let _ = ShowWindow(*item, SW_SHOW);
+                let _ = InvalidateRect(Some(*item), None, false);
+            }
+            let _ = ShowWindow(self.theme_panel, SW_SHOW);
+            let _ = InvalidateRect(Some(self.theme_button), None, false);
+        }
+    }
+
+    fn select_theme(&self, theme: WindowTheme, language: Language) {
+        self.close_theme();
+        self.draft.borrow_mut().select_theme(theme);
+        self.refresh_language(language);
+        for field in ColorField::ALL {
+            self.repaint_swatch(field);
+        }
+        unsafe {
+            let _ = SetFocus(Some(self.theme_button));
+        }
     }
 
     fn swatch(&self, field: ColorField) -> HWND {
@@ -722,6 +865,23 @@ fn field_for_id(id: usize, base: usize) -> Option<ColorField> {
         .and_then(|index| ColorField::ALL.get(index).copied())
 }
 
+fn theme_label_key(theme: WindowTheme) -> &'static str {
+    match theme {
+        WindowTheme::Dark => "window_theme_dark",
+        WindowTheme::Light => "window_theme_light",
+        WindowTheme::Custom => "window_theme_custom",
+    }
+}
+
+pub(super) fn is_theme_button(id: usize) -> bool {
+    id == ID_THEME
+}
+
+pub(super) fn theme_item(id: usize) -> Option<WindowTheme> {
+    id.checked_sub(ID_THEME_ITEM_BASE)
+        .and_then(|index| THEMES.get(index).copied())
+}
+
 pub(super) fn is_reset(id: usize) -> bool {
     field_for_id(id, ID_RESET_BASE).is_some()
 }
@@ -730,17 +890,32 @@ pub(super) fn command(state: &mut SettingsState, id: usize, notification: u32) -
     if notification != BN_CLICKED || state.saving {
         return false;
     }
+    if is_theme_button(id) {
+        set_language_dropdown(state, false);
+        if let Some(picker) = &state.color_picker {
+            picker.toggle_theme(state.dpi);
+        }
+        return true;
+    }
+    if let Some(theme) = theme_item(id) {
+        if let Some(picker) = &state.color_picker {
+            picker.select_theme(theme, state.language);
+        }
+        return true;
+    }
     if let Some(field) = field_for_id(id, ID_SWATCH_BASE) {
         if state.language_open {
             set_language_dropdown(state, false);
         }
         if let Some(picker) = &state.color_picker {
+            picker.close_theme();
             picker.toggle(field, state.dpi, state.font);
         }
         return true;
     }
     if let Some(field) = field_for_id(id, ID_RESET_BASE) {
         if let Some(picker) = &state.color_picker {
+            picker.close_theme();
             picker.reset(field);
         }
         return true;
@@ -752,7 +927,8 @@ pub(super) fn handles_escape(hwnd: HWND) -> bool {
     let mut data = 0;
     unsafe {
         GetWindowSubclass(hwnd, Some(control_proc), SUBCLASS, Some(&mut data)).as_bool()
-            && (*(data as *const Picker)).active.get().is_some()
+            && ((*(data as *const Picker)).active.get().is_some()
+                || (*(data as *const Picker)).theme_open.get())
     }
 }
 
@@ -807,6 +983,13 @@ unsafe extern "system" fn control_proc(
         // reference even if another message destroys this particular control.
         Rc::increment_strong_count(pointer);
         let picker = Rc::from_raw(pointer);
+        if hwnd == picker.theme_panel && message == CHECK_THEME_FOCUS {
+            let focus = GetFocus();
+            if focus != picker.theme_button && !picker.theme_items.contains(&focus) {
+                picker.close_theme();
+            }
+            return LRESULT(0);
+        }
         if hwnd == picker.panel
             && let Some(result) = picker.panel_message(message, wparam, lparam)
         {
@@ -835,6 +1018,49 @@ unsafe extern "system" fn control_proc(
         }
         let key = wparam.0 as u16;
         if message == WM_KEYDOWN {
+            if hwnd == picker.theme_button || picker.theme_items.contains(&hwnd) {
+                if key == VK_TAB.0 {
+                    picker.close_theme();
+                    let target = GetParent(picker.theme_button)
+                        .and_then(|parent| {
+                            GetNextDlgTabItem(
+                                parent,
+                                Some(picker.theme_button),
+                                GetKeyState(VK_SHIFT.0 as i32) < 0,
+                            )
+                        })
+                        .unwrap_or(picker.theme_button);
+                    let _ = SetFocus(Some(target));
+                    return LRESULT(0);
+                }
+                if picker.theme_open.get() && key == VK_ESCAPE.0 {
+                    picker.close_theme();
+                    let _ = SetFocus(Some(picker.theme_button));
+                    return LRESULT(0);
+                }
+                if key == VK_RETURN.0 {
+                    SendMessageW(hwnd, BM_CLICK, None, None);
+                    return LRESULT(0);
+                }
+                if key == VK_UP.0 || key == VK_DOWN.0 {
+                    if !picker.theme_open.get() {
+                        SendMessageW(picker.theme_button, BM_CLICK, None, None);
+                    }
+                    if picker.theme_open.get() {
+                        let index = picker.theme_items.iter().position(|item| *item == hwnd);
+                        let index = match index {
+                            Some(index) if key == VK_UP.0 => index.saturating_sub(1),
+                            Some(index) => (index + 1).min(THEMES.len() - 1),
+                            None => THEMES
+                                .iter()
+                                .position(|theme| *theme == picker.theme())
+                                .unwrap_or(0),
+                        };
+                        let _ = SetFocus(Some(picker.theme_items[index]));
+                    }
+                    return LRESULT(0);
+                }
+            }
             if picker.active.get().is_some() {
                 if key == VK_ESCAPE.0 || (key == VK_RETURN.0 && picker.valid_hex()) {
                     picker.close(true);
@@ -859,6 +1085,17 @@ unsafe extern "system" fn control_proc(
         }
         if message == WM_KILLFOCUS && picker.active.get().is_some() {
             let _ = PostMessageW(Some(picker.panel), CHECK_FOCUS, WPARAM(0), LPARAM(0));
+        }
+        if message == WM_KILLFOCUS
+            && picker.theme_open.get()
+            && (hwnd == picker.theme_button || picker.theme_items.contains(&hwnd))
+        {
+            let _ = PostMessageW(
+                Some(picker.theme_panel),
+                CHECK_THEME_FOCUS,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
         DefSubclassProc(hwnd, message, wparam, lparam)
     }

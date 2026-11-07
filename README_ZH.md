@@ -94,7 +94,7 @@ Dictate for Windows 是一个面向 Windows x86_64 的本地语音转文字客�
 
 | 页面 | 内容 |
 |---|---|
-| Display | 界面语言、配置文件位置、浮窗透明度、缩放和背景色 |
+| Display | 界面语言、配置文件位置，以及浮窗透明度、缩放、主题和颜色 |
 | Audio API | 旧接口的地址、Token、模型、语言、提示词、文本路径和额外字段 |
 | Advanced Audio API | 启用开关、用户需求与厂商资料、工作流生成/校验、参数值、密钥、原始工作流 JSON、远程托管和测试工作流 |
 | Audio Record | 麦克风（第一项）、输出声道数、输出采样率、输出位深、比特率、编码器、容器、VAD 和边界填充 |
@@ -253,6 +253,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
   "ExtraConfig": "{\"response_format\":\"json\",\"stream\":false,\"temperature\":0,\"language\":null,\"include[]\":\"logprobs\"}",
   "OPACITY": 1.0,
   "WINDOW_SCALE": 1.0,
+  "WINDOW_THEME": "dark",
   "WINDOW_BACKGROUND_COLOR": "#121619",
   "WINDOW_BUTTON_COLOR": "#272D30",
   "WINDOW_FONT_COLOR": null,
@@ -333,6 +334,7 @@ GUI 和 CLI 使用相同的 JSON 数据结构。缺失字段自动使用默认�
 |---|---:|---|
 | `OPACITY` | `1.0` | GUI 浮窗透明度。允许 `0.10`–`1.00`，步进 `0.01`；`1.0` 为完全不透明。完整模式和 minimal 模式共用此设置。 |
 | `WINDOW_SCALE` | `1.0` | GUI 浮窗缩放。允许 `0.30`–`2.00`，步进 `0.01`。保存后立即调整完整模式和 minimal 模式的窗口大小、绘制内容及鼠标命中区域。 |
+| `WINDOW_THEME` | `"dark"` | 当前浮窗主题，可选 `dark`、`light` 或 `custom`。四个颜色独立保存，不受此字段覆盖。 |
 | `WINDOW_BACKGROUND_COLOR` | `"#121619"` | 完整模式和精简模式的浮窗背景色。 |
 | `WINDOW_BUTTON_COLOR` | `"#272D30"` | 浮窗按钮的填充色。 |
 | `WINDOW_FONT_COLOR` | `null` | 浮窗状态文字的颜色。`null` 会根据背景自动选取有对比度的颜色。 |
