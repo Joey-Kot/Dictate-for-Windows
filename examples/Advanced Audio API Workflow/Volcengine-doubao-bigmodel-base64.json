@@ -1,0 +1,143 @@
+{
+  "schema_version": 2,
+  "name": "Volcengine Doubao Fast Audio File Transcription",
+  "parameters": [
+    {
+      "id": "format",
+      "label": "Audio container",
+      "required": true,
+      "default": "ogg",
+      "description": null,
+      "type": "select",
+      "options": [
+        {
+          "value": "wav",
+          "label": "WAV"
+        },
+        {
+          "value": "mp3",
+          "label": "MP3"
+        },
+        {
+          "value": "ogg",
+          "label": "OGG"
+        }
+      ]
+    },
+    {
+      "id": "codec",
+      "label": "Audio encoding",
+      "required": true,
+      "default": "opus",
+      "description": null,
+      "type": "select",
+      "options": [
+        {
+          "value": "raw",
+          "label": "Raw PCM"
+        },
+        {
+          "value": "opus",
+          "label": "Opus"
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "label": "Model",
+      "required": true,
+      "default": "bigmodel",
+      "description": null,
+      "type": "select",
+      "options": [
+        {
+          "value": "bigmodel",
+          "label": "bigmodel"
+        }
+      ]
+    },
+    {
+      "id": "language",
+      "label": "Language",
+      "required": false,
+      "default": "zh-CN",
+      "description": "Leave blank to use the default recognition scope described in the documentation; to specify a language, enter a language code, such as zh-CN or en-US.",
+      "type": "text"
+    },
+    {
+      "id": "itn",
+      "label": "Enable ITN",
+      "required": true,
+      "default": "true",
+      "description": null,
+      "type": "boolean"
+    },
+    {
+      "id": "punctuation",
+      "label": "Enable punctuation",
+      "required": true,
+      "default": "true",
+      "description": null,
+      "type": "boolean"
+    }
+  ],
+  "secrets": [
+    {
+      "id": "api_key",
+      "label": "New Console API Key",
+      "required": true,
+      "description": null
+    }
+  ],
+  "audio": {
+    "delivery": {
+      "type": "base64"
+    },
+    "mime": null
+  },
+  "recognition": {
+    "mode": "request",
+    "request": {
+      "method": "POST",
+      "url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+      "query": {},
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Api-Key": "{{secret:api_key}}",
+        "X-Api-Request-Id": "{{runtime:uuid}}",
+        "X-Api-Resource-Id": "volc.bigasr.auc_turbo",
+        "X-Api-Sequence": "-1"
+      },
+      "body": {
+        "type": "json",
+        "value": {
+          "audio": {
+            "codec": "{{var:codec}}",
+            "data": "{{audio:base64}}",
+            "format": "{{var:format}}",
+            "language": "{{var:language}}"
+          },
+          "request": {
+            "enable_itn": "{{var:itn}}",
+            "enable_punc": "{{var:punctuation}}",
+            "model_name": "{{var:model}}"
+          },
+          "user": {
+            "uid": "{{secret:api_key}}"
+          }
+        }
+      },
+      "accepted_statuses": [
+        200
+      ],
+      "signer": {
+        "type": "none"
+      },
+      "captures": []
+    },
+    "final_text": {
+      "type": "json_path",
+      "path": "$.result.text"
+    }
+  }
+}

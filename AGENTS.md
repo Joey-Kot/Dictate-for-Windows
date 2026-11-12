@@ -1255,6 +1255,8 @@ Rewrite does not create an audio cache or a persistent request/response cache, a
 
 Official releases are cross-compiled using Ubuntu, MinGW-w64, and the Rust `x86_64-pc-windows-gnu` and `i686-pc-windows-gnu` targets.
 
+The About page, CLI `--version`, and GUI Windows resources use `[workspace.package].version` in `Cargo.toml`. Update it and `Cargo.lock` only after the version is confirmed; GitHub Actions builds the checked-in version without incrementing it.
+
 ### Installing the Rust toolchain
 
 Local builds and CI use Rust 1.99.1, with `rustfmt`, `clippy`, and the Windows GNU target.

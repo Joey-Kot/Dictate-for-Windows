@@ -36,9 +36,71 @@
       "id": "audio_format",
       "label": "Audio Format",
       "required": true,
-      "default": "wav",
+      "default": "ogg",
       "description": "Actual audio format, for example wav, mp3, or opus.",
-      "type": "text"
+      "type": "select",
+      "options": [
+        {
+          "value": "wav",
+          "label": "WAV"
+        },
+        {
+          "value": "opus",
+          "label": "Opus"
+        },
+        {
+          "value": "ogg",
+          "label": "Ogg"
+        },
+        {
+          "value": "webm",
+          "label": "Webm"
+        },
+        {
+          "value": "aac",
+          "label": "AAC"
+        },
+        {
+          "value": "m4a",
+          "label": "M4A"
+        },
+        {
+          "value": "mp3",
+          "label": "MP3"
+        },
+        {
+          "value": "mp4",
+          "label": "MP4"
+        },
+        {
+          "value": "mpeg",
+          "label": "MPEG"
+        },
+        {
+          "value": "amr",
+          "label": "AMR"
+        },
+        {
+          "value": "avi",
+          "label": "AVI"
+        },
+        {
+          "value": "flac",
+          "label": "FLAC"
+        },
+        {
+          "value": "flv",
+          "label": "FLV"
+        },
+        {
+          "value": "wma",
+          "label": "WMA"
+        },
+        {
+          "value": "wmv",
+          "label": "WMV"
+        }
+      ]
     },
     {
       "id": "sample_rate",
@@ -46,13 +108,27 @@
       "required": true,
       "default": "16000",
       "description": "Audio sample rate in Hz.",
-      "type": "text"
+      "type": "select",
+      "options": [
+        {
+          "value": "8000",
+          "label": "8000"
+        },
+        {
+          "value": "16000",
+          "label": "16000"
+        },
+        {
+          "value": "48000",
+          "label": "48000"
+        }
+      ]
     },
     {
       "id": "language_hints",
       "label": "Language Hints",
-      "required": true,
-      "default": "[\"zh\"]",
+      "required": false,
+      "default": "[]",
       "description": "Select likely recognition languages. Qwen Audio 3.x supports up to four values; Fun ASR Flash uses only the first value.",
       "type": "multi_select",
       "options": [

@@ -1,0 +1,100 @@
+{
+  "schema_version": 2,
+  "name": "OpenAI Transcribe",
+  "parameters": [
+    {
+      "id": "model",
+      "label": "Model",
+      "required": true,
+      "default": "gpt-transcribe",
+      "description": null,
+      "type": "select",
+      "options": [
+        {
+          "value": "gpt-transcribe",
+          "label": "gpt-transcribe"
+        },
+        {
+          "value": "gpt-4o-transcribe",
+          "label": "gpt-4o-transcribe"
+        },
+        {
+          "value": "gpt-4o-mini-transcribe",
+          "label": "gpt-4o-mini-transcribe"
+        },
+        {
+          "value": "gpt-4o-mini-transcribe-2025-12-15",
+          "label": "gpt-4o-mini-transcribe-2025-12-15"
+        },
+        {
+          "value": "whisper-1",
+          "label": "whisper-1"
+        },
+        {
+          "value": "gpt-4o-transcribe-diarize",
+          "label": "gpt-4o-transcribe-diarize"
+        }
+      ]
+    }
+  ],
+  "secrets": [
+    {
+      "id": "api_key",
+      "label": "API Key",
+      "required": true,
+      "description": null
+    }
+  ],
+  "audio": {
+    "delivery": {
+      "type": "multipart_file"
+    },
+    "mime": null
+  },
+  "recognition": {
+    "mode": "request",
+    "request": {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/audio/transcriptions",
+      "query": {},
+      "headers": {
+        "Authorization": "Bearer {{secret:api_key}}"
+      },
+      "body": {
+        "type": "multipart",
+        "fields": [
+          {
+            "name": "file",
+            "type": "audio_file"
+          },
+          {
+            "name": "model",
+            "type": "text",
+            "value": "{{var:model}}"
+          },
+          {
+            "name": "chunking_strategy",
+            "type": "text",
+            "value": "auto"
+          },
+          {
+            "name": "response_format",
+            "type": "text",
+            "value": "json"
+          }
+        ]
+      },
+      "accepted_statuses": [
+        200
+      ],
+      "signer": {
+        "type": "none"
+      },
+      "captures": []
+    },
+    "final_text": {
+      "type": "json_path",
+      "path": "$.text"
+    }
+  }
+}
