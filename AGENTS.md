@@ -264,7 +264,7 @@ stateDiagram-v2
 
 - Recording (including pauses), transcription, Rewrite, and connectivity tests run one at a time. New tasks are discarded while busy, without queuing; cancellation can stop the current task, but new tasks are not accepted until cleanup and clipboard restoration finish.
 - Opening or scrolling the menu does not create a Core state or acquire the task lock. The GUI opens it only in `Idle`/`Error`; entering a busy state, opening Settings, or applying a configuration closes it. A click still rechecks the runtime guard, so a race with another task cannot queue a Rewrite.
-- Rewrite connectivity tests use the current settings draft and make a single request. Legacy audio connectivity tests normally do the same. With segmented upload enabled for a non-realtime Audio API, the Legacy test and Advanced **Test workflow** instead use the same segment preparation and bounded batch dispatch as transcription. The fixed short test source can still produce one segment, so a successful test is not evidence that a provider accepts the configured maximum duration. Advanced **Test workflow** executes the declared workflow after confirmation and can include remote upload, polling, result fetches, or recorded realtime replay. Tests do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
+- Rewrite connectivity tests use the current settings draft and make a single request. Legacy audio connectivity tests normally do the same. With segmented upload enabled for a non-realtime Audio API, the Legacy test and Advanced **Test workflow** instead use the same segment preparation and bounded batch dispatch as transcription. Advanced **Test workflow** executes the declared workflow after confirmation and can include remote upload, polling, result fetches, or recorded realtime replay. Tests do not read the selection or insert text, and return to `Idle` after success, failure, or cancellation.
 - Retry retranscribes only the most recent completed audio recording and does not trigger Rewrite. The retry buffer is held only in memory, up to 100,000,000 bytes. It is replaced when a new recording finishes, retained after cancellation during recording, request cancellation, or completion of a retry, and cleared when complete-file VAD or segmented analysis finds no speech. Once a segmented plan has been created, Retry retains the original WAV plus that plan and its maximum duration, minimum-pause, and concurrency settings; it re-exports and resends the entire batch without reanalyzing pauses or reusing earlier segment text.
 - A successfully completed API response with no text retains the retry recording. This differs from local VAD or segment analysis detecting silence before recognition, which clears it.
 
@@ -379,7 +379,7 @@ The batch list reserves the 14-DIP scrollbar gutter only when its item count exc
 
 Default output lookup uses `SHGetKnownFolderPath(KF_FLAG_DONT_VERIFY)`: opening Settings only resolves Documents/Transcripts and never requires or creates either directory. If lookup itself fails, the output field remains empty and editable so the remaining controls still initialize. Save accepts an empty default configuration; Transcribe reports an empty field before admission. The core batch entry recursively creates missing output ancestors and checks writability before conversion or recognition, reporting destination failures without terminating the application.
 
-`BATCH_TRANSCRIPTION` contains `output_dir` (default empty, GUI resolves Windows Documents/Transcripts) and positive `batch_size` (default 1). Existing configurations deserialize with defaults. Both settings are saved only by outer Save; queue/status/error/output metadata are not persisted. See [batch validation](docs/batch-transcription-validation.md) for automated and Windows-desktop acceptance boundaries.
+`BATCH_TRANSCRIPTION` contains `output_dir` (default empty, GUI resolves Windows Documents/Transcripts) and positive `batch_size` (default 1). Existing configurations deserialize with defaults. Both settings are saved only by outer Save; queue/status/error/output metadata are not persisted.
 
 ### Rewriting selected text
 
@@ -392,7 +392,7 @@ Default output lookup uses `SHGetKnownFolderPath(KF_FLAG_DONT_VERIFY)`: opening 
 - Dictate backs up the clipboard, issues `Ctrl+C`, restores the backup, and only then sends the request. Read, backup, restore, cancellation, or empty-input failures stop the operation. The target application determines what `Ctrl+C` returns, so selection and password-field behavior cannot be inferred reliably.
 - Only valid, nonempty, complete Rewrite results are inserted. Failed, canceled, truncated, incomplete, or partial Rewrite results are never inserted. `USE_SENDINPUT=false` uses the clipboard and `Ctrl+V`; `true` uses SendInput.
 - **Test connectivity** uses the current main or prompt API draft and Network settings, makes one request, and does not read selection, insert text, or save changes. It shares the normal task lock and cancellation behavior.
-- Audio API and Rewrite API **Test connectivity**, Advanced Audio API **Test workflow**, and the prompt editor's **Test connectivity** share the supplied `assets/status-icons/Success1.svg`, `Failed1.svg`, and `Processing.svg`. `test_status_icons.rs` preserves the SVG canvas/colors/opacity and resolves the supplied 1.2-second clockwise group rotation into 60 cached vector phases. Its raster cache is bounded to 4 MiB / 256 entries. `settings/test_status.rs` owns fixed-size 20-DIP child icon windows, buffered GDI painting, and 20-ms timers while processing; success, failure, hiding, and destruction stop the timer. Rewrite reparenting and prompt-body scrolling move the icon with its result text. See the [test status icon validation record](docs/test-status-icons-validation.md) for automated coverage and pending Windows checks.
+- Audio API and Rewrite API **Test connectivity**, Advanced Audio API **Test workflow**, and the prompt editor's **Test connectivity** share the supplied `assets/status-icons/Success1.svg`, `Failed1.svg`, and `Processing.svg`. `test_status_icons.rs` preserves the SVG canvas/colors/opacity and resolves the supplied 1.2-second clockwise group rotation into 60 cached vector phases. Its raster cache is bounded to 4 MiB / 256 entries. `settings/test_status.rs` owns fixed-size 20-DIP child icon windows, buffered GDI painting, and 20-ms timers while processing; success, failure, hiding, and destruction stop the timer. Rewrite reparenting and prompt-body scrolling move the icon with its result text.
 
 ### Rewrite menu lifecycle and rendering
 
@@ -424,7 +424,7 @@ stateDiagram-v2
 - **DPI and positioning:** use the trigger-time pointer's monitor DPI and work area, including taskbar limits and negative screen coordinates. Flip the opening direction near an edge, clamp to the work area, and recompute on display/DPI changes. Menu scale is independent of `WINDOW_SCALE` and `OPACITY`, which control the recording overlay.
 - **Composition:** `surface.rs` owns a DirectComposition visual and premultiplied-alpha DXGI swap chain. Direct2D/DirectWrite draw crisp text, icons, subtle interaction overlays, separators, and scrollbar above the background; do not blur or stretch a screenshot of the whole menu. The recording overlay's existing layered-window renderer is a different path.
 - **Material:** `backdrop.rs` dynamically resolves `SetWindowCompositionAttribute` and isolates the undocumented Accent policy (`WCA_ACCENT_POLICY=19`, Acrylic state `4`). `theme.rs` explicitly disables the managed DWM backdrop with `DWMSBT_NONE` and removes full-client frame extension, while retaining system corner/shadow support. Do not restore `DWMSBT_TRANSIENTWINDOW` as the current path: it produced a flat opaque surface in the user's nonactivating-menu test. Normal Acrylic draws no additional full-panel Direct2D fill and contains no fixed blue wallpaper or gradient.
-- **Tint and fallback:** light tint is `#F7F7F7` with alpha `0xB3` (about 70% **opacity**); dark tint is `#202227` with alpha `0xCC` (80% opacity). Acrylic is attempted only when the Windows 11 corner capability, desktop composition, and transparency policy permit it. Windows 10, disabled transparency, high contrast, battery saver, missing APIs, or failed calls use a matching solid surface; high contrast uses system colors. A successful Accent call is not proof of correct visible blur.
+- **Tint and fallback:** light tint is `#F7F7F7` with alpha `0xB3` (about 70% **opacity**); dark tint is `#202227` with alpha `0xCC` (80% opacity). Acrylic is attempted only when the Windows 11 corner capability, desktop composition, and transparency policy permit it. Windows 10, disabled transparency, high contrast, battery saver, missing APIs, or failed calls use a matching solid surface; high contrast uses system colors.
 - **Theme:** read the Windows default app mode (`AppsUseLightTheme`) and transparency preference; setting, color, theme, DWM composition, and power notifications refresh the open menu without restarting. This automatic theme behavior belongs to the Rewrite menu, not every existing settings control.
 
 ### Prompt drafts and icon resource transactions
@@ -532,7 +532,7 @@ flowchart TD
 
 ### Testing, diagnostics, and current boundary
 
-- **Test workflow** shows the target host, remote-upload requirement, recognition mode, and replay status before network access. It then runs fixed short audio through the same Core path. It verifies that path, not a provider's duration limit or every production combination.
+- **Test workflow** shows the target host, remote-upload requirement, recognition mode, and replay status before network access. It then runs fixed short audio through the same Core path.
 - `UPLOAD_DEBUG` records safe lifecycle metadata for Advanced workflows, including remote-audio upload and cleanup. It never logs rendered URLs, queries, raw headers, bodies, audio, captures, transcripts, Secrets, storage credentials, signatures, or presigned URLs.
 - Unsupported: gRPC, custom HTTP/2 event streams, callback/webhook-only completion, arbitrary stages/branches/loops, user scripts, custom signer code, provider-specific realtime resume, and foreground partial text.
 
@@ -1289,22 +1289,13 @@ cargo test -p dictate-gui --features native-gui,static-libav \
   embedded_presets_encode -- --ignored --nocapture
 ```
 
-The tests require the output encoders and muxers corresponding to the menu options. For smaller, trimmed native test builds, `DICTATE_PRESET_CODECS` can limit the encoding tests; the default Opus and PCM 16/24/32-bit checks still run. Windows rendering, focus, scrolling, and Save/Cancel interactions still require validation on a Windows desktop.
-
-For hotkey capture, full-chord dispatch coverage, and the Windows keyboard/focus regression matrix, see the [Hotkey recording validation record](docs/hotkey-recording-validation.md).
-
-For automated results for this Rewrite implementation and pending checks for selection reading, actual text output, Provider behavior, and DPI, see the [Rewrite validation record](docs/rewrite-validation.md). Linux tests and Windows cross-compilation do not replace validation on a Windows desktop.
-
-For tests of log reception, buffering, request redaction, and native FFmpeg log forwarding, as well as pending Windows log box checks, see the [GUI Debug output validation record](docs/debug-output-validation.md).
+The tests require the output encoders and muxers corresponding to the menu options. For smaller, trimmed native test builds, `DICTATE_PRESET_CODECS` can limit the encoding tests; the default Opus and PCM 16/24/32-bit checks still run.
 
 ### Current menu, hotkey, icon, and empty-ASR validation
 
-The latest code validation before this documentation-only update passed 439 Linux workspace tests, formatting, Linux and Windows GNU all-target Clippy with warnings denied, and static-libav Windows GUI/CLI release builds and packaging. Windows-specific native drawing tests were compiled, not executed on Linux. The user subsequently tested the exact-chord hotkey fix and reported no problems; earlier feedback also confirmed the Alt focus fix and general functionality. These reports do not assert that every Windows version, target app, DPI, or visual reference case has been individually recorded.
-
 - Core regression coverage includes all 16 modifier sets and their 16×16 isolation, shared-main-key audio/menu/prompt action IDs, long-press modifier changes, Alt masking, sparse empty-key mapping, and save/registration rollback. GUI tests cover both draft-save entry points and normalized duplicate checks across all action kinds.
-- Menu/icon tests cover whole-row layout, work-area/DPI placement, scrollbar metrics, icon decoding and missing-resource fallback, import cancellation, and failed-save rollback. Keep Clear→Save→reload→GDI tests in `settings/text_tests.rs` as native Windows coverage; cross-compilation alone cannot prove the original user-reported crash is absent.
+- Menu/icon tests cover whole-row layout, work-area/DPI placement, scrollbar metrics, icon decoding and missing-resource fallback, import cancellation, and failed-save rollback. Keep Clear→Save→reload→GDI tests in `settings/text_tests.rs` as native Windows coverage.
 - Empty-ASR tests cover missing versus null/empty fields, whitespace, structured no-words errors, Advanced extraction/accumulation/realtime, and HTTP integration. SSE/NDJSON/JSON-chunk tests include trailing `done`/`delta` in the same or later network chunks and a connection kept open after no-words completion; ordinary completion still rejects illegal trailing actions.
-- Functional, visual, and fallback acceptance are separate. The user accepted a dark Acrylic screenshot and then requested a lighter tint change; an overall functional pass is not a replacement for four actual theme/scrollbar screenshots. Windows 10 checks are performed by the user. The detailed matrix and historical feedback are in [Rewrite menu validation](docs/rewrite-menu-validation.md).
 
 The independent native preview bypasses stored configuration and Rewrite/network work:
 
@@ -1313,7 +1304,7 @@ The independent native preview bypasses stored configuration and Rewrite/network
 .\Dictate.exe --rewrite-menu-preview=10
 ```
 
-The option defaults to six items and accepts 0–1000. `F8` toggles at the pointer and `F9` exits. `%TEMP%\dictate-menu-preview.log` records item count, selected ID, material/fallback, foreground window, focus control, and menu-bar mode, but not selected text. An API success or stable foreground handle alone does not establish preserved selection or correct blur. Recheck the real popup on light/dark/complex backgrounds, two hotkey backends, inactive-window scrolling on/off, and mixed-DPI monitor edges; do not count generated icon previews as Windows UI screenshots.
+The option defaults to six items and accepts 0–1000. `F8` toggles at the pointer and `F9` exits. `%TEMP%\dictate-menu-preview.log` records item count, selected ID, material/fallback, foreground window, focus control, and menu-bar mode, but not selected text.
 
 ### Building native dependencies and applications
 
@@ -1345,7 +1336,7 @@ Audio capture uses the Windows system WASAPI interface directly, with no need to
 
 The Opus 1.5.2 and LAME 3.100 source archives are also checked against fixed SHA-256 hashes before extraction, including downloads already in the cache. The hashes are recorded in the build scripts and third-party component notices.
 
-The x86 and amd64 build directories and FFmpeg install prefixes must remain separate. The build scripts check compiler pointer width and existing archives before reuse, and mark each directory with its architecture. See [Windows x86 validation](docs/windows-x86-validation.md) for local checks and the remaining desktop acceptance boundary.
+The x86 and amd64 build directories and FFmpeg install prefixes must remain separate. The build scripts check compiler pointer width and existing archives before reuse, and mark each directory with its architecture.
 
 The trimmed build enables file input/output and the codecs, parsers, and muxers required for PCM (including A-law/μ-law), WAV, MP3, Opus, Speex, AAC, AMR-NB/WB, AVI, FLAC, FLV, M4A, MKV, MOV, MP4, MPEG, Ogg, WebM, ASF (WMA), AIFF, and WavPack. Speex uses `libspeex`, and AMR-WB uses `libvo_amrwbenc`. FLV retains AAC/MP3 audio support, with FLV1 and H.264 codecs removed. WMA v1/v2 encoding and decoding are enabled, while Theora and WMV video codecs are removed; this build does not include WMA Pro, WMA Lossless, WMV3, or VC-1.
 
@@ -1359,7 +1350,7 @@ GitHub Actions also checks that:
 - The FFmpeg build does not enable `nonfree`.
 - Both the CLI and GUI include `keybd_event` and `SendInput`, supporting the two selectable input paths.
 - Neither executable contains an external FFmpeg backend or imports audio/codec or compiler-runtime DLLs.
-- A Windows runner extracts both architectures and exercises each packaged CLI's embedded Opus conversion and transcription against a local stub. The x86 executable runs there under WOW64; it does not replace 32-bit Windows desktop acceptance.
+- A Windows runner extracts both architectures and exercises each packaged CLI's embedded Opus conversion and transcription against a local stub. The x86 executable runs there under WOW64.
 - `NOTICE` and `THIRD_PARTY_LICENSES/` are complete.
 
 After both architecture builds and Windows smoke tests succeed, one publishing job updates the `Latest` tag and Release and uploads all four archives and their SHA-256 files.
@@ -1439,9 +1430,7 @@ The build has no dedicated raw stream muxer for 64-bit integer PCM; PCM encoders
 - Notifications: no Windows system notifications.
 - Configuration: validated before saving, missing fields use defaults, and unknown fields are ignored.
 
-For more precise compatibility behavior, see the [Rust rewrite compatibility contract](docs/rust-rewrite-contract.md); for the boundaries of automated and manual validation, see the [Rust technical validation record](docs/rust-technical-validation.md).
-
-For automated format/VAD tests for this capture update, user-reported manual Windows validation results, and hardware regression checks, see the [Microphone selection validation record](docs/microphone-selection-validation.md).
+For more precise compatibility behavior, see the [Rust rewrite compatibility contract](docs/rust-rewrite-contract.md).
 
 ## Repository layout
 
